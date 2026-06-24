@@ -1,0 +1,42 @@
+# Local/dev orchestration. Secrets come from .env (gitignored), never inline.
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: gba-reco-redis
+    command: redis-server --appendonly yes --maxmemory 1gb --maxmemory-policy allkeys-lru
+    ports: ["6379:6379"]
+    volumes: ["redis_data:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+  api:
+    build: .
+    container_name: gba-reco-api
+    env_file: [.env]
+    environment:
+      REDIS_HOST: redis
+    ports: ["8000:8000"]
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build: .
+    container_name: gba-reco-worker
+    env_file: [.env]
+    environment:
+      REDIS_HOST: redis
+    depends_on:
+      redis:
+        condition: service_healthy
+    # cron-style scheduling handled by host/orchestrator; this runs once then exits.
+    command: ["python", "-m", "app.services.recommendations.worker", "--top-n", "50"]
+    restart: "no"
+
+volumes:
+  redis_data:

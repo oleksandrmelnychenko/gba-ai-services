@@ -1,0 +1,30 @@
+# Local/dev orchestration. Secrets come from .env (gitignored), never inline.
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: gba-pricing-redis
+    command: redis-server --appendonly yes --maxmemory 1gb --maxmemory-policy allkeys-lru
+    ports: ["6383:6379"]
+    volumes: ["redis_data:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+  api:
+    build: .
+    container_name: gba-pricing-api
+    env_file: [.env]
+    environment:
+      REDIS_HOST: redis
+      REDIS_DB: 3
+    ports: ["8004:8004"]
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  redis_data:
