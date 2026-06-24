@@ -77,6 +77,12 @@ def test_discount_from_price_reproduces_engine_lever():
     assert engine.discount_from_price(20.0, 20.0) == pytest.approx(0.0)
 
 
+def test_price_from_discount_reproduces_price():
+    assert engine.price_from_discount(20.0, 7.5) == pytest.approx(18.5)
+    assert engine.price_from_discount(20.0, 0.0) == pytest.approx(20.0)
+    assert engine.price_from_discount(None, 7.5) is None
+
+
 def test_discount_from_price_guards_bad_denominator():
     assert engine.discount_from_price(18.5, None) is None
     assert engine.discount_from_price(18.5, 0.0) is None
@@ -148,13 +154,13 @@ def test_rationale_surfaces_discount_cap_over_peer_median():
         engine.R_PEER_MEDIAN
 
 
-def test_rationale_floor_and_loss_flag_take_precedence_over_cap():
+def test_rationale_discount_cap_is_binding_when_it_changes_actionable_price():
     assert engine.rationale_for(engine.R_BELOW_MARGIN, discount_was_capped=True) == \
-        engine.R_BELOW_MARGIN
+        engine.R_DISCOUNT_CAP
     assert engine.rationale_for(engine.R_MARGIN_FLOOR, discount_was_capped=True) == \
-        engine.R_MARGIN_FLOOR
+        engine.R_DISCOUNT_CAP
     assert engine.rationale_for(engine.R_AT_BASELINE, discount_was_capped=True) == \
-        engine.R_AT_BASELINE
+        engine.R_DISCOUNT_CAP
 
 
 def _build(**over):
@@ -183,9 +189,9 @@ def test_assembler_happy_path_peer_median():
     assert reco.confidence == Confidence.HIGH
     assert reco.rationale == engine.R_PEER_MEDIAN
     assert reco.margin_pct_at_recommended == pytest.approx(45.95, abs=0.01)
-    assert reco.discount_band.min_pct == 18.0
-    assert reco.discount_band.target_pct == 18.0
-    assert reco.discount_band.max_pct == pytest.approx(44.0)
+    assert reco.discount_band.min_pct == 0.0
+    assert reco.discount_band.target_pct == pytest.approx(7.5)
+    assert reco.discount_band.max_pct == pytest.approx(18.0)
     assert (
         reco.discount_band.min_pct
         <= reco.discount_band.target_pct
@@ -199,6 +205,9 @@ def test_assembler_loss_flag_when_floor_above_baseline():
     )
     assert reco.price_floor == 28.0
     assert reco.recommended_price == 28.0
+    assert reco.suggested_discount_pct is None
+    assert reco.discount_band is None
+    assert reco.margin_pct_at_recommended == pytest.approx(10.71, abs=0.01)
     assert reco.rationale == engine.R_BELOW_MARGIN
 
 
@@ -210,9 +219,16 @@ def test_assembler_discount_cap_binds_rationale():
         peer={"p25": 9.0, "p50": 10.0, "p75": 11.0, "n": 12},
         segment={"p75": 8.0, "p90": 12.0, "n": 40},
     )
-    assert reco.recommended_price == 10.0
+    assert reco.recommended_price == 18.4
     assert reco.suggested_discount_pct == 8.0
+    assert reco.margin_pct_at_recommended == pytest.approx(72.83, abs=0.01)
+    assert reco.discount_band.min_pct == 0.0
+    assert reco.discount_band.target_pct == 8.0
+    assert reco.discount_band.max_pct == 12.0
     assert reco.rationale == engine.R_DISCOUNT_CAP
+    assert 20.0 * (1.0 - reco.suggested_discount_pct / 100.0) == pytest.approx(
+        reco.recommended_price
+    )
 
 
 def test_assembler_no_cost_path_is_peer_only_low_confidence():
@@ -226,3 +242,5 @@ def test_assembler_no_cost_path_is_peer_only_low_confidence():
     assert reco.margin_pct_at_recommended is None
     assert reco.confidence == Confidence.LOW
     assert reco.discount_band.min_pct == 0.0
+    assert reco.discount_band.target_pct == pytest.approx(7.5)
+    assert reco.discount_band.max_pct == pytest.approx(18.0)

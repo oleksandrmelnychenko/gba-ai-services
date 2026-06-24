@@ -1,9 +1,12 @@
 """MongoDB access — connection, collections, index setup. Graceful, lazy singleton."""
 from __future__ import annotations
 
-from pymongo import ASCENDING, DESCENDING, MongoClient
+from datetime import UTC, datetime, timedelta
+
+from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
 from pymongo.collection import Collection
 from pymongo.database import Database
+from pymongo.errors import DuplicateKeyError
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
@@ -38,6 +41,10 @@ def manager_prefs() -> Collection:
     return get_db()["manager_prefs"]
 
 
+def locks() -> Collection:
+    return get_db()["locks"]
+
+
 def ensure_indexes() -> None:
     """Idempotent index creation — matches the access patterns in the master plan."""
     t = tasks()
@@ -52,7 +59,39 @@ def ensure_indexes() -> None:
 
     task_events().create_index([("task_key", ASCENDING), ("at", ASCENDING)], name="ix_event_task")
     manager_prefs().create_index([("manager_id", ASCENDING)], unique=True, name="uq_mgr")
+    locks().create_index([("name", ASCENDING)], unique=True, name="uq_lock_name")
+    locks().create_index([("expires_at", ASCENDING)], name="ix_lock_expiry")
     log.info("mongo_indexes_ensured")
+
+
+def acquire_lock(name: str, owner: str, ttl_seconds: int) -> bool:
+    now = datetime.now(UTC)
+    expires_at = now + timedelta(seconds=ttl_seconds)
+    try:
+        doc = locks().find_one_and_update(
+            {
+                "name": name,
+                "$or": [
+                    {"expires_at": {"$lte": now}},
+                    {"owner": owner},
+                    {"owner": {"$exists": False}},
+                ],
+            },
+            {
+                "$set": {"name": name, "owner": owner, "expires_at": expires_at,
+                         "updated_at": now},
+                "$setOnInsert": {"created_at": now},
+            },
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+    except DuplicateKeyError:
+        return False
+    return bool(doc and doc.get("owner") == owner)
+
+
+def release_lock(name: str, owner: str) -> None:
+    locks().delete_one({"name": name, "owner": owner})
 
 
 def ping() -> bool:

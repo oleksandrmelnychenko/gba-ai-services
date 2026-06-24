@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import inspect
 import re
+from pathlib import Path
 
 from app.data import signals_repository as sig
+from scripts import realdata_census
 
 _OVERDUE_SRC = inspect.getsource(sig.overdue_debts_for_manager)
 _PAID_SRC = inspect.getsource(sig.monthly_paid)
@@ -53,3 +55,17 @@ def test_monthly_paid_does_not_trust_euroamount():
 def test_overdue_debt_uses_parameterized_filters():
     assert ":mid" in _OVERDUE_SRC and ":asof" in _OVERDUE_SRC
     assert ":maxage" in _OVERDUE_SRC and ":minamt" in _OVERDUE_SRC
+
+
+def test_realdata_census_has_fail_fast_check_mode():
+    src = inspect.getsource(realdata_census)
+    assert "--check" in src
+    assert "total_candidates" in src
+    assert "return 1" in src
+
+
+def test_makefile_exposes_calibration_target():
+    makefile = Path(__file__).resolve().parents[1] / "Makefile"
+    src = makefile.read_text(encoding="utf-8")
+    assert "calibration:" in src
+    assert "realdata_census --check" in src

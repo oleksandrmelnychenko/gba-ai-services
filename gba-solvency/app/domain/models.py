@@ -43,6 +43,11 @@ class DebtLoadSource(StrEnum):
     LIVE_PROXY = "live_proxy"
 
 
+class ExposureSource(StrEnum):
+    DEBT_TABLE = "debt_table"
+    UNAVAILABLE = "unavailable"
+
+
 class CapType(StrEnum):
     UTILIZATION_HARD_40 = "utilization_hard_40"
     UTILIZATION_SOFT_60 = "utilization_soft_60"
@@ -67,7 +72,8 @@ class SubFactors(BaseModel):
 class CurrencyExposure(BaseModel):
     currency_id: int
     turnover_eur: float
-    exposure_eur: float
+    exposure_eur: float | None = None
+    exposure_source: ExposureSource = ExposureSource.UNAVAILABLE
 
 
 class SolvencyScore(BaseModel):
@@ -85,7 +91,8 @@ class SolvencyScore(BaseModel):
 
 
 class GaugeChart(BaseModel):
-    value: float
+    value: float | None = None
+    has_controlled_limit: bool = False
     threshold_soft: float = 0.9
     threshold_hard: float = 1.0
     label: str = "limit_utilization"
@@ -105,7 +112,8 @@ class AgingBar(BaseModel):
 class TurnoverExposurePoint(BaseModel):
     period: str
     turnover_eur: float
-    exposure_eur: float
+    exposure_eur: float | None = None
+    exposure_source: ExposureSource = ExposureSource.UNAVAILABLE
 
 
 class ScorePoint(BaseModel):

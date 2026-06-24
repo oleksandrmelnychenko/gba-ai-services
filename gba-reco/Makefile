@@ -1,4 +1,4 @@
-.PHONY: install dev test integration lint eval smoke worker up down
+.PHONY: install dev test integration lint eval calibration smoke worker up down
 
 install:
 	python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
@@ -17,6 +17,9 @@ lint:
 
 eval:
 	.venv/bin/python -m app.services.eval.harness --k 10
+
+calibration:
+	.venv/bin/python -m app.services.eval.harness --k 10 --baseline --limit 120
 
 smoke:
 	.venv/bin/python scripts/smoke_test.py

@@ -22,6 +22,8 @@ cp .env.example .env   # fill DB_PASSWORD with the read-only login
 .venv/bin/uvicorn app.api.main:app --host 0.0.0.0 --port 8000
 # smoke test:
 .venv/bin/python scripts/smoke_test.py
+# bounded release calibration:
+make calibration
 ```
 
 ## API

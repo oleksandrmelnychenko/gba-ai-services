@@ -18,8 +18,7 @@ from datetime import date, datetime
 
 from app.core.config import get_settings
 from app.data import cost_repository as cost_repo
-from app.data import feedback
-from app.data import masters
+from app.data import feedback, masters
 from app.data import supply_repository as repo
 from app.domain.models import (
     CartReplenishmentPlan,
@@ -38,9 +37,9 @@ from app.domain.models import (
 )
 from app.services.classify import segmentation
 from app.services.classify import service as classify_svc
-from app.services.optimization import milp as milp_opt
 from app.services.forecasting import demand as demand_svc
 from app.services.forecasting import lead_time as lead_time_svc
+from app.services.optimization import milp as milp_opt
 
 # Shared urgency ordering (critical first) for sorting and the mix histogram.
 _URGENCY_ORDER = {Urgency.CRITICAL: 0, Urgency.HIGH: 1, Urgency.NORMAL: 2, Urgency.NONE: 3}
@@ -185,7 +184,6 @@ def build_plan(producer_id: int, as_of: str, only_needed: bool = True,
                abc_map: dict[int, str] | None = None,
                producer_name=_UNSET) -> ProducerPurchasePlan:
     s = get_settings()
-    z_global = _z_for(s.service_level)
     lt_mean, lt_std, lt_source = lead_time_svc.producer_lead_time(producer_id, as_of)
     product_ids = repo.products_for_producer(producer_id, as_of, s.history_days)
 

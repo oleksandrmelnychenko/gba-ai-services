@@ -53,6 +53,10 @@ def resolve_product(product_id: int | None, product_net_uid: str | None) -> dict
 def resolve_client_agreement(client_agreement_net_uid: str) -> dict[str, Any] | None:
     """Resolve a ClientAgreement.NetUID to its ID, the parent Agreement.ID, its PricingID and
     CurrencyID. The Agreement context drives base-tier resolution and FX of realized revenue.
+
+    Deleted agreement chains are not valid serving targets for fresh AI recommendations. The
+    legacy SQL price function can still calculate for historical NetUIDs, but the API should not
+    recommend a new price against a soft-deleted ClientAgreement/Agreement.
     """
     rows = query(
         """
@@ -65,6 +69,8 @@ def resolve_client_agreement(client_agreement_net_uid: str) -> dict[str, Any] | 
         FROM dbo.ClientAgreement ca
         JOIN dbo.Agreement a ON a.ID = ca.AgreementID
         WHERE ca.NetUID = :uid
+              AND ca.Deleted = 0
+              AND a.Deleted = 0
         """,
         {"uid": client_agreement_net_uid},
     )
@@ -122,8 +128,10 @@ def base_list_price_and_markup(product_id: int, agreement_id: int) -> dict[str, 
     solved against (B leg). marked_up*(1-DiscountRate/100) then reproduces the engine baseline,
     so suggested_discount_pct reproduces recommended_price.
 
-    base_pricing_id / culture are still the BASE tier's (drive the segment discount distribution,
-    which is keyed on the base-tier family via GetBasePricingId).
+    base_pricing_id / culture describe the BASE tier used for ProductPricing. Discount caps are
+    intentionally not keyed on this base family: ЦО2 and ЦО1 share the same base price, but their
+    ProductGroupDiscount distributions are different and must be capped by the actual
+    Agreement.PricingID.
     """
     rows = query(
         """
@@ -207,8 +215,9 @@ def product_group_id(product_id: int) -> int | None:
 
 def active_group_discount(client_agreement_id: int, product_group_id_value: int) -> float | None:
     """The @DiscountRate the live engine consumes: ProductGroupDiscount.DiscountRate for this
-    (client-agreement × product-group), IsActive=1, Deleted=0. Returned so the engine can report
-    the current discount and detect over-discount versus the peer cap.
+    (client-agreement × product-group), IsActive=1, ProductGroupDiscount.Deleted intentionally
+    ignored to mirror dbo.GetCalculatedProductPriceWithSharesAndVat. Returned so the engine can
+    report the current discount and detect over-discount versus the peer cap.
     """
     rows = query(
         """
@@ -417,22 +426,28 @@ def peer_band(product_id: int, as_of_date: str, window_months: int,
     }
 
 
-def segment_discount_distribution(product_group_id_value: int, base_pricing_id: int,
+def segment_discount_distribution(product_group_id_value: int, pricing_id: int,
                                   culture: str) -> dict[str, Any]:
     """B leg: the peer discount cap. Distribution of the engine's own DiscountRate lever within
-    the segment = (ProductGroupID × base-tier-family via GetBasePricingId × Culture).
+    the segment = (ProductGroupID × actual Agreement.PricingID × Culture).
 
-    D = { ProductGroupDiscount.DiscountRate : IsActive-only, Deleted ignored, matching the
-          engine/lever, same ProductGroupID, client-agreements whose Agreement resolves
-          (GetBasePricingId) to the same base tier and whose Pricing.Culture matches }.
+    D = { ProductGroupDiscount.DiscountRate : IsActive-only, pgd.Deleted ignored, matching the
+          engine/lever, same ProductGroupID, live client-agreements whose Agreement uses the same
+          actual PricingID and whose Pricing.Culture matches }.
           Returns P75 (target cap) and P90 (hard cap) + n.
 
     The cap MUST be computed over the SAME population the lever/engine consume: active_group_discount
     (the applied @DiscountRate) and the live engine honor IsActive=1 and IGNORE Deleted (on this DB
     100% of Sale/Order/OrderItem carry Deleted=1; ProductGroupDiscount is gated by IsActive only).
-    Filtering Deleted=0 here would cap the discount against a smaller, different population than the
-    discount being capped. See tests/test_source_guards.py (active_group_discount must not filter
-    Deleted) — this cap obeys the same invariant.
+    Filtering pgd.Deleted=0 here would cap the discount against a smaller, different population than
+    the discount being capped. See tests/test_source_guards.py (active_group_discount must not filter
+    pgd.Deleted) — this cap obeys the same invariant. ClientAgreement/Agreement Deleted flags are
+    different: they define whether a commercial agreement is a live serving peer, and are filtered
+    out to avoid stale sync leftovers contaminating current tier norms.
+
+    Do not group by dbo.GetBasePricingId(a.PricingID): ЦО2 and ЦО1/ЦP share the same base product
+    price but have materially different discount norms. Pooling them would let the AI recommend a
+    ЦО1-style discount on a ЦО2 agreement.
     """
     rows = query(
         """
@@ -441,10 +456,12 @@ def segment_discount_distribution(product_group_id_value: int, base_pricing_id: 
             FROM dbo.ProductGroupDiscount pgd
             JOIN dbo.ClientAgreement ca ON ca.ID = pgd.ClientAgreementID
             JOIN dbo.Agreement a ON a.ID = ca.AgreementID
-            JOIN dbo.Pricing pr ON pr.ID = dbo.GetBasePricingId(a.PricingID)
+            JOIN dbo.Pricing pr ON pr.ID = a.PricingID
             WHERE pgd.ProductGroupID = :pgid
                   AND pgd.IsActive = 1
-                  AND pr.ID = :base_pricing_id
+                  AND ca.Deleted = 0
+                  AND a.Deleted = 0
+                  AND a.PricingID = :pricing_id
                   AND pr.Culture = :culture
         )
         SELECT DISTINCT
@@ -455,7 +472,7 @@ def segment_discount_distribution(product_group_id_value: int, base_pricing_id: 
         """,
         {
             "pgid": product_group_id_value,
-            "base_pricing_id": base_pricing_id,
+            "pricing_id": pricing_id,
             "culture": culture,
         },
     )

@@ -11,6 +11,7 @@ from app.domain.models import (
     CapType,
     CurrencyExposure,
     DebtLoadSource,
+    ExposureSource,
     Rating,
     SolvencyCharts,
     SolvencyScore,
@@ -77,7 +78,8 @@ def _currency_breakdown(
         CurrencyExposure(
             currency_id=r["currency_id"] if r["currency_id"] is not None else 0,
             turnover_eur=round(float(r["turnover_eur"]), 2),
-            exposure_eur=0.0,
+            exposure_eur=None,
+            exposure_source=ExposureSource.UNAVAILABLE,
         )
         for r in rows
     ]

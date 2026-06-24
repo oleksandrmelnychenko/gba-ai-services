@@ -95,6 +95,13 @@ def discount_from_price(rec_price: float | None, marked_up: float | None) -> flo
     return (1.0 - rec_price / marked_up) * 100.0
 
 
+def price_from_discount(marked_up: float | None, discount_pct: float | None) -> float | None:
+    """Engine inverse of discount_from_price: marked_up*(1-discount/100)."""
+    if marked_up is None or marked_up <= 0 or discount_pct is None:
+        return None
+    return marked_up * (1.0 - discount_pct / 100.0)
+
+
 def cap_discount(
     raw_discount_pct: float | None,
     peer_p75: float | None,
@@ -141,15 +148,48 @@ def margin_pct_at(rec_price: float | None, unit_cost_eur: float | None) -> float
 
 
 def rationale_for(price_rationale: str, discount_was_capped: bool) -> str:
-    """The binding constraint. A discount-cap that actually bound is surfaced over a peer-median
-    anchor; a margin floor / loss flag / baseline anchor always take precedence."""
-    if price_rationale in (
-        R_BELOW_MARGIN, R_MARGIN_FLOOR, R_AT_BASELINE, R_NO_ANCHOR, R_NO_BASELINE
-    ):
-        return price_rationale
+    """The binding constraint. If the discount cap changes the actionable price, it wins."""
     if discount_was_capped:
         return R_DISCOUNT_CAP
     return price_rationale
+
+
+def discount_band_for(
+    *,
+    suggested_discount: float | None,
+    floor: float | None,
+    marked_up: float | None,
+    peer_p75: float | None,
+    peer_p90: float | None,
+) -> DiscountBand | None:
+    """Actionable DiscountRate window for the UI.
+
+    min_pct is 0 because negative discounts are not an engine lever. max_pct is the strictest
+    available upper bound between the margin floor's implied discount and the peer hard cap (P90,
+    or P75 when P90 is missing). target_pct is the final suggested discount and must stay inside
+    the rendered range.
+    """
+    if suggested_discount is None:
+        return None
+
+    upper_bounds: list[float] = []
+    floor_discount = discount_from_price(floor, marked_up)
+    if floor_discount is not None and floor_discount >= 0:
+        upper_bounds.append(floor_discount)
+
+    peer_hard_cap = peer_p90 if peer_p90 is not None else peer_p75
+    if peer_hard_cap is not None:
+        upper_bounds.append(max(0.0, peer_hard_cap))
+
+    max_pct = min(upper_bounds) if upper_bounds else max(0.0, suggested_discount)
+    target_pct = min(max(suggested_discount, 0.0), max_pct)
+    band = DiscountBand(
+        min_pct=0.0,
+        target_pct=_round2(target_pct),
+        max_pct=_round2(max_pct),
+    )
+    assert band.min_pct <= band.target_pct <= band.max_pct
+    return band
 
 
 def elasticity_outputs(
@@ -204,23 +244,31 @@ def build_recommendation(
     raw_discount = discount_from_price(rec.value, marked_up)
     seg_p75 = segment.get("p75")
     seg_p90 = segment.get("p90")
-    suggested_discount, was_capped = cap_discount(raw_discount, seg_p75, seg_p90)
-
-    floor_discount = discount_from_price(floor, marked_up)
-    min_pct = max(0.0, floor_discount) if floor_discount is not None else 0.0
-    max_pct = seg_p90 if seg_p90 is not None else (seg_p75 if seg_p75 is not None else 0.0)
-    target_pct = suggested_discount if suggested_discount is not None else 0.0
-    lo, hi = sorted([min_pct, max_pct])
-    target_pct = min(max(target_pct, lo), hi)
-    discount_band = DiscountBand(
-        min_pct=_round2(lo),
-        target_pct=_round2(target_pct),
-        max_pct=_round2(hi),
+    non_actionable_loss_flag = (
+        rec.rationale == R_BELOW_MARGIN
+        and raw_discount is not None
+        and raw_discount < 0
     )
-    assert discount_band.min_pct <= discount_band.target_pct <= discount_band.max_pct
+    if non_actionable_loss_flag:
+        suggested_discount = None
+        was_capped = False
+        final_price = rec.value
+        discount_band = None
+    else:
+        suggested_discount, was_capped = cap_discount(raw_discount, seg_p75, seg_p90)
+        final_price = price_from_discount(marked_up, suggested_discount)
+        if final_price is None:
+            final_price = rec.value
+        discount_band = discount_band_for(
+            suggested_discount=suggested_discount,
+            floor=floor,
+            marked_up=marked_up,
+            peer_p75=seg_p75,
+            peer_p90=seg_p90,
+        )
 
     confidence = confidence_for(lot_count, peer_n, has_cost, baseline)
-    margin_pct = margin_pct_at(rec.value, unit_cost)
+    margin_pct = margin_pct_at(final_price, unit_cost)
     rationale = rationale_for(rec.rationale, was_capped)
 
     elasticity_val, elasticity_src, elastic_price = elasticity_outputs(
@@ -232,7 +280,7 @@ def build_recommendation(
         client_agreement_netuid=client_agreement_netuid,
         currency="EUR",
         baseline_price=_round2(baseline) if baseline is not None else None,
-        recommended_price=_round2(rec.value) if rec.value is not None else None,
+        recommended_price=_round2(final_price) if final_price is not None else None,
         price_floor=_round2(floor) if floor is not None else None,
         unit_cost_eur=_round2(unit_cost) if unit_cost is not None else None,
         suggested_discount_pct=(

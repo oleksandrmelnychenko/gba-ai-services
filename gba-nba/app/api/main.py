@@ -29,10 +29,12 @@ _OPEN_PATHS = {"/health"}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    settings.assert_release_safe("gba-nba")
     try:
         mongo.ensure_indexes()
     except Exception as exc:  # noqa: BLE001
-        log.warning("mongo_index_setup_failed", error=str(exc))
+        log.error("mongo_index_setup_failed", error=str(exc))
+        raise
     if not settings.internal_api_key:
         log.warning("internal_api_key_not_set", note="gba-nba running OPEN — set INTERNAL_API_KEY")
     log.info("service_starting", service="gba-nba")

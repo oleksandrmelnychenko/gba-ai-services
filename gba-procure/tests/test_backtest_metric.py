@@ -6,6 +6,11 @@ so it can trade off against the unit/event stockout signal.
 """
 from __future__ import annotations
 
+import inspect
+from datetime import date
+
+import pytest
+
 from app.domain.models import (
     DemandForecast,
     InventoryPosition,
@@ -43,6 +48,7 @@ def test_overstock_units_counts_excess_beyond_demand(monkeypatch):
     assert r.products == 1
     assert r.overstock_units_per_product == 15.0
     assert r.overstock_units_per_demand == 1.5
+    assert r.demand_units == 10.0
 
 
 def test_no_excess_when_post_order_below_demand(monkeypatch):
@@ -52,6 +58,7 @@ def test_no_excess_when_post_order_below_demand(monkeypatch):
     assert r.overstock_units == 0.0
     assert r.stockout_rate == 1.0
     assert r.fill_rate == 0.5
+    assert r.demand_units == 10.0
 
 
 def test_zero_demand_product_is_pure_excess(monkeypatch):
@@ -72,3 +79,26 @@ def test_overstock_units_grows_with_order_size(monkeypatch):
     big = bt.backtest_producer(1, "2026-01-01", 30).overstock_units
     assert big > small
     assert small == 10.0 and big == 190.0
+
+
+def test_actual_demand_uses_valid_sale_filter_not_order_deleted():
+    src = inspect.getsource(bt._actual_demand)
+    assert "oi.IsValidForCurrentSale = 1" in src
+    assert "oi.ProductID <> 25422404" in src
+    assert "o.Deleted" not in src
+
+
+def test_backtest_rejects_incomplete_future_window_before_policy(monkeypatch):
+    monkeypatch.setattr(bt, "_today", lambda: date(2026, 1, 15))
+
+    def boom(*a, **k):
+        raise AssertionError("policy must not run for an incomplete backtest window")
+
+    monkeypatch.setattr(bt.policy, "build_plan", boom)
+    with pytest.raises(ValueError, match="complete_future_demand_window"):
+        bt.backtest_producer(1, "2026-01-01", 30)
+
+
+def test_backtest_rejects_invalid_window():
+    with pytest.raises(ValueError, match="eval_window_days"):
+        bt.backtest_producer(1, "2026-01-01", 0)

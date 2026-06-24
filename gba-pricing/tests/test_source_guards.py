@@ -46,31 +46,55 @@ def test_peer_band_uses_priceperitem_as_eur_not_fx_converted():
 
 
 def test_active_group_discount_does_not_filter_deleted():
-    """REVERT CAUGHT: adding `AND Deleted = 0` (or any `Deleted`) to the active-discount lookup.
-    On this DB Sale/Order/OrderItem carry Deleted=1 on 100% of rows; the discount lever is gated by
-    IsActive=1, never Deleted. A Deleted predicate here would silently drop the real @DiscountRate
-    the engine consumes."""
+    """REVERT CAUGHT: adding `AND ProductGroupDiscount.Deleted = 0` (or any Deleted predicate) to
+    the active-discount lookup. The live SQL price function gates the discount lever by IsActive=1
+    and ignores ProductGroupDiscount.Deleted. A Deleted predicate here would silently drop the real
+    @DiscountRate the engine consumes."""
     code = _code_without_docstring(repo.active_group_discount)
     assert "IsActive = 1" in code
     assert "Deleted" not in code
 
 
-def test_segment_cap_population_matches_lever_does_not_filter_deleted():
-    """REVERT CAUGHT: adding `AND pgd.Deleted = 0` (or any `Deleted`) to the peer-discount CAP.
-    The cap MUST be measured on the SAME population the lever/engine consume. active_group_discount
-    (the applied @DiscountRate) and the live engine gate ProductGroupDiscount by IsActive=1 and
-    IGNORE Deleted. A Deleted=0 predicate on the cap computes the P75/P90 over a smaller, different
-    set than the discount it caps (verified live: 102,134 active rows carry Deleted=1), spuriously
-    flagging ~27k active lever rows as over-cap. The cap obeys the same invariant as the lever."""
+def test_segment_cap_population_matches_lever_does_not_filter_pgd_deleted():
+    """REVERT CAUGHT: adding `AND pgd.Deleted = 0` to the peer-discount CAP. The cap MUST be
+    measured on the same ProductGroupDiscount lever population the live engine consumes: IsActive=1,
+    pgd.Deleted ignored. ClientAgreement/Agreement Deleted are separate serving-target flags and
+    must stay filtered so stale sync leftovers do not contaminate current tier norms."""
     code = _code_without_docstring(repo.segment_discount_distribution)
     assert "pgd.IsActive = 1" in code
-    assert "Deleted" not in code
+    assert "pgd.Deleted" not in code
+    assert "ca.Deleted = 0" in code
+    assert "a.Deleted = 0" in code
+
+
+def test_resolve_client_agreement_rejects_deleted_agreement_chain():
+    """REVERT CAUGHT: serving fresh AI recommendations against soft-deleted client agreements.
+    The legacy SQL price function can still calculate old NetUIDs, but the API target must be a
+    current ClientAgreement + Agreement chain."""
+    code = _code_without_docstring(repo.resolve_client_agreement)
+    assert "ca.NetUID = :uid" in code
+    assert "ca.Deleted = 0" in code
+    assert "a.Deleted = 0" in code
+
+
+def test_segment_cap_uses_actual_pricing_not_base_pricing_family():
+    """REVERT CAUGHT: grouping discount caps by dbo.GetBasePricingId(a.PricingID). ЦО2 and
+    ЦО1/ЦP share the same base ProductPricing row but have different discount norms; pooling the
+    base family lets ЦО1's commercial discount band leak into ЦО2 agreements."""
+    code = _code_without_docstring(repo.segment_discount_distribution)
+    assert "a.PricingID = :pricing_id" in code
+    assert "GetBasePricingId" not in code
+
+    svc_code = _code_without_docstring(service.recommend_price)
+    assert "agreement.get('pricing_id')" in svc_code
+    assert "base_pricing_id" not in svc_code
 
 
 def test_is_promotional_present_and_service_derives_marked_up_from_baseline():
     """REVERT CAUGHT: dropping the promotional branch or re-resolving marked_up from the pricing
     tier. On the promo branch the engine FORCES DiscountRate=0, so marked_up must use applied=0;
-    the service must derive marked_up from the authoritative baseline (not re-read the tier)."""
+    the service must derive marked_up from the authoritative baseline (not re-read the tier), and
+    must not apply normal ProductGroupDiscount caps because that DiscountRate lever is disabled."""
     assert hasattr(repo, "is_promotional")
     promo_code = _code_without_docstring(repo.is_promotional)
     assert "PromotionalPricingID IS NOT NULL" in promo_code
@@ -78,6 +102,8 @@ def test_is_promotional_present_and_service_derives_marked_up_from_baseline():
     svc_code = _code_without_docstring(service.recommend_price)
     assert "is_promotional" in svc_code
     assert "_marked_up_from_baseline" in svc_code
+    assert "'p75': 0.0" in svc_code
+    assert "'p90': 0.0" in svc_code
 
     helper_code = _code_without_docstring(service._marked_up_from_baseline)
     assert "baseline / (1.0 - applied_discount_pct / 100.0)" in helper_code
@@ -155,7 +181,7 @@ def test_elastic_price_is_secondary_never_replaces_recommended_price():
     code = _code_without_docstring(engine.build_recommendation)
     assert "recommended_price(floor, p50, baseline)" in code
     assert "elastic_optimal_price=" in code
-    assert "recommended_price=_round2(rec.value)" in code
+    assert "recommended_price=_round2(final_price)" in code
     assert "recommended_price=elastic_price" not in code
     assert "recommended_price=_round2(elastic_price)" not in code
 

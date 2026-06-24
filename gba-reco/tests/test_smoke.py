@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from app.data.db import in_clause
 from app.domain.models import ProductRec, RecommendationResult, RecSource, Segment
+from scripts import smoke_test
 
 
 def test_in_clause_parameterized():
@@ -46,3 +47,41 @@ def test_cache_key_stable_and_versioned():
     assert k1 == k2
     assert k1.startswith("reco:")
     assert ":123:" in k1
+
+
+def _smoke_result(recs: list[ProductRec], *, count: int | None = None) -> RecommendationResult:
+    return RecommendationResult(
+        customer_id=1,
+        recommendations=recs,
+        count=len(recs) if count is None else count,
+        discovery_count=0,
+        segment="LIGHT",
+        latency_ms=1.0,
+        model_version="test-model",
+    )
+
+
+def test_smoke_validator_accepts_valid_contract():
+    result = _smoke_result([
+        ProductRec(product_id=5, score=0.9, rank=1, segment="LIGHT", source=RecSource.REPURCHASE),
+    ])
+
+    assert smoke_test.validate_result(1, result, top_n=10) == []
+
+
+def test_smoke_validator_rejects_empty_result():
+    errors = smoke_test.validate_result(1, _smoke_result([]), top_n=10)
+
+    assert any("empty recommendation list" in err for err in errors)
+
+
+def test_smoke_validator_rejects_duplicate_products_and_bad_ranks():
+    result = _smoke_result([
+        ProductRec(product_id=5, score=0.9, rank=2, segment="LIGHT", source=RecSource.REPURCHASE),
+        ProductRec(product_id=5, score=0.8, rank=2, segment="LIGHT", source=RecSource.DISCOVERY),
+    ])
+
+    errors = smoke_test.validate_result(1, result, top_n=10)
+
+    assert any("duplicate product ids" in err for err in errors)
+    assert any("ranks=" in err for err in errors)

@@ -79,6 +79,8 @@ def test_score_client_currency_breakdown_only_when_multicurrency(monkeypatch):
     out = service.score_client(5, None, "2026-06-01", 12, use_cache=False)
     assert out.currency_breakdown is not None
     assert len(out.currency_breakdown) == 2
+    assert all(c.exposure_eur is None for c in out.currency_breakdown)
+    assert {c.exposure_source.value for c in out.currency_breakdown} == {"unavailable"}
 
 
 def test_score_client_no_currency_breakdown_single_currency(monkeypatch):
@@ -140,9 +142,33 @@ def test_build_charts_assembles_from_repo(monkeypatch):
 
     out = service.build_charts(11, "2026-06-01", 12)
     assert out.limit_utilization_gauge.value == 0.8
+    assert out.limit_utilization_gauge.has_controlled_limit is True
     labels = {d.label: d.count for d in out.payment_discipline_donut}
     assert labels["refund"] == 4
     assert labels["partial"] == 2
     assert [b.bucket for b in out.open_invoice_aging_bars] == ["0-30", "31-60", "61-90", "90+"]
     assert out.aging_over_time_heatmap == "pending"
     assert len(out.turnover_trend) == 2
+    assert all(p.exposure_eur is None for p in out.turnover_vs_exposure)
+    assert {p.exposure_source.value for p in out.turnover_vs_exposure} == {"unavailable"}
+
+
+def test_build_charts_marks_missing_limit_and_live_debt_exposure(monkeypatch):
+    monkeypatch.setattr(service.repo, "payment_status_counts", lambda *a, **k: {})
+    monkeypatch.setattr(service.repo, "retail_payment_status_counts", lambda *a, **k: {})
+    monkeypatch.setattr(service.repo, "credit_limit_utilization", lambda *a, **k: [])
+    monkeypatch.setattr(service.repo, "open_unpaid_aging_buckets", lambda *a, **k: [])
+    monkeypatch.setattr(service.repo, "monthly_turnover_series", lambda *a, **k: [
+        {"period": "2026-06", "turnover_eur": 200.0}])
+    monkeypatch.setattr(service.repo, "debt_sync_is_live", lambda *a, **k: True)
+    monkeypatch.setattr(service.repo, "overdue_amount_eur", lambda *a, **k: 0.0)
+
+    from app.services.solvency import charts as charts_builder
+    monkeypatch.setattr(charts_builder, "_score_sparkline", lambda *a, **k: [])
+
+    out = service.build_charts(11, "2026-06-01", 12)
+
+    assert out.limit_utilization_gauge.value is None
+    assert out.limit_utilization_gauge.has_controlled_limit is False
+    assert out.turnover_vs_exposure[0].exposure_eur == 0.0
+    assert out.turnover_vs_exposure[0].exposure_source.value == "debt_table"

@@ -22,10 +22,10 @@ class Confidence(StrEnum):
 class DiscountBand(BaseModel):
     """The defensible discount window expressed in the engine's own DiscountRate lever (%).
 
-    Edges = { floor-implied discount (most aggressive discount that still holds the margin floor),
-    peer P90 cap from ProductGroupDiscount.DiscountRate within the segment }, emitted as
-    min_pct <= max_pct (sorted) so the rendered range is always monotone. target_pct = the
-    suggested discount that reproduces recommended_price, clamped into [min_pct, max_pct].
+    min_pct is 0 because negative discounts are not an engine lever. max_pct is the strictest
+    available hard upper bound between the margin-floor-implied discount and the peer P90 cap
+    from ProductGroupDiscount.DiscountRate within the actual pricing segment. target_pct = the
+    final suggested discount that reproduces recommended_price, clamped into [min_pct, max_pct].
     DISPLAY-ONLY: this band never feeds recommended_price / suggested_discount_pct / margin.
     """
     min_pct: float
@@ -49,7 +49,8 @@ class PriceRecommendation(BaseModel):
         default=None, description="dbo.GetCalculatedProductPriceWithSharesAndVat output, unchanged"
     )
     recommended_price: float | None = Field(
-        default=None, description="optimizer target; clamp(max(floor,peer_P50), floor, baseline)"
+        default=None,
+        description="final optimizer target; A+B target adjusted when the DiscountRate cap binds",
     )
     price_floor: float | None = Field(
         default=None, description="unit_cost_eur*(1+target_margin_pct/100); never recommend below"

@@ -61,6 +61,21 @@ def test_quota_keeps_a_balanced_mix(mongo_db, monkeypatch):
     assert bt["debt_followup"] >= bt["cross_sell"]        # debt is the heaviest-weighted quota
 
 
+def test_generate_skips_when_manager_lock_is_held(mongo_db, monkeypatch):
+    from app.data import mongo
+    from app.services import orchestrator
+
+    mongo.ensure_indexes()
+    assert mongo.acquire_lock("nba.generate.manager.1", "already-running", 900) is True
+    _patch_generators(monkeypatch, {TaskType.DEBT_FOLLOWUP: 5})
+
+    stats = orchestrator.generate_for_manager(1, "2026-06-07")
+
+    assert stats["locked"] is True
+    assert stats["persisted"] == 0
+    assert mongo.tasks().count_documents({}) == 0
+
+
 def test_inbox_orders_by_urgency_then_debt_first(mongo_db):
     from app.services import lifecycle
     lifecycle.upsert_generated(_band_task("reorder_crit", TaskType.REORDER_DUE, Urgency.CRITICAL, 99.0))

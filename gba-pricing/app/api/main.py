@@ -41,6 +41,7 @@ def _service():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    settings.assert_release_safe("gba-pricing")
     get_engine()  # warm pool
     if not settings.internal_api_key:
         log.warning("internal_api_key_not_set", note="gba-pricing running OPEN — set INTERNAL_API_KEY")

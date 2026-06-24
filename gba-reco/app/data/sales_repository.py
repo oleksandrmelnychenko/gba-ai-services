@@ -86,6 +86,10 @@ def count_orders_before(customer_id: int, as_of_date: str) -> int:
         FROM dbo.ClientAgreement ca
         JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
         WHERE ca.ClientID = :cid AND o.Created < :asof
+          AND EXISTS (
+              SELECT 1 FROM dbo.OrderItem oi
+              WHERE oi.OrderID = o.ID AND oi.IsValidForCurrentSale = 1
+          )
         """,
         {"cid": customer_id, "asof": as_of_date},
     )
@@ -104,7 +108,10 @@ def repurchase_rate(customer_id: int, as_of_date: str) -> float:
             FROM dbo.ClientAgreement ca
             JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
             JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
-            WHERE ca.ClientID = :cid AND o.Created < :asof AND oi.ProductID IS NOT NULL
+            WHERE ca.ClientID = :cid
+              AND o.Created < :asof
+              AND oi.IsValidForCurrentSale = 1
+              AND oi.ProductID IS NOT NULL
             GROUP BY oi.ProductID
         ) t
         """,
@@ -122,7 +129,10 @@ def product_frequency(customer_id: int, as_of_date: str) -> dict[int, int]:
         FROM dbo.ClientAgreement ca
         JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
         JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
-        WHERE ca.ClientID = :cid AND o.Created < :asof AND oi.ProductID IS NOT NULL
+        WHERE ca.ClientID = :cid
+          AND o.Created < :asof
+          AND oi.IsValidForCurrentSale = 1
+          AND oi.ProductID IS NOT NULL
         GROUP BY oi.ProductID
         """,
         {"cid": customer_id, "asof": as_of_date},
@@ -137,12 +147,34 @@ def product_last_purchase(customer_id: int, as_of_date: str) -> dict[int, object
         FROM dbo.ClientAgreement ca
         JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
         JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
-        WHERE ca.ClientID = :cid AND o.Created < :asof AND oi.ProductID IS NOT NULL
+        WHERE ca.ClientID = :cid
+          AND o.Created < :asof
+          AND oi.IsValidForCurrentSale = 1
+          AND oi.ProductID IS NOT NULL
         GROUP BY oi.ProductID
         """,
         {"cid": customer_id, "asof": as_of_date},
     )
     return {int(r["pid"]): r["last_dt"] for r in rows}
+
+
+def product_purchase_stats(customer_id: int, as_of_date: str) -> dict[int, tuple[int, object]]:
+    """Frequency and recency source in one pass over the client's sales history."""
+    rows = query(
+        """
+        SELECT oi.ProductID AS pid, COUNT(DISTINCT o.ID) AS cnt, MAX(o.Created) AS last_dt
+        FROM dbo.ClientAgreement ca
+        JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
+        JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
+        WHERE ca.ClientID = :cid
+          AND o.Created < :asof
+          AND oi.IsValidForCurrentSale = 1
+          AND oi.ProductID IS NOT NULL
+        GROUP BY oi.ProductID
+        """,
+        {"cid": customer_id, "asof": as_of_date},
+    )
+    return {int(r["pid"]): (int(r["cnt"]), r["last_dt"]) for r in rows}
 
 
 def customer_products(customer_id: int, as_of_date: str, limit: int = 500) -> set[int]:
@@ -154,7 +186,10 @@ def customer_products(customer_id: int, as_of_date: str, limit: int = 500) -> se
             FROM dbo.ClientAgreement ca
             JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
             JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
-            WHERE ca.ClientID = :cid AND o.Created < :asof AND oi.ProductID IS NOT NULL
+            WHERE ca.ClientID = :cid
+              AND o.Created < :asof
+              AND oi.IsValidForCurrentSale = 1
+              AND oi.ProductID IS NOT NULL
             ORDER BY o.Created DESC
         ) t
         """,
@@ -189,6 +224,7 @@ def candidate_similar_customers(product_ids: set[int], exclude_id: int, as_of_da
         JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
         WHERE ca.ClientID <> :exclude
               AND o.Created < :asof
+              AND oi.IsValidForCurrentSale = 1
               AND oi.ProductID IN {placeholder}
         GROUP BY ca.ClientID
         ORDER BY overlap DESC
@@ -212,7 +248,10 @@ def customer_products_bulk(customer_ids: list[int], as_of_date: str) -> dict[int
         FROM dbo.ClientAgreement ca
         JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
         JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
-        WHERE ca.ClientID IN {placeholder} AND o.Created < :asof AND oi.ProductID IS NOT NULL
+        WHERE ca.ClientID IN {placeholder}
+          AND o.Created < :asof
+          AND oi.IsValidForCurrentSale = 1
+          AND oi.ProductID IS NOT NULL
         """,
         {"asof": as_of_date, **params},
     )
@@ -249,6 +288,7 @@ def collaborative_products(
         JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
         JOIN Sim s ON ca.ClientID = s.customer_id
         WHERE o.Created < :asof
+              AND oi.IsValidForCurrentSale = 1
               AND oi.ProductID IS NOT NULL
               AND oi.ProductID NOT IN {owned_ph}
         GROUP BY oi.ProductID

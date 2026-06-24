@@ -6,6 +6,7 @@ from functools import lru_cache
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import URL
 
 
 class Settings(BaseSettings):
@@ -26,11 +27,13 @@ class Settings(BaseSettings):
     redis_port: int = 6379
     redis_db: int = 3
     cache_ttl: int = 3600
+    redis_retry_cooldown_seconds: int = 30
 
     # API — port 8004 (8000 reco, 8001 procure, 8002 nba, 8003 solvency, 8004 pricing)
     api_host: str = "0.0.0.0"
     api_port: int = 8004
     log_level: str = "INFO"
+    environment: str = "dev"
     # Shared secret the trusted gba-server proxy must present (X-Internal-Api-Key).
     # Empty = open (dev only); set in every non-local deployment.
     internal_api_key: str = ""
@@ -100,11 +103,20 @@ class Settings(BaseSettings):
     elasticity_pooled_max_products: int = 400
 
     @property
-    def sqlalchemy_url(self) -> str:
-        return (
-            f"mssql+pymssql://{self.db_user}:{self.db_password}"
-            f"@{self.db_host}:{self.db_port}/{self.db_name}"
+    def sqlalchemy_url(self) -> URL:
+        return URL.create(
+            "mssql+pymssql",
+            username=self.db_user,
+            password=self.db_password,
+            host=self.db_host,
+            port=self.db_port,
+            database=self.db_name,
         )
+
+    def assert_release_safe(self, service_name: str) -> None:
+        is_local = self.environment.lower() in {"dev", "local", "test", "development"}
+        if not is_local and not self.internal_api_key:
+            raise RuntimeError(f"{service_name}: INTERNAL_API_KEY is required outside dev/local/test")
 
     def resolve_fx_date(self, as_of_date: str | None) -> str:
         if self.fx_snapshot_date:

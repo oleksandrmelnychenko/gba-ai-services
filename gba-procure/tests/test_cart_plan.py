@@ -57,9 +57,15 @@ def test_build_cart_plan_flattens_sorts_and_filters(monkeypatch):
 
 
 def test_build_cart_plan_budget_knapsack(monkeypatch):
-    a = _sug(1, 10, 5.0, Urgency.CRITICAL, 1.0); a.line_cost_eur = 100.0; a.unit_margin_eur = 4.0
-    b = _sug(2, 10, 5.0, Urgency.HIGH, 1.0); b.line_cost_eur = 50.0; b.unit_margin_eur = 2.0
-    c = _sug(3, 10, 5.0, Urgency.CRITICAL, 1.0); c.line_cost_eur = 80.0; c.unit_margin_eur = 10.0
+    a = _sug(1, 10, 5.0, Urgency.CRITICAL, 1.0)
+    a.line_cost_eur = 100.0
+    a.unit_margin_eur = 4.0
+    b = _sug(2, 10, 5.0, Urgency.HIGH, 1.0)
+    b.line_cost_eur = 50.0
+    b.unit_margin_eur = 2.0
+    c = _sug(3, 10, 5.0, Urgency.CRITICAL, 1.0)
+    c.line_cost_eur = 80.0
+    c.unit_margin_eur = 10.0
     plan_obj = ProducerPurchasePlan(producer_id=10, lead_time_days=5.0,
                                     items=[a, b, c], item_count=3)
     monkeypatch.setattr(policy.repo, "all_producers", lambda as_of, history_days: [10])

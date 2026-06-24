@@ -61,6 +61,17 @@ def test_idempotent_generation_no_duplicate(patched_mongo):
     assert len(lifecycle.inbox(1)) == 1
 
 
+def test_mongo_generation_lock_is_exclusive(patched_mongo):
+    from app.data import mongo
+    mongo.ensure_indexes()
+
+    assert mongo.acquire_lock("nba.generate.manager.1", "owner-a", 60) is True
+    assert mongo.acquire_lock("nba.generate.manager.1", "owner-b", 60) is False
+
+    mongo.release_lock("nba.generate.manager.1", "owner-a")
+    assert mongo.acquire_lock("nba.generate.manager.1", "owner-b", 60) is True
+
+
 def test_done_is_terminal_and_blocks_further(patched_mongo):
     from app.domain.models import Outcome
     from app.services import lifecycle

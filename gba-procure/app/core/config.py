@@ -5,6 +5,7 @@ from functools import lru_cache
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import URL
 
 
 class Settings(BaseSettings):
@@ -17,11 +18,13 @@ class Settings(BaseSettings):
     db_password: str = Field(default="", description="Set in .env; never hardcode")
     db_pool_size: int = 10
     db_max_overflow: int = 10
+    query_timeout: int = 25
 
     redis_host: str = "127.0.0.1"
     redis_port: int = 6379
     redis_db: int = 1
     cache_ttl: int = 3600
+    redis_retry_cooldown_seconds: int = 30
 
     mongo_uri: str = ""
     mongo_db: str = "gba_nba"
@@ -34,6 +37,7 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8001
     log_level: str = "INFO"
+    environment: str = "dev"
 
     # Shared secret the trusted gba-server proxy must present (X-Internal-Api-Key).
     # Empty = open (dev only); set in every non-local deployment.
@@ -88,11 +92,20 @@ class Settings(BaseSettings):
     producer_warm_hour: int = 5    # 05:00 local — full per-producer pass before the cart warm
 
     @property
-    def sqlalchemy_url(self) -> str:
-        return (
-            f"mssql+pymssql://{self.db_user}:{self.db_password}"
-            f"@{self.db_host}:{self.db_port}/{self.db_name}"
+    def sqlalchemy_url(self) -> URL:
+        return URL.create(
+            "mssql+pymssql",
+            username=self.db_user,
+            password=self.db_password,
+            host=self.db_host,
+            port=self.db_port,
+            database=self.db_name,
         )
+
+    def assert_release_safe(self, service_name: str) -> None:
+        is_local = self.environment.lower() in {"dev", "local", "test", "development"}
+        if not is_local and not self.internal_api_key:
+            raise RuntimeError(f"{service_name}: INTERNAL_API_KEY is required outside dev/local/test")
 
 
 @lru_cache

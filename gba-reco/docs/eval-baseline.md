@@ -13,7 +13,10 @@ of each eligible client's last order. One case per client with >= 2 valid orders
 ## How to reproduce
 
 ```
-# full v3.2 (all eligible cases — cheap, ~280ms/case)
+# quick CI/dev regression gate (committed bounded panel)
+.venv/bin/python -m app.services.eval.harness --baseline --k 10 --limit 120
+
+# full v3.2 audit (all eligible cases; slower because backfill calls co-purchase)
 .venv/bin/python -m app.services.eval.harness --k 10
 
 # 4-way head-to-head (v3.2 vs copurchase vs naive baselines) — sampled (copurchase ~1.7s/case)
@@ -24,6 +27,19 @@ of each eligible client's last order. One case per client with >= 2 valid orders
 ```
 
 ## Measured baseline (dev DB, 2026-06)
+
+### v3.2 — quick release gate panel (limit = 120, n = 62, k = 10)
+
+This is the target behind `make calibration`. It is deliberately bounded so CI/dev release
+checks finish in under a minute on the current dev DB while still covering HEAVY, LIGHT, and
+REGULAR_CONSISTENT segments. Use the full audit below before deliberately changing the model.
+
+| metric        | value |
+|---------------|-------|
+| hit_rate@10   | 0.226 |
+| precision@10  | 0.034 |
+| recall@10     | 0.134 |
+| MRR@10        | 0.138 |
 
 ### v3.2 — full population, all eligible cases (n = 409, k = 10)
 

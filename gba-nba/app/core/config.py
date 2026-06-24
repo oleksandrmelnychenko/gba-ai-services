@@ -5,6 +5,7 @@ from functools import lru_cache
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import URL
 
 
 class Settings(BaseSettings):
@@ -22,6 +23,7 @@ class Settings(BaseSettings):
     db_password: str = ""
     db_pool_size: int = 10
     db_max_overflow: int = 10
+    query_timeout: int = 25
 
     # downstream AI services
     reco_url: str = "http://127.0.0.1:8000"
@@ -35,6 +37,7 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8002
     log_level: str = "INFO"
+    environment: str = "dev"
 
     # Daily generation schedule — every manager has a fresh inbox before they log in.
     timezone: str = "Europe/Kyiv"
@@ -46,6 +49,7 @@ class Settings(BaseSettings):
     # NBA policy / throttling
     max_active_tasks_per_manager: int = 50
     max_tasks_per_client_per_day: int = 2
+    generation_lock_ttl_seconds: int = 900
     task_ttl_days: int = 14
     dismiss_mute_days: int = 30
     service_level_due_days: int = 3
@@ -84,11 +88,20 @@ class Settings(BaseSettings):
     feedback_penalty_floor: float = 0.5            # never sink a task below half its score
 
     @property
-    def sqlalchemy_url(self) -> str:
-        return (
-            f"mssql+pymssql://{self.db_user}:{self.db_password}"
-            f"@{self.db_host}:{self.db_port}/{self.db_name}"
+    def sqlalchemy_url(self) -> URL:
+        return URL.create(
+            "mssql+pymssql",
+            username=self.db_user,
+            password=self.db_password,
+            host=self.db_host,
+            port=self.db_port,
+            database=self.db_name,
         )
+
+    def assert_release_safe(self, service_name: str) -> None:
+        is_local = self.environment.lower() in {"dev", "local", "test", "development"}
+        if not is_local and not self.internal_api_key:
+            raise RuntimeError(f"{service_name}: INTERNAL_API_KEY is required outside dev/local/test")
 
 
 @lru_cache

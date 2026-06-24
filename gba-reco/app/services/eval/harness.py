@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 
 from app.core.config import get_settings
 from app.data import sales_repository
-from app.data.db import query
+from app.data.db import in_clause, query
 from app.services.recommendations import recommender
 
 
@@ -103,21 +103,32 @@ def build_cases(min_orders: int = 2, limit: int | None = None) -> list[EvalCase]
         """,
         {"minord": min_orders},
     )
+    excluded = _excluded()
+    order_ids = [int(row["last_order_id"]) for row in last_orders]
+    truth_by_order: dict[int, set[int]] = {}
+    if order_ids:
+        order_ph, order_params = in_clause("oid", order_ids)
+        truth_rows = query(
+            f"""
+            SELECT oi.OrderID AS order_id, oi.ProductID AS pid
+            FROM dbo.OrderItem oi
+            WHERE oi.OrderID IN {order_ph}
+              AND oi.IsValidForCurrentSale = 1
+              AND oi.ProductID IS NOT NULL
+            GROUP BY oi.OrderID, oi.ProductID
+            """,
+            order_params,
+        )
+        for truth_row in truth_rows:
+            truth_by_order.setdefault(int(truth_row["order_id"]), set()).add(int(truth_row["pid"]))
+
     cases: list[EvalCase] = []
     for row in last_orders:
         cid = int(row["cid"])
         last_order_id = int(row["last_order_id"])
         last_dt = row["last_dt"]
         # truth = valid product lines of THAT order (IsValidForCurrentSale=1 parity with rec population)
-        truth_rows = query(
-            """
-            SELECT DISTINCT oi.ProductID AS pid
-            FROM dbo.OrderItem oi
-            WHERE oi.OrderID = :oid AND oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
-            """,
-            {"oid": last_order_id},
-        )
-        truth = {int(r["pid"]) for r in truth_rows} - _excluded()
+        truth = truth_by_order.get(last_order_id, set()) - excluded
         if not truth:
             continue
         # exact timestamp cutoff (keeps same-day-earlier orders visible)
@@ -248,17 +259,31 @@ def compare_fold(fold_as_of: str, k: int = 10, min_orders: int = 2) -> dict[str,
     }
 
 
-# Committed honest baseline for v3.2 (full population, leave-last-basket, k=10, synthetic
-# excluded). See docs/eval-baseline.md. `--baseline` re-runs the harness and asserts the
-# current run has not regressed below these floors (minus tolerance) so future changes are
-# measured against a recorded number, not a guess. Update deliberately when the model improves.
+# Committed honest baselines for v3.2 (leave-last-basket, k=10, synthetic excluded).
+# See docs/eval-baseline.md. `--baseline` without --limit runs the full audit gate; CI/dev
+# should use the committed quick panel (`--baseline --limit 120`) so release checks are bounded.
 BASELINE_V32 = {"n": 409, "hit_rate": 0.242, "precision": 0.033, "recall": 0.193, "mrr": 0.129}
 BASELINE_TOLERANCE = 0.02
+QUICK_BASELINE_V32_LIMIT = 120
+QUICK_BASELINE_V32 = {"n": 62, "hit_rate": 0.226, "precision": 0.034, "recall": 0.134, "mrr": 0.138}
+QUICK_BASELINE_TOLERANCE = 0.03
 
 
-def assert_baseline(k: int = 10, min_orders: int = 2, tol: float = BASELINE_TOLERANCE) -> bool:
-    """Re-run full v3.2 eval and assert no regression vs the committed BASELINE_V32 floors."""
-    m = evaluate(k=k, min_orders=min_orders)
+def _baseline_for_limit(limit: int | None) -> tuple[str, dict[str, float], float]:
+    if limit is None:
+        return "full", BASELINE_V32, BASELINE_TOLERANCE
+    if limit == QUICK_BASELINE_V32_LIMIT:
+        return "quick", QUICK_BASELINE_V32, QUICK_BASELINE_TOLERANCE
+    raise ValueError(
+        f"unsupported baseline limit {limit}; use no --limit for full or "
+        f"--limit {QUICK_BASELINE_V32_LIMIT} for the committed quick gate"
+    )
+
+
+def assert_baseline(k: int = 10, min_orders: int = 2, limit: int | None = None) -> bool:
+    """Re-run v3.2 eval and assert no regression vs a committed full/quick baseline."""
+    mode, baseline, tol = _baseline_for_limit(limit)
+    m = evaluate(k=k, min_orders=min_orders, limit=limit)
     n = max(m.n, 1)
     cur = {
         "hit_rate": m.hits / n,
@@ -267,9 +292,16 @@ def assert_baseline(k: int = 10, min_orders: int = 2, tol: float = BASELINE_TOLE
         "mrr": m.mrr_sum / n,
     }
     ok = True
-    print(f"=== baseline regression check (n={m.n}, expected~{BASELINE_V32['n']}, tol={tol}) ===")
-    for metric, floor in (("hit_rate", BASELINE_V32["hit_rate"]), ("precision", BASELINE_V32["precision"]),
-                          ("recall", BASELINE_V32["recall"]), ("mrr", BASELINE_V32["mrr"])):
+    print(
+        f"=== {mode} baseline regression check "
+        f"(n={m.n}, expected~{baseline['n']}, limit={limit}, tol={tol}) ==="
+    )
+    for metric, floor in (
+        ("hit_rate", baseline["hit_rate"]),
+        ("precision", baseline["precision"]),
+        ("recall", baseline["recall"]),
+        ("mrr", baseline["mrr"]),
+    ):
         passed = cur[metric] >= floor - tol
         ok = ok and passed
         print(f"  {metric:10} current={cur[metric]:.3f} floor={floor:.3f} "
@@ -290,7 +322,11 @@ def main() -> None:
     args = ap.parse_args()
     if args.baseline:
         import sys
-        sys.exit(0 if assert_baseline(k=args.k, min_orders=args.min_orders) else 1)
+        try:
+            ok = assert_baseline(k=args.k, min_orders=args.min_orders, limit=args.limit)
+        except ValueError as exc:
+            ap.error(str(exc))
+        sys.exit(0 if ok else 1)
     elif args.compare_region:
         results = compare_region(k=args.k, min_orders=args.min_orders, limit=args.limit)
         print(f"=== byRegion A/B (k={args.k}, n={results['v3.2'].n}) ===")

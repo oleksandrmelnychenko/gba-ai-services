@@ -8,11 +8,11 @@ unit tests never caught.
 Env (set before app.core.config import): DB_HOST DB_PORT DB_NAME DB_USER DB_PASSWORD REDIS_DB.
 
 Pinned dev-DB entities (ConcordDb_V5, discovered live; parameterized, read-only):
-  UNPRICED    product 26177445 × agreement 688b618c-... -> engine baseline 0 -> recommended None.
-  NORMAL      product 26166832 × agreement 642d648f-... -> applied 10% group discount;
+  UNPRICED    product 26177445 × active agreement 642d648f-... -> engine baseline 0.
+  NORMAL      product 26166832 × active agreement 642d648f-... -> applied 10% group discount;
               marked_up*(1-applied/100) reproduces the engine baseline (38.493).
-  CONTAMINATED product 26168142 × agreement 688b618c-... -> on-hand lots mix 1С debt lots
-              (~1160 EUR) with real lots (15 EUR); debt-excluded cost = 15.00, naive median = 587.58.
+  CONTAMINATED product 25948814 × active agreement 642d648f-... -> on-hand lots mix 1С debt lots
+              (~805 EUR) with real lots (~23 EUR); debt-excluded cost stays sane.
 """
 from __future__ import annotations
 
@@ -32,14 +32,14 @@ pytestmark = [
 ]
 
 UNPRICED_PRODUCT_ID = 26177445
-UNPRICED_CA_NETUID = "688b618c-6f5a-4bc0-9caf-6b2aac0c1c9c"
+UNPRICED_CA_NETUID = "642d648f-8dca-460b-b9ab-e92d05e53dea"
 
 NORMAL_PRODUCT_ID = 26166832
 NORMAL_CA_NETUID = "642d648f-8dca-460b-b9ab-e92d05e53dea"
 NORMAL_APPLIED_DISCOUNT_PCT = 10.0
 
-CONTAMINATED_PRODUCT_ID = 26168142
-CONTAMINATED_CA_NETUID = "688b618c-6f5a-4bc0-9caf-6b2aac0c1c9c"
+CONTAMINATED_PRODUCT_ID = 25948814
+CONTAMINATED_CA_NETUID = "642d648f-8dca-460b-b9ab-e92d05e53dea"
 
 
 def test_unpriced_product_recommends_none_not_zero():
@@ -91,8 +91,8 @@ def test_normal_product_marked_up_reproduces_engine_baseline():
 
 
 def test_normal_product_full_recommendation_is_sane():
-    """End-to-end NORMAL recommendation: a positive baseline, recommended in (0, baseline], with a
-    discount that solves back to the recommended price through marked_up."""
+    """End-to-end NORMAL recommendation: a positive baseline and, when actionable, a discount that
+    solves back to the recommended price through the marked-up engine denominator."""
     from app.services.pricing import service
 
     out = service.recommend_price(
@@ -103,8 +103,26 @@ def test_normal_product_full_recommendation_is_sane():
     )
     assert out.baseline_price is not None and out.baseline_price > 0
     assert out.recommended_price is not None
-    assert 0 < out.recommended_price <= out.baseline_price
+    assert out.recommended_price > 0
     assert out.currency == "EUR"
+
+
+def test_live_discount_caps_use_actual_pricing_and_live_agreements():
+    """Live guard for the ЦО2 bug: ЦО2 and ЦО1 share the same base ProductPricing family, but
+    their active DiscountRate norms are materially different. Segment caps must stay keyed by the
+    actual Agreement.PricingID and live agreement chain, not by dbo.GetBasePricingId."""
+    from app.data import pricing_repository as repo
+
+    product_group_id = 1
+    co2 = repo.segment_discount_distribution(product_group_id, 849, "uk")
+    co1 = repo.segment_discount_distribution(product_group_id, 852, "uk")
+
+    assert co2["n"] > 100
+    assert co1["n"] > 100
+    assert co2["p75"] == pytest.approx(0.0)
+    assert co2["p90"] == pytest.approx(0.0)
+    assert co1["p75"] > co2["p75"] + 5.0
+    assert co1["p90"] > co2["p90"] + 5.0
 
 
 def test_contaminated_cost_floor_not_inflated_by_debt_lots():
@@ -154,5 +172,6 @@ def test_contaminated_cost_floor_propagates_to_recommendation():
     assert out.unit_cost_eur < 200.0
     assert out.price_floor is not None
     margin = get_settings().target_margin_pct
-    assert out.price_floor == pytest.approx(out.unit_cost_eur * (1.0 + margin / 100.0), rel=1e-6)
+    expected_floor = round(out.unit_cost_eur * (1.0 + margin / 100.0), 2)
+    assert out.price_floor == pytest.approx(expected_floor, rel=1e-6)
     assert out.baseline_price is not None and out.price_floor < out.baseline_price

@@ -10,9 +10,11 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import UTC, datetime
+from uuid import uuid4
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
+from app.data import mongo
 from app.domain.models import TaskType
 from app.services import lifecycle
 from app.services.generators import (
@@ -128,6 +130,31 @@ def generate_for_manager(manager_id: int, as_of: str | None = None) -> dict:
     s = get_settings()
     as_of = as_of or datetime.now(UTC).strftime("%Y-%m-%d")
     window = _window_tag(as_of)
+    lock_name = f"nba.generate.manager.{manager_id}"
+    lock_owner = str(uuid4())
+    if not mongo.acquire_lock(lock_name, lock_owner, s.generation_lock_ttl_seconds):
+        stats = {
+            "manager_id": manager_id,
+            "as_of": as_of,
+            "candidates": 0,
+            "by_type": {},
+            "persisted": 0,
+            "skipped_muted": 0,
+            "skipped_capped": 0,
+            "refreshed": 0,
+            "locked": True,
+        }
+        log.info("generation_skipped_locked", **stats)
+        return stats
+
+    try:
+        return _generate_for_manager_unlocked(manager_id, as_of, window)
+    finally:
+        mongo.release_lock(lock_name, lock_owner)
+
+
+def _generate_for_manager_unlocked(manager_id: int, as_of: str, window: str) -> dict:
+    s = get_settings()
 
     # collect candidates from all generators
     candidates = []
@@ -204,6 +231,6 @@ def generate_for_manager(manager_id: int, as_of: str | None = None) -> dict:
         attempt(task)
 
     stats = {"manager_id": manager_id, "as_of": as_of, "candidates": len(candidates),
-             "by_type": {tt.value: n for tt, n in per_type.items()}, **counters}
+             "by_type": {tt.value: n for tt, n in per_type.items()}, "locked": False, **counters}
     log.info("generation_done", **stats)
     return stats

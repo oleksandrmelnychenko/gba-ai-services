@@ -16,11 +16,12 @@ from __future__ import annotations
 
 import inspect
 import re
+from pathlib import Path
 
 from app.core import config
 from app.data import sales_repository
 from app.services.eval import baselines, harness
-from app.services.recommendations import als, copurchase, worker
+from app.services.recommendations import als, copurchase, recommender, worker
 
 VALIDITY_MODULES = {
     "copurchase": copurchase,
@@ -111,3 +112,18 @@ def test_region_scoping_uses_region_id_natural_key_not_per_client_code():
     assert "RegionCodeID" not in src, (
         "region scoping must NOT use the per-client RegionCodeID (it does not group clients)"
     )
+
+
+def test_makefile_has_baseline_calibration_gate():
+    makefile = Path(__file__).resolve().parents[1] / "Makefile"
+    src = makefile.read_text(encoding="utf-8")
+    assert "calibration:" in src
+    assert "--baseline" in src
+    assert "--limit 120" in src
+
+
+def test_recommender_uses_single_purchase_stats_query_for_freq_and_recency():
+    src = inspect.getsource(recommender)
+    assert "product_purchase_stats" in src
+    assert "product_frequency(customer_id, as_of)" not in src
+    assert "_recency_scores(customer_id, as_of)" not in src

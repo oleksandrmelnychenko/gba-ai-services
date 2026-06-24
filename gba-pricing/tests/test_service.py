@@ -31,6 +31,10 @@ def _wire_repo(monkeypatch, **over):
     monkeypatch.setattr(service.repo, "peer_band", lambda *a, **k: over.get(
         "peer", {"p25": 17.0, "p50": 18.5, "p75": 19.5, "n": 12}))
     monkeypatch.setattr(service.repo, "product_group_id", lambda *a, **k: over.get("pg_id", 106))
+    monkeypatch.setattr(
+        service.repo, "active_group_discount", lambda *a, **k: over.get("group_discount", 0.0)
+    )
+    monkeypatch.setattr(service.repo, "is_promotional", lambda *a, **k: over.get("is_promotional", False))
     monkeypatch.setattr(service.repo, "segment_discount_distribution", lambda *a, **k: over.get(
         "segment", {"p75": 12.0, "p90": 18.0, "n": 40}))
 
@@ -103,6 +107,67 @@ def test_recommend_skips_segment_when_no_group_or_tier(monkeypatch):
     )
 
 
+def test_recommend_segments_discount_cap_by_actual_pricing(monkeypatch):
+    _wire_repo(
+        monkeypatch,
+        agreement={
+            "client_agreement_id": 11,
+            "client_agreement_netuid": "ca-uid",
+            "agreement_id": 22,
+            "pricing_id": 852,
+            "currency_id": 2,
+        },
+        list_markup={
+            "base_price": 20.0,
+            "extra_charge": 30.0,
+            "base_pricing_id": 849,
+            "culture": "uk",
+        },
+    )
+    captured = {}
+
+    def segment(product_group_id, pricing_id, culture):
+        captured["args"] = (product_group_id, pricing_id, culture)
+        return {"p75": 12.0, "p90": 18.0, "n": 40}
+
+    monkeypatch.setattr(service.repo, "segment_discount_distribution", segment)
+    service.recommend_price(
+        product_id=7, product_net_uid=None, client_agreement_net_uid="ca-uid",
+        as_of_date="2026-06-15", use_cache=False,
+    )
+    assert captured["args"] == (106, 852, "uk")
+
+
+def test_promotional_branch_does_not_suggest_discountrate_lever(monkeypatch):
+    _wire_repo(
+        monkeypatch,
+        baseline=20.0,
+        cost={"unit_cost_eur": None, "lot_count": 0, "cost_source": "none"},
+        peer={"p25": 14.0, "p50": 15.0, "p75": 16.0, "n": 12},
+        segment={"p75": 18.0, "p90": 20.0, "n": 40},
+        is_promotional=True,
+    )
+
+    def boom(*a, **k):
+        raise AssertionError("promo branch must not use normal discount distribution")
+
+    monkeypatch.setattr(service.repo, "segment_discount_distribution", boom)
+    out = service.recommend_price(
+        product_id=7,
+        product_net_uid=None,
+        client_agreement_net_uid="ca-uid",
+        as_of_date="2026-06-15",
+        use_cache=False,
+    )
+
+    assert out.recommended_price == 20.0
+    assert out.suggested_discount_pct == 0.0
+    assert out.discount_band.min_pct == 0.0
+    assert out.discount_band.target_pct == 0.0
+    assert out.discount_band.max_pct == 0.0
+    assert out.rationale == "discount-cap"
+
+
 def test_recommend_target_margin_override(monkeypatch):
     _wire_repo(monkeypatch)
     out = service.recommend_price(
@@ -137,6 +202,45 @@ def test_recommend_cache_hit_hydrates(monkeypatch):
     assert out.recommended_price == 18.5
     assert out.confidence == Confidence.HIGH
     assert out.discount_band.max_pct == 44.0
+
+
+def test_recommend_cache_key_includes_serving_options(monkeypatch):
+    _wire_repo(monkeypatch)
+    captured = {}
+
+    def make_key(product, agreement, as_of, **kwargs):
+        captured["args"] = (product, agreement, as_of)
+        captured["kwargs"] = kwargs
+        return "cache-key"
+
+    monkeypatch.setattr(service.cache, "make_key", make_key)
+    monkeypatch.setattr(service.cache, "get", lambda *a, **k: None)
+    monkeypatch.setattr(service.cache, "set", lambda *a, **k: None)
+    monkeypatch.setattr(service.get_settings(), "elasticity_enabled", True)
+    monkeypatch.setattr(service.get_settings(), "fx_snapshot_date", "2026-06-01")
+    monkeypatch.setattr(service.get_settings(), "trailing_window_months", 6)
+    monkeypatch.setattr(service, "estimate_elasticity", lambda *a, **k: None)
+
+    service.recommend_price(
+        product_id=7,
+        product_net_uid=None,
+        client_agreement_net_uid="ca-uid",
+        culture="pl",
+        with_vat=False,
+        target_margin_pct=17.5,
+        as_of_date="2026-06-15",
+        use_cache=True,
+    )
+
+    assert captured["args"] == (7, "ca-uid", "2026-06-15")
+    assert captured["kwargs"] == {
+        "culture": "pl",
+        "with_vat": False,
+        "target_margin_pct": 17.5,
+        "window_months": 6,
+        "fx_date": "2026-06-01",
+        "elasticity_enabled": True,
+    }
 
 
 def test_synthetic_line_excluded_in_repository_sql():

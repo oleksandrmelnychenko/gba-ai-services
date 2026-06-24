@@ -126,3 +126,29 @@ def test_active_group_discount(monkeypatch):
     assert repo.active_group_discount(11, 106) == 8.5
     monkeypatch.setattr(repo, "query", lambda *a, **k: [])
     assert repo.active_group_discount(11, 106) is None
+
+
+def test_segment_discount_distribution_uses_actual_pricing_not_base_family():
+    import inspect
+
+    src = inspect.getsource(repo.segment_discount_distribution)
+    assert "a.PricingID = :pricing_id" in src
+    assert "JOIN dbo.Pricing pr ON pr.ID = a.PricingID" in src
+    assert "pr.ID = dbo.GetBasePricingId" not in src
+
+
+def test_segment_discount_distribution_filters_deleted_agreement_chain_not_pgd_deleted():
+    import inspect
+
+    src = inspect.getsource(repo.segment_discount_distribution)
+    assert "ca.Deleted = 0" in src
+    assert "a.Deleted = 0" in src
+    assert "pgd.Deleted = 0" not in src
+
+
+def test_resolve_client_agreement_filters_deleted_agreement_chain():
+    import inspect
+
+    src = inspect.getsource(repo.resolve_client_agreement)
+    assert "ca.Deleted = 0" in src
+    assert "a.Deleted = 0" in src

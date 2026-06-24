@@ -20,6 +20,7 @@ import inspect
 import textwrap
 
 from app.data import solvency_repository as repo
+from app.services.solvency import charts, service
 
 _TURNOVER_FNS = (
     repo.turnover_eur,
@@ -87,3 +88,17 @@ def test_asof_anchored_never_clock_calls():
         assert "GETUTCDATE()" not in body, (
             f"{fn.__name__} must anchor on :asof, not the non-deterministic GETUTCDATE()"
         )
+
+
+def test_missing_exposure_is_not_rendered_as_zero():
+    gauge_src = inspect.getsource(charts._gauge)
+    assert "value=None" in gauge_src
+    assert "has_controlled_limit=False" in gauge_src
+
+    exposure_src = _sql_body(charts._turnover_vs_exposure)
+    assert "exposure_eur=None" not in exposure_src
+    assert "if exposure_eur is not None else None" in exposure_src
+
+    currency_src = inspect.getsource(service._currency_breakdown)
+    assert "exposure_eur=None" in currency_src
+    assert "ExposureSource.UNAVAILABLE" in currency_src

@@ -52,6 +52,8 @@ Schedule weekly via host cron / k8s CronJob. Idempotent & resumable.
 
 ## 5. Evaluate / tune (needs representative data)
 ```bash
+make calibration                                      # quick committed gate: --baseline --limit 120
+python -m app.services.eval.harness --baseline --k 10 # full audit gate
 python -m app.services.eval.harness --compare --k 10        # v3.2 vs copurchase vs naive
 python -m app.services.eval.harness --fold-as-of 2025-09-01 # + ALS (trained once)
 ```

@@ -7,6 +7,7 @@ caught only by live smoke (mocked tests stayed green) gets a guard here.
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 
 from app.data import supply_repository as repo
 
@@ -83,3 +84,11 @@ def test_cost_repository_converts_unitprice_to_eur_via_agreement_currency():
     assert "a.CurrencyID" in src
     assert "soi.UnitPrice" in src
     assert "25422404" in src
+
+
+def test_makefile_exposes_backtest_calibration_gate():
+    makefile = Path(__file__).resolve().parents[1] / "Makefile"
+    src = makefile.read_text(encoding="utf-8")
+    assert "backtest:" in src
+    assert "procure_backtest_sweep.py" in src
+    assert "calibration: backtest" in src

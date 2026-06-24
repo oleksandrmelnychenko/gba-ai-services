@@ -47,6 +47,10 @@ def _normalize(scores: dict[int, float]) -> dict[int, float]:
 
 def _recency_scores(customer_id: int, as_of_date: str) -> dict[int, float]:
     last = repo.product_last_purchase(customer_id, as_of_date)
+    return _recency_scores_from_last_purchase(last, as_of_date)
+
+
+def _recency_scores_from_last_purchase(last: dict[int, object], as_of_date: str) -> dict[int, float]:
     asof = datetime.fromisoformat(as_of_date)
     out: dict[int, float] = {}
     for pid, dt in last.items():
@@ -175,10 +179,16 @@ def recommend(
     region_id = repo.client_region_id(customer_id) if region_scope else None
 
     excl = repo.ubiquitous_product_ids(s.ubiquity_exclude_pct)
-    freq = _normalize({pid: float(c) for pid, c in repo.product_frequency(customer_id, as_of).items()
-                       if pid not in excl})
-    rec = _normalize({pid: v for pid, v in _recency_scores(customer_id, as_of).items()
-                      if pid not in excl})
+    purchase_stats = repo.product_purchase_stats(customer_id, as_of)
+    freq = _normalize({pid: float(cnt) for pid, (cnt, _dt) in purchase_stats.items() if pid not in excl})
+    rec = _normalize({
+        pid: v
+        for pid, v in _recency_scores_from_last_purchase(
+            {pid: dt for pid, (_cnt, dt) in purchase_stats.items()},
+            as_of,
+        ).items()
+        if pid not in excl
+    })
     owned = set(freq) | set(rec)
 
     repurchase_scores = {pid: w_freq * freq.get(pid, 0.0) + w_rec * rec.get(pid, 0.0) for pid in owned}

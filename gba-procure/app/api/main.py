@@ -4,18 +4,18 @@ from __future__ import annotations
 import hmac
 import time
 from contextlib import asynccontextmanager
+from datetime import date, datetime
+from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.core.metrics import METRICS
-from app.data import cache
-from app.data import feedback
-from app.data import masters
+from app.data import cache, feedback, masters
 from app.data.db import dispose, get_engine
 from app.domain.models import CartReplenishmentPlan, PlanCharts, ProducerPurchasePlan
 from app.services.replenishment import policy
@@ -29,13 +29,30 @@ _OPEN_PATHS = {"/health"}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    settings.assert_release_safe("gba-procure")
     get_engine()
+    _ensure_document_store_indexes()
     if not settings.internal_api_key:
         log.warning("internal_api_key_not_set", note="gba-procure running OPEN — set INTERNAL_API_KEY")
     log.info("service_starting", service="gba-procure")
     yield
     dispose()
     log.info("service_stopped")
+
+
+def _ensure_document_store_indexes() -> None:
+    if not settings.mongo_uri:
+        if settings.use_masters or settings.use_feedback:
+            log.warning("mongo_uri_not_set", note="procure masters/feedback stores disabled")
+        return
+    try:
+        if settings.use_masters:
+            masters.ensure_indexes()
+        if settings.use_feedback:
+            feedback.ensure_indexes()
+    except Exception as exc:  # noqa: BLE001
+        log.error("mongo_index_setup_failed", error=str(exc))
+        raise
 
 
 app = FastAPI(title="GBA Procurement / Replenishment Service", version="0.1.0", lifespan=lifespan)
@@ -60,25 +77,53 @@ async def timing(request: Request, call_next):
     return resp
 
 
-class PlanRequest(BaseModel):
-    producer_id: int = Field(..., description="dbo.SupplyOrganization.ID")
+def _date_or_none(value: str | date | None) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(raw).isoformat()
+    except ValueError as exc:
+        raise ValueError("date must be YYYY-MM-DD") from exc
+
+
+class AsOfDateRequest(BaseModel):
+    @field_validator("as_of_date", mode="before", check_fields=False)
+    @classmethod
+    def validate_as_of_date(cls, value):
+        return _date_or_none(value)
+
+
+class PlanRequest(AsOfDateRequest):
+    producer_id: int = Field(..., gt=0, description="dbo.SupplyOrganization.ID")
     as_of_date: str | None = None
     only_needed: bool = True
 
 
-class CartPlanRequest(BaseModel):
+class CartPlanRequest(AsOfDateRequest):
     as_of_date: str | None = None
     only_needed: bool = True
-    limit: int | None = 200
-    budget_eur: float | None = None
-    method: str = "greedy"
-    active_days: int | None = None
+    limit: int | None = Field(default=200, ge=0, le=1000)
+    budget_eur: float | None = Field(default=None, gt=0)
+    method: Literal["greedy", "milp"] = "greedy"
+    active_days: int | None = Field(default=None, ge=1, le=1095)
+
+    @field_validator("method", mode="before")
+    @classmethod
+    def normalize_method(cls, value):
+        return str(value).strip().lower() if value is not None else value
 
 
-class PlanChartsRequest(BaseModel):
-    producer_id: int | None = None
+class PlanChartsRequest(AsOfDateRequest):
+    producer_id: int | None = Field(default=None, gt=0)
     as_of_date: str | None = None
-    top_n: int = 15
+    top_n: int = Field(default=15, ge=1, le=100)
 
 
 @app.get("/health")
@@ -174,25 +219,25 @@ def plan_charts(req: PlanChartsRequest) -> PlanCharts:
 
 
 class ProducerProfileUpdate(BaseModel):
-    producer_id: int
-    service_level_target: float | None = None
-    lead_time_override_days: float | None = None
-    ordering_cost_eur: float | None = None
-    holding_rate_pct: float | None = None
-    autonomy_level: str | None = None
-    auto_place_max_eur: float | None = None
+    producer_id: int = Field(..., gt=0)
+    service_level_target: float | None = Field(default=None, ge=0.50, le=0.99)
+    lead_time_override_days: float | None = Field(default=None, ge=1, le=365)
+    ordering_cost_eur: float | None = Field(default=None, ge=0)
+    holding_rate_pct: float | None = Field(default=None, ge=0, le=100)
+    autonomy_level: str | None = Field(default=None, min_length=1, max_length=32)
+    auto_place_max_eur: float | None = Field(default=None, ge=0)
 
 
 class ProductTermsUpdate(BaseModel):
-    producer_id: int
-    product_id: int
-    moq: float | None = None
-    order_multiple: float | None = None
-    unit_cost_override: float | None = None
+    producer_id: int = Field(..., gt=0)
+    product_id: int = Field(..., gt=0)
+    moq: float | None = Field(default=None, gt=0)
+    order_multiple: float | None = Field(default=None, gt=0)
+    unit_cost_override: float | None = Field(default=None, ge=0)
 
 
 @app.get("/masters/producer")
-def get_producer_profile(producer_id: int) -> dict:
+def get_producer_profile(producer_id: int = Query(..., gt=0)) -> dict:
     return masters.producer_profile(producer_id) or {"producer_id": producer_id}
 
 
@@ -206,7 +251,7 @@ def set_producer_profile(req: ProducerProfileUpdate) -> dict:
 
 
 @app.post("/masters/seed-terms")
-def seed_terms(min_orders: int = 3, overwrite: bool = False) -> dict:
+def seed_terms(min_orders: int = Query(3, ge=1, le=10000), overwrite: bool = False) -> dict:
     try:
         return masters.seed_derived_terms(min_orders=min_orders, overwrite=overwrite)
     except Exception as exc:  # noqa: BLE001
@@ -215,7 +260,7 @@ def seed_terms(min_orders: int = 3, overwrite: bool = False) -> dict:
 
 
 @app.get("/masters/product-terms")
-def get_product_terms(producer_id: int) -> dict:
+def get_product_terms(producer_id: int = Query(..., gt=0)) -> dict:
     return {"producer_id": producer_id, "terms": masters.list_product_terms(producer_id)}
 
 
@@ -232,12 +277,29 @@ def set_product_terms(req: ProductTermsUpdate) -> dict:
 
 
 class FeedbackRequest(BaseModel):
-    producer_id: int
-    product_id: int
-    suggested_qty: float
-    final_qty: float
-    action: str = Field(description="accept | edit | dismiss")
+    producer_id: int = Field(..., gt=0)
+    product_id: int = Field(..., gt=0)
+    suggested_qty: float = Field(..., gt=0)
+    final_qty: float = Field(..., ge=0)
+    action: Literal["accept", "edit", "dismiss"] = Field(description="accept | edit | dismiss")
     abc: str | None = None
+
+    @field_validator("action", mode="before")
+    @classmethod
+    def normalize_action(cls, value):
+        return str(value).strip().lower() if value is not None else value
+
+    @field_validator("abc", mode="before")
+    @classmethod
+    def normalize_abc(cls, value):
+        if value is None:
+            return None
+        normalized = str(value).strip().upper()
+        if not normalized:
+            return None
+        if normalized not in {"A", "B", "C"}:
+            raise ValueError("abc must be A, B, or C")
+        return normalized
 
 
 @app.post("/feedback")
@@ -253,7 +315,7 @@ def record_feedback(req: FeedbackRequest) -> dict:
 
 
 @app.get("/feedback/learned")
-def get_learned_factors(producer_id: int) -> dict:
+def get_learned_factors(producer_id: int = Query(..., gt=0)) -> dict:
     return {
         "producer_id": producer_id,
         "factors": feedback.learned_factors(
@@ -263,5 +325,4 @@ def get_learned_factors(producer_id: int) -> dict:
 
 
 def _today() -> str:
-    from datetime import datetime
     return datetime.now().strftime("%Y-%m-%d")

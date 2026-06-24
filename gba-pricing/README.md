@@ -26,8 +26,14 @@ marked_up = ROUND(P + P*ExtraCharge/100, 14)              # P = ProductPricing.P
                                                           #   dbo.GetBasePricingId(Agreement.PricingID)
                                                           # ExtraCharge = Pricing.CalculatedExtraCharge
 baseline_price = marked_up * (1 - DiscountRate/100) * (1 - OneTimeDiscount/100)
-                                                          # DiscountRate = ProductGroupDiscount (IsActive=1)
+                                                          # DiscountRate = ProductGroupDiscount (IsActive=1,
+                                                          # ProductGroupDiscount.Deleted ignored by legacy engine)
 ```
+
+Promo exception: when the product is promotional (`IsForSale=1`, `IsForZeroSale=1`, `Top=X9/Х9`)
+and the agreement has `PromotionalPricingID`, the SQL function reads price/markup from that promo
+pricing and keeps `DiscountRate=0`. In that branch the normal `ProductGroupDiscount` lever is not
+actionable, so the service caps the discount band at `0`.
 
 ### A — margin floor + peer band
 
@@ -38,22 +44,23 @@ unit_cost_eur  = robust per-product cost = MEDIAN of ConsignmentItem.AccountingP
                  EUR-base. No cost lot -> unit_cost_eur=null, confidence low, skip the floor.
 price_floor    = unit_cost_eur * (1 + target_margin_pct/100)   # config default 12; never below
 peer_band      = P25/P50/P75 + n of realized EUR unit price over distinct client-agreements for p
-                 in the trailing window (EUR_price = Agreement.CurrencyID=2 ? OrderItem.PricePerItem
-                 : GetExchangedToEuroValue(PricePerItem, Agreement.CurrencyID, Sale.Created); UoM
-                 outliers decile-trimmed).
-recommended_price = clamp( max(price_floor, peer_P50), lower=price_floor, upper=baseline_price )
-                 # never above the engine's current price; if floor>baseline -> LOSS FLAG
-                 #   (recommended=price_floor, rationale='below-margin-loss-flag').
+                 in the trailing window (OrderItem.PricePerItem is already EUR; UoM outliers
+                 rejected by median/MAD rather than a fixed decile trim).
+raw_target_price = clamp( max(price_floor, peer_P50), lower=price_floor, upper=baseline_price )
+                 # A+B anchor; if floor>baseline -> LOSS FLAG.
 ```
 
 ### B — discount discipline
 
 ```
-suggested_discount_pct = (1 - recommended_price / ROUND(P + P*ExtraCharge/100, 14)) * 100
-                 # the DiscountRate that reproduces recommended_price THROUGH the engine,
+raw_discount_pct = (1 - raw_target_price / ROUND(P + P*ExtraCharge/100, 14)) * 100
+suggested_discount_pct = cap(raw_discount_pct, peer_P75, hard_cap=peer_P90)
+recommended_price = marked_up * (1 - suggested_discount_pct/100)
+                 # the final recommended_price is the price reproduced THROUGH the engine,
                  # capped at peer P75 (hard-capped at P90) of ProductGroupDiscount.DiscountRate
-                 # within the segment = (ProductGroupID × base-tier-family via GetBasePricingId × Culture).
-discount_band  = { min_pct: floor-implied discount, target_pct: suggested, max_pct: peer P90 cap }
+                 # within the segment = (ProductGroupID × actual Agreement.PricingID × Culture
+                 # × live ClientAgreement/Agreement).
+discount_band  = { min_pct: 0, target_pct: suggested, max_pct: min(floor-implied discount, peer P90 cap) }
 ```
 
 `confidence` = `high` if cost lots>=3 AND peer n>=10; `low` if no cost OR peer n<3; else `medium`.
@@ -77,8 +84,16 @@ The optimizer emits its result as an **adjustment to the engine's DiscountRate l
   pinned to `Sale.Created`. Configured via `FX_SNAPSHOT_DATE` / `as_of_date`.
 - `OrderItem.DiscountAmount` is a **line-total** money figure (not per-unit) → not used; discount
   discipline comes from `ProductGroupDiscount.DiscountRate` (the engine-native lever).
+- Discount caps are keyed by actual `Agreement.PricingID`, not by `GetBasePricingId`. `ЦО2` and
+  `ЦО1` share a base price row, but their commercial discount bands differ materially.
+- Discount caps ignore `ProductGroupDiscount.Deleted`, matching the legacy SQL price function, but
+  filter `ClientAgreement.Deleted=0` and `Agreement.Deleted=0` so stale sync leftovers from deleted
+  agreement chains do not contaminate current tier norms.
+- Promotional agreements with `PromotionalPricingID` disable the normal `ProductGroupDiscount`
+  discount lever in the SQL function; AI recommendations keep `discount_band.max_pct=0` for that
+  branch instead of leaking regular segment caps into promo prices.
 - `ProductPricing` has 23x soft-deleted bloat → always filter `Deleted=0` on `ProductPricing`.
-- UoM piece-vs-box outliers → peer percentiles decile-trim.
+- UoM piece-vs-box outliers → peer percentiles use per-product median/MAD rejection.
 - **No win/loss / offer-conversion data** (offers empty) → NO elasticity / win-rate in A+B.
 
 ## Run

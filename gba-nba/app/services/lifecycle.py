@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
@@ -56,9 +57,10 @@ def upsert_generated(task: Task) -> str:
     the window is part of task_key). Returns the task_key."""
     now = _now()
     ttl_days = get_settings().task_ttl_days
-    existing = mongo.tasks().find_one({"task_key": task.task_key})
+    terminal_values = {s.value for s in TERMINAL}
+    existing = mongo.tasks().find_one({"task_key": task.task_key}, {"status": 1})
 
-    if existing and existing.get("status") in {s.value for s in TERMINAL}:
+    if existing and existing.get("status") in terminal_values:
         # manager already resolved this exact task in this window — leave it.
         return task.task_key
 
@@ -82,26 +84,37 @@ def upsert_generated(task: Task) -> str:
         "expires_at": now + timedelta(days=ttl_days),
     }
 
-    if existing:
-        # refresh computed fields only; keep status/notes/history/snooze/outcome
+    insert_defaults = {
+        "task_key": task.task_key,
+        "status": TaskStatus.OPEN.value,   # generated tasks go straight to OPEN for the inbox
+        "notes": [],
+        "status_history": [{"from": TaskStatus.GENERATED.value, "to": TaskStatus.OPEN.value,
+                            "at": now, "by": "system"}],
+        "snooze_until": None,
+        "sla_breached": False,
+        "escalated_to": None,
+        "outcome": None,
+        "generated_at": now,
+    }
+    try:
+        result = mongo.tasks().update_one(
+            {"task_key": task.task_key, "status": {"$nin": list(terminal_values)}},
+            {"$set": computed, "$setOnInsert": insert_defaults},
+            upsert=True,
+        )
+    except DuplicateKeyError:
+        # Another generator inserted or terminalized the same task between the pre-check and upsert.
+        existing = mongo.tasks().find_one({"task_key": task.task_key}, {"status": 1})
+        if existing and existing.get("status") in terminal_values:
+            return task.task_key
         mongo.tasks().update_one({"task_key": task.task_key}, {"$set": computed})
         _event(task.task_key, "refresh", by="system")
-    else:
-        doc = {
-            "task_key": task.task_key,
-            "status": TaskStatus.OPEN.value,   # generated tasks go straight to OPEN for the inbox
-            "notes": [],
-            "status_history": [{"from": TaskStatus.GENERATED.value, "to": TaskStatus.OPEN.value,
-                                "at": now, "by": "system"}],
-            "snooze_until": None,
-            "sla_breached": False,
-            "escalated_to": None,
-            "outcome": None,
-            "generated_at": now,
-            **computed,
-        }
-        mongo.tasks().insert_one(doc)
+        return task.task_key
+
+    if result.upserted_id is not None:
         _event(task.task_key, "generated", by="system")
+    elif result.matched_count:
+        _event(task.task_key, "refresh", by="system")
     return task.task_key
 
 

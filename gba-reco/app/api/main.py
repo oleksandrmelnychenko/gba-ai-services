@@ -29,6 +29,7 @@ _OPEN_PATHS = {"/health"}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    settings.assert_release_safe("gba-reco")
     get_engine()  # warm pool
     if not settings.internal_api_key:
         log.warning("internal_api_key_not_set", note="gba-reco running OPEN — set INTERNAL_API_KEY")

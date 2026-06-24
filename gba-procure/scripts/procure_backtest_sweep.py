@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -59,16 +60,21 @@ def main() -> None:
     economic_cost_total = 0.0
     understock_loss_total = 0.0
     overstock_hold_total = 0.0
+    errors: list[dict[str, Any]] = []
 
     for producer_id in producers:
         for as_of in as_ofs:
             try:
                 r = backtest_producer(producer_id, as_of, window)
-            except Exception:
+            except Exception as exc:  # noqa: BLE001
                 n_skipped += 1
+                errors.append({"producer_id": producer_id, "as_of": as_of, "error": str(exc)})
                 continue
             if r.products <= 0:
                 n_skipped += 1
+                errors.append(
+                    {"producer_id": producer_id, "as_of": as_of, "error": "no_products_with_demand"}
+                )
                 continue
             n_pairs += 1
             products_total += r.products
@@ -76,9 +82,7 @@ def main() -> None:
             fill_sum += r.fill_rate * r.products
             stockout_sum += r.stockout_rate * r.products
             overstock_units_total += r.overstock_units
-            # reconstruct realized demand units for per-demand normalization
-            if r.overstock_units_per_demand > 0:
-                demand_units_total += r.overstock_units / r.overstock_units_per_demand
+            demand_units_total += r.demand_units
             economic_cost_total += r.economic_cost_eur
             understock_loss_total += r.understock_margin_loss_eur
             overstock_hold_total += r.overstock_holding_cost_eur
@@ -98,8 +102,11 @@ def main() -> None:
         "n_pairs": n_pairs,
         "n_skipped": n_skipped,
         "products": products_total,
+        "errors": errors[:10],
     }
     print(json.dumps(out))
+    if n_pairs <= 0:
+        raise SystemExit("procure_backtest_sweep_no_successful_pairs")
 
 
 if __name__ == "__main__":

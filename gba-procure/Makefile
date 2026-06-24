@@ -1,4 +1,4 @@
-.PHONY: install dev test integration lint plan up down
+.PHONY: install dev test integration lint plan backtest calibration up down
 
 install:
 	python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
@@ -14,6 +14,11 @@ integration:
 
 lint:
 	.venv/bin/ruff check app tests
+
+backtest:
+	.venv/bin/python scripts/procure_backtest_sweep.py
+
+calibration: backtest
 
 up:
 	docker compose up -d --build

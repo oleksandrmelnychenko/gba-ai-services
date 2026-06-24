@@ -10,6 +10,7 @@ still works (just uncached). Never let cache failure break recommendations.
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import redis
@@ -22,14 +23,22 @@ log = get_logger("cache")
 
 _MODEL_VERSION = "v33-realdata-202606"
 _client: redis.Redis | None = None
-_unavailable = False
+_unavailable_until = 0.0
+
+
+def _mark_unavailable(event: str, exc: Exception) -> None:
+    global _client, _unavailable_until
+    s = get_settings()
+    _client = None
+    _unavailable_until = time.monotonic() + s.redis_retry_cooldown_seconds
+    log.warning(event, error=str(exc), retry_after_seconds=s.redis_retry_cooldown_seconds)
 
 
 def _get_client() -> redis.Redis | None:
-    global _client, _unavailable
-    if _unavailable:
-        return None
+    global _client
     if _client is None:
+        if time.monotonic() < _unavailable_until:
+            return None
         s = get_settings()
         try:
             _client = redis.Redis(
@@ -39,9 +48,7 @@ def _get_client() -> redis.Redis | None:
             _client.ping()
             log.info("redis_connected", host=s.redis_host, port=s.redis_port)
         except Exception as exc:  # noqa: BLE001
-            log.warning("redis_unavailable", error=str(exc))
-            _client = None
-            _unavailable = True
+            _mark_unavailable("redis_unavailable", exc)
     return _client
 
 
@@ -62,7 +69,7 @@ def get(key: str) -> dict[str, Any] | None:
     try:
         raw = client.get(key)
     except Exception as exc:  # noqa: BLE001
-        log.warning("cache_get_failed", error=str(exc))
+        _mark_unavailable("cache_get_failed", exc)
         return None
     if raw is None:
         METRICS.record_cache(hit=False)
@@ -79,7 +86,7 @@ def set(key: str, value: dict[str, Any], ttl: int | None = None) -> None:
     try:
         client.setex(key, ttl, json.dumps(value, default=str))
     except Exception as exc:  # noqa: BLE001
-        log.warning("cache_set_failed", error=str(exc))
+        _mark_unavailable("cache_set_failed", exc)
 
 
 def invalidate_customer(customer_id: int) -> int:
@@ -87,8 +94,12 @@ def invalidate_customer(customer_id: int) -> int:
     if client is None:
         return 0
     pattern = f"reco:{_MODEL_VERSION}:{customer_id}:*"
-    keys = list(client.scan_iter(match=pattern, count=200))
-    return client.delete(*keys) if keys else 0
+    try:
+        keys = list(client.scan_iter(match=pattern, count=200))
+        return client.delete(*keys) if keys else 0
+    except Exception as exc:  # noqa: BLE001
+        _mark_unavailable("cache_invalidate_failed", exc)
+        return 0
 
 
 def invalidate_copurchase(customer_id: int) -> int:
@@ -96,8 +107,12 @@ def invalidate_copurchase(customer_id: int) -> int:
     if client is None:
         return 0
     pattern = f"copurchase:{_MODEL_VERSION}:{customer_id}:*"
-    keys = list(client.scan_iter(match=pattern, count=200))
-    return client.delete(*keys) if keys else 0
+    try:
+        keys = list(client.scan_iter(match=pattern, count=200))
+        return client.delete(*keys) if keys else 0
+    except Exception as exc:  # noqa: BLE001
+        _mark_unavailable("cache_invalidate_failed", exc)
+        return 0
 
 
 def _neg_key(customer_id: int) -> str:
@@ -116,7 +131,7 @@ def add_negatives(customer_id: int, product_ids: list[int], ttl: int) -> int:
         client.expire(key, ttl)
         return int(n)
     except Exception as exc:  # noqa: BLE001
-        log.warning("neg_add_failed", customer_id=customer_id, error=str(exc))
+        _mark_unavailable("neg_add_failed", exc)
         return 0
 
 
@@ -127,7 +142,7 @@ def get_negatives(customer_id: int) -> frozenset[int]:
     try:
         return frozenset(int(x) for x in client.smembers(_neg_key(customer_id)))
     except Exception as exc:  # noqa: BLE001
-        log.warning("neg_get_failed", customer_id=customer_id, error=str(exc))
+        _mark_unavailable("neg_get_failed", exc)
         return frozenset()
 
 
@@ -137,5 +152,6 @@ def health() -> bool:
         return False
     try:
         return bool(client.ping())
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        _mark_unavailable("redis_health_failed", exc)
         return False

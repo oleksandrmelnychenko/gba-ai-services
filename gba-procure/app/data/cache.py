@@ -6,6 +6,7 @@ If Redis is down, every call is a no-op miss — service keeps working.
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import redis
@@ -18,14 +19,22 @@ log = get_logger("cache")
 
 _VER = "v2"
 _client: redis.Redis | None = None
-_unavailable = False
+_unavailable_until = 0.0
+
+
+def _mark_unavailable(event: str, exc: Exception) -> None:
+    global _client, _unavailable_until
+    s = get_settings()
+    _client = None
+    _unavailable_until = time.monotonic() + s.redis_retry_cooldown_seconds
+    log.warning(event, error=str(exc), retry_after_seconds=s.redis_retry_cooldown_seconds)
 
 
 def _get_client() -> redis.Redis | None:
-    global _client, _unavailable
-    if _unavailable:
-        return None
+    global _client
     if _client is None:
+        if time.monotonic() < _unavailable_until:
+            return None
         s = get_settings()
         try:
             _client = redis.Redis(
@@ -35,9 +44,7 @@ def _get_client() -> redis.Redis | None:
             _client.ping()
             log.info("redis_connected", host=s.redis_host, port=s.redis_port, db=s.redis_db)
         except Exception as exc:  # noqa: BLE001
-            log.warning("redis_unavailable", error=str(exc))
-            _client = None
-            _unavailable = True
+            _mark_unavailable("redis_unavailable", exc)
     return _client
 
 
@@ -52,7 +59,7 @@ def get(key: str) -> dict[str, Any] | None:
     try:
         raw = client.get(key)
     except Exception as exc:  # noqa: BLE001
-        log.warning("cache_get_failed", error=str(exc))
+        _mark_unavailable("cache_get_failed", exc)
         return None
     if raw is None:
         METRICS.record_cache(hit=False)
@@ -69,7 +76,7 @@ def set(key: str, value: dict[str, Any], ttl: int | None = None) -> None:
     try:
         client.setex(key, ttl, json.dumps(value, default=str))
     except Exception as exc:  # noqa: BLE001
-        log.warning("cache_set_failed", error=str(exc))
+        _mark_unavailable("cache_set_failed", exc)
 
 
 def health() -> bool:
@@ -78,5 +85,6 @@ def health() -> bool:
         return False
     try:
         return bool(client.ping())
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        _mark_unavailable("redis_health_failed", exc)
         return False

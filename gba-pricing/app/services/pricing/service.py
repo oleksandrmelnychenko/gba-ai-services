@@ -84,7 +84,17 @@ def recommend_price(
     pid = product["id"]
     p_net_uid = product["net_uid"]
     ca_net_uid = agreement["client_agreement_netuid"]
-    key = cache.make_key(pid, ca_net_uid, as_of)
+    key = cache.make_key(
+        pid,
+        ca_net_uid,
+        as_of,
+        culture=culture,
+        with_vat=with_vat,
+        target_margin_pct=margin,
+        window_months=window,
+        fx_date=fx_date,
+        elasticity_enabled=settings.elasticity_enabled,
+    )
 
     if use_cache:
         cached = cache.get(key)
@@ -118,24 +128,28 @@ def recommend_price(
 
         list_markup = repo.base_list_price_and_markup(pid, agreement["agreement_id"])
         seg_culture = list_markup.get("culture") if list_markup else culture
-        base_pricing_id = list_markup.get("base_pricing_id") if list_markup else None
+        pricing_id = agreement.get("pricing_id")
 
         pg_id = repo.product_group_id(pid)
         group_disc = (
             (repo.active_group_discount(agreement["client_agreement_id"], pg_id) or 0.0)
             if pg_id is not None else 0.0
         )
-        applied_disc = 0.0 if repo.is_promotional(pid, agreement["agreement_id"]) else group_disc
+        is_promotional = repo.is_promotional(pid, agreement["agreement_id"])
+        applied_disc = 0.0 if is_promotional else group_disc
         marked_up = _marked_up_from_baseline(baseline, applied_disc)
 
         cost = repo.unit_cost_eur(pid)
         peer = repo.peer_band(pid, as_of, window, fx_date)
 
-        segment = (
-            repo.segment_discount_distribution(pg_id, base_pricing_id, seg_culture)
-            if pg_id is not None and base_pricing_id is not None
-            else {"p75": None, "p90": None, "n": 0}
-        )
+        if is_promotional:
+            segment = {"p75": 0.0, "p90": 0.0, "n": 0}
+        else:
+            segment = (
+                repo.segment_discount_distribution(pg_id, pricing_id, seg_culture)
+                if pg_id is not None and pricing_id is not None
+                else {"p75": None, "p90": None, "n": 0}
+            )
 
         elasticity_estimate = estimate_elasticity(pid, pg_id, as_of, window)
 

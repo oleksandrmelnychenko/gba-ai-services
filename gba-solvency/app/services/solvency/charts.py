@@ -7,6 +7,7 @@ from app.data import solvency_repository as repo
 from app.domain.models import (
     AgingBar,
     DonutSlice,
+    ExposureSource,
     GaugeChart,
     ScorePoint,
     SolvencyCharts,
@@ -20,7 +21,9 @@ _AGING_ORDER = {"0-30": 0, "31-60": 1, "61-90": 2, "90+": 3}
 
 def _gauge(agreements: list[dict]) -> GaugeChart:
     util = scoring.max_limit_utilization(agreements)
-    return GaugeChart(value=round(util, 4) if util is not None else 0.0)
+    if util is None:
+        return GaugeChart(value=None, has_controlled_limit=False)
+    return GaugeChart(value=round(util, 4), has_controlled_limit=True)
 
 
 def _donut(regular: dict[str, int], retail: dict[str, int]) -> list[DonutSlice]:
@@ -53,21 +56,22 @@ def _add_months(d: date, n: int) -> date:
 
 def _turnover_vs_exposure(
     monthly: list[dict],
-    overdue_eur: float,
-    open_unpaid_count: int,
-    total_sales_count: int,
+    exposure_eur: float | None,
+    exposure_source: ExposureSource,
 ) -> list[TurnoverExposurePoint]:
     """Per-month turnover vs a flat current-exposure reference line (point-in-time exposure,
     since per-month historical exposure needs the Debt aging-over-time data that is still pending).
+
+    When Debt sync is not live, the score uses the live open-unpaid-count proxy for debt load, but
+    that proxy is not an EUR exposure amount. Return exposure_eur=None so the UI can hide/label the
+    line instead of reading a fabricated zero as "no exposure".
     """
-    exposure = overdue_eur
-    if exposure <= 0 and total_sales_count > 0 and open_unpaid_count > 0:
-        exposure = 0.0
     return [
         TurnoverExposurePoint(
             period=m["period"],
             turnover_eur=round(float(m.get("turnover_eur", 0.0)), 2),
-            exposure_eur=round(exposure, 2),
+            exposure_eur=round(exposure_eur, 2) if exposure_eur is not None else None,
+            exposure_source=exposure_source,
         )
         for m in monthly
     ]
@@ -108,9 +112,8 @@ def build_charts(client_id: int, as_of_date: str | None, window_months: int) -> 
     monthly = repo.monthly_turnover_series(client_id, as_of, window_months, fx_date)
 
     sync_live = repo.debt_sync_is_live()
-    overdue = repo.overdue_amount_eur(client_id, as_of, fx_date) if sync_live else 0.0
-    open_stats = repo.open_unpaid_stats(client_id, as_of, window_months)
-    total_sales = repo.total_sales_count(client_id, as_of, window_months)
+    exposure_source = ExposureSource.DEBT_TABLE if sync_live else ExposureSource.UNAVAILABLE
+    exposure_eur = repo.overdue_amount_eur(client_id, as_of, fx_date) if sync_live else None
 
     return SolvencyCharts(
         client_id=client_id,
@@ -118,7 +121,7 @@ def build_charts(client_id: int, as_of_date: str | None, window_months: int) -> 
         payment_discipline_donut=_donut(regular, retail),
         open_invoice_aging_bars=_aging_bars(aging),
         turnover_vs_exposure=_turnover_vs_exposure(
-            monthly, overdue, int(open_stats.get("open_count", 0)), total_sales
+            monthly, exposure_eur, exposure_source
         ),
         score_sparkline=_score_sparkline(client_id, as_of, window_months),
         turnover_trend=_turnover_trend(monthly),

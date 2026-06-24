@@ -26,6 +26,7 @@ NOTE: forecast & policy read history < as_of; actual demand reads > as_of → ev
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, timedelta
 
 from app.core.config import get_settings
 from app.data.db import in_clause, query
@@ -43,6 +44,7 @@ class BacktestResult:
     overstock_units: float    # total EXCESS units beyond realized forward demand (magnitude)
     overstock_units_per_product: float  # excess units / products evaluated
     overstock_units_per_demand: float   # excess units / total realized demand units
+    demand_units: float       # total realized forward demand units
     overstock_rate: float     # LEGACY binary flag: share ordered far above realized demand
     coverage_with_policy: float   # share fully covered WITH the suggestion
     coverage_without_policy: float  # share fully covered WITHOUT it (counterfactual)
@@ -60,7 +62,8 @@ def _actual_demand(product_ids: list[int], as_of: str, window_days: int) -> dict
         SELECT oi.ProductID AS pid, SUM(oi.Qty) AS units
         FROM dbo.[Order] o
         JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-        WHERE o.Deleted = 0
+        WHERE oi.IsValidForCurrentSale = 1
+              AND oi.ProductID <> 25422404
               AND o.Created >= :asof
               AND o.Created < DATEADD(day, :win, :asof)
               AND oi.ProductID IN {ph}
@@ -71,10 +74,27 @@ def _actual_demand(product_ids: list[int], as_of: str, window_days: int) -> dict
     return {int(r["pid"]): float(r["units"] or 0) for r in rows}
 
 
+def _today() -> date:
+    return date.today()
+
+
+def _validated_window(as_of: str, eval_window_days: int | None, default_window: int) -> tuple[str, int]:
+    try:
+        as_of_date = date.fromisoformat(as_of)
+    except ValueError as exc:
+        raise ValueError("as_of must be YYYY-MM-DD") from exc
+    window = int(default_window if eval_window_days is None else eval_window_days)
+    if window <= 0:
+        raise ValueError("eval_window_days must be positive")
+    if as_of_date + timedelta(days=window) >= _today():
+        raise ValueError("backtest_requires_complete_future_demand_window")
+    return as_of_date.isoformat(), window
+
+
 def backtest_producer(producer_id: int, as_of: str, eval_window_days: int | None = None,
                       overstock_factor: float = 3.0) -> BacktestResult:
     s = get_settings()
-    window = eval_window_days or s.forecast_horizon_days
+    as_of, window = _validated_window(as_of, eval_window_days, s.forecast_horizon_days)
 
     plan = policy.build_plan(producer_id, as_of, only_needed=False)
     product_ids = [it.product_id for it in plan.items]
@@ -126,6 +146,7 @@ def backtest_producer(producer_id: int, as_of: str, eval_window_days: int | None
         overstock_units=round(overstock_units, 2),
         overstock_units_per_product=round(overstock_units / total_items, 3),
         overstock_units_per_demand=round(overstock_units / demand_units, 3) if demand_units > 0 else 0.0,
+        demand_units=round(demand_units, 2),
         overstock_rate=round(overstocks / total_items, 3),
         coverage_with_policy=round(covered_with / denom, 3),
         coverage_without_policy=round(covered_without / denom, 3),

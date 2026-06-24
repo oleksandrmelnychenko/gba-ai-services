@@ -26,7 +26,7 @@ _ALPHA = 40.0
 _REG = 0.1
 
 # cache trained models per as_of (avoid retraining for every eval case)
-_MODEL_CACHE: dict[str, "ALSModel"] = {}
+_MODEL_CACHE: dict[str, ALSModel] = {}
 
 
 class ALSModel:

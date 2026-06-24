@@ -10,6 +10,7 @@ still works (just uncached). Never let cache failure break scoring.
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import redis
@@ -21,7 +22,15 @@ from app.core.metrics import METRICS
 log = get_logger("cache")
 
 _client: redis.Redis | None = None
-_unavailable = False
+_unavailable_until = 0.0
+
+
+def _mark_unavailable(event: str, exc: Exception) -> None:
+    global _client, _unavailable_until
+    s = get_settings()
+    _client = None
+    _unavailable_until = time.monotonic() + s.redis_retry_cooldown_seconds
+    log.warning(event, error=str(exc), retry_after_seconds=s.redis_retry_cooldown_seconds)
 
 
 def _model_version() -> str:
@@ -29,10 +38,10 @@ def _model_version() -> str:
 
 
 def _get_client() -> redis.Redis | None:
-    global _client, _unavailable
-    if _unavailable:
-        return None
+    global _client
     if _client is None:
+        if time.monotonic() < _unavailable_until:
+            return None
         s = get_settings()
         try:
             _client = redis.Redis(
@@ -42,9 +51,7 @@ def _get_client() -> redis.Redis | None:
             _client.ping()
             log.info("redis_connected", host=s.redis_host, port=s.redis_port, db=s.redis_db)
         except Exception as exc:  # noqa: BLE001
-            log.warning("redis_unavailable", error=str(exc))
-            _client = None
-            _unavailable = True
+            _mark_unavailable("redis_unavailable", exc)
     return _client
 
 
@@ -63,7 +70,7 @@ def get(key: str) -> dict[str, Any] | None:
     try:
         raw = client.get(key)
     except Exception as exc:  # noqa: BLE001
-        log.warning("cache_get_failed", error=str(exc))
+        _mark_unavailable("cache_get_failed", exc)
         return None
     if raw is None:
         METRICS.record_cache(hit=False)
@@ -80,7 +87,7 @@ def set(key: str, value: dict[str, Any], ttl: int | None = None) -> None:
     try:
         client.setex(key, ttl, json.dumps(value, default=str))
     except Exception as exc:  # noqa: BLE001
-        log.warning("cache_set_failed", error=str(exc))
+        _mark_unavailable("cache_set_failed", exc)
 
 
 def invalidate_client(client_id: int) -> int:
@@ -90,9 +97,13 @@ def invalidate_client(client_id: int) -> int:
     deleted = 0
     for prefix in ("solv", "solvchart"):
         pattern = f"{prefix}:{_model_version()}:{client_id}:*"
-        keys = list(client.scan_iter(match=pattern, count=200))
-        if keys:
-            deleted += client.delete(*keys)
+        try:
+            keys = list(client.scan_iter(match=pattern, count=200))
+            if keys:
+                deleted += client.delete(*keys)
+        except Exception as exc:  # noqa: BLE001
+            _mark_unavailable("cache_invalidate_failed", exc)
+            return deleted
     return deleted
 
 
@@ -102,5 +113,6 @@ def health() -> bool:
         return False
     try:
         return bool(client.ping())
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        _mark_unavailable("redis_health_failed", exc)
         return False
