@@ -1,0 +1,32 @@
+# Secrets — never commit
+.env
+.env.local
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Logs / data dumps
+*.log
+*.rdb
+benchmarks/*.json
+
+# Generated modeling datasets (large, regenerable via scripts/build_risk_dataset.py)
+data/
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+
+# v3 training byproducts (regenerable; service uses the coefficient JSONs)
+app/risk/artifacts/*.joblib
+app/risk/artifacts/*.pkl
+app/risk/artifacts/*.png
+app/risk/artifacts/backup_*/

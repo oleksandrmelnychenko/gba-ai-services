@@ -1,0 +1,17 @@
+[Unit]
+Description=GBA NBA weekly propensity model retrain timer
+# Drives gba-nba-retrain.service on a weekly cadence.
+
+[Timer]
+# Weekly, Monday 04:00 local time (low-traffic window; the DB read-only login and the reco
+# service are least contended). Offset from gba-solvency-retrain (03:30) so the two retrains
+# don't hammer the read-only DB login at the same instant.
+OnCalendar=Mon *-*-* 04:00:00
+# If the box was off at the scheduled time, run as soon as it is back up.
+Persistent=true
+# Stagger up to 10 min so a fleet-wide reboot doesn't fire every retrain at once.
+RandomizedDelaySec=600
+Unit=gba-nba-retrain.service
+
+[Install]
+WantedBy=timers.target

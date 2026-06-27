@@ -1,0 +1,38 @@
+[project]
+name = "gba-nba"
+version = "0.1.0"
+description = "GBA AI Sales Cockpit — Next Best Action task engine (stateful, MongoDB)"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "pydantic>=2.10",
+    "pydantic-settings>=2.7",
+    "pymongo>=4.10",
+    "sqlalchemy>=2.0.36",
+    "pymssql>=2.3.1",
+    "httpx>=0.28",
+    "structlog>=24.4",
+    "apscheduler>=3.10",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.8",
+    "mongomock>=4.3",
+    "httpx2>=2.5",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: DB-backed smoke against the dev ConcordDb_V5 (skipped without DB_* env; run via 'make integration')",
+]

@@ -1,0 +1,43 @@
+# Local/dev orchestration. Secrets come from .env (gitignored), never inline.
+# Three processes: MongoDB (task state) + the API + the daily scheduler (09:00 Europe/Kyiv).
+services:
+  mongo:
+    image: mongo:7
+    container_name: gba-nba-mongo
+    ports: ["27017:27017"]
+    volumes: ["mongo_data:/data/db"]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  api:
+    build: .
+    container_name: gba-nba-api
+    env_file: [.env]
+    environment:
+      MONGO_URI: mongodb://mongo:27017
+    ports: ["8002:8002"]
+    depends_on:
+      mongo:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Long-running APScheduler process: generates every manager's inbox at 09:00 Europe/Kyiv
+  # (+ a catch-up run on start). Idempotent, so safe alongside the API.
+  scheduler:
+    build: .
+    container_name: gba-nba-scheduler
+    env_file: [.env]
+    environment:
+      MONGO_URI: mongodb://mongo:27017
+    command: ["python", "-m", "app.services.scheduler"]
+    depends_on:
+      mongo:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  mongo_data:

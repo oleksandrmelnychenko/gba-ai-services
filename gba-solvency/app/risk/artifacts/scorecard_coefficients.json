@@ -1,0 +1,237 @@
+{
+  "model": "woe_logistic_scorecard_current_state",
+  "target": "label_sev180",
+  "features": [
+    "overdue_eur_91_180",
+    "overdue_eur_61_90",
+    "overdue_eur_31_60",
+    "overdue_eur_1_30",
+    "current_debt_eur",
+    "total_debt_eur",
+    "max_overdue_days",
+    "n_open_debt_lines",
+    "debt_growth_3mo",
+    "months_with_debt_last12",
+    "new_debt_eur_3mo",
+    "credit_limit_eur",
+    "limit_utilization",
+    "grace_days",
+    "has_credit_control",
+    "turnover_eur_12mo",
+    "order_count_12mo",
+    "recency_days",
+    "tenure_months",
+    "return_rate_12mo"
+  ],
+  "tautological_excluded": [
+    "overdue_eur_180plus",
+    "pct_debt_180plus"
+  ],
+  "risk_direction": {
+    "overdue_eur_91_180": "up",
+    "overdue_eur_61_90": "up",
+    "overdue_eur_31_60": "up",
+    "overdue_eur_1_30": "up",
+    "current_debt_eur": "up",
+    "total_debt_eur": "up",
+    "max_overdue_days": "up",
+    "n_open_debt_lines": "up",
+    "debt_growth_3mo": "up",
+    "months_with_debt_last12": "up",
+    "new_debt_eur_3mo": "up",
+    "credit_limit_eur": "down",
+    "limit_utilization": "up",
+    "grace_days": "up",
+    "has_credit_control": "up",
+    "turnover_eur_12mo": "down",
+    "order_count_12mo": "down",
+    "recency_days": "up",
+    "tenure_months": "down",
+    "return_rate_12mo": "up"
+  },
+  "woe_bins": {
+    "overdue_eur_91_180": {
+      "splits": [],
+      "woe": [
+        0.0
+      ]
+    },
+    "overdue_eur_61_90": {
+      "splits": [],
+      "woe": [
+        0.0
+      ]
+    },
+    "overdue_eur_31_60": {
+      "splits": [],
+      "woe": [
+        0.0
+      ]
+    },
+    "overdue_eur_1_30": {
+      "splits": [],
+      "woe": [
+        0.0
+      ]
+    },
+    "current_debt_eur": {
+      "splits": [],
+      "woe": [
+        0.0
+      ]
+    },
+    "total_debt_eur": {
+      "splits": [],
+      "woe": [
+        0.0
+      ]
+    },
+    "max_overdue_days": {
+      "splits": [],
+      "woe": [
+        0.0
+      ]
+    },
+    "n_open_debt_lines": {
+      "splits": [
+        0.0
+      ],
+      "woe": [
+        -4.0,
+        2.628018743624442
+      ]
+    },
+    "debt_growth_3mo": {
+      "splits": [
+        1.041899,
+        10.0
+      ],
+      "woe": [
+        -0.40229254572894746,
+        2.5786529771015663
+      ]
+    },
+    "months_with_debt_last12": {
+      "splits": [
+        0.0
+      ],
+      "woe": [
+        -2.2828074989468785,
+        2.9386298640735875
+      ]
+    },
+    "new_debt_eur_3mo": {
+      "splits": [],
+      "woe": [
+        0.0
+      ]
+    },
+    "credit_limit_eur": {
+      "splits": [
+        0.0
+      ],
+      "woe": [
+        0.07249026746269796,
+        -1.1281667462598284
+      ]
+    },
+    "limit_utilization": {
+      "splits": [],
+      "woe": [
+        0.0
+      ]
+    },
+    "grace_days": {
+      "splits": [],
+      "woe": [
+        0.0
+      ]
+    },
+    "has_credit_control": {
+      "splits": [
+        1.0
+      ],
+      "woe": [
+        0.0
+      ]
+    },
+    "turnover_eur_12mo": {
+      "splits": [],
+      "woe": [
+        0.0
+      ]
+    },
+    "order_count_12mo": {
+      "splits": [],
+      "woe": [
+        0.0
+      ]
+    },
+    "recency_days": {
+      "splits": [
+        445.0
+      ],
+      "woe": [
+        0.0
+      ]
+    },
+    "tenure_months": {
+      "splits": [
+        14.0
+      ],
+      "woe": [
+        0.0
+      ]
+    },
+    "return_rate_12mo": {
+      "splits": [],
+      "woe": [
+        0.0
+      ]
+    }
+  },
+  "logistic": {
+    "coef": {
+      "overdue_eur_91_180": 0.0,
+      "overdue_eur_61_90": 0.0,
+      "overdue_eur_31_60": 0.0,
+      "overdue_eur_1_30": 0.0,
+      "current_debt_eur": 0.0,
+      "total_debt_eur": 0.0,
+      "max_overdue_days": 0.0,
+      "n_open_debt_lines": 1.4682854759521293,
+      "debt_growth_3mo": -0.2273280168311036,
+      "months_with_debt_last12": 0.2921115315798901,
+      "new_debt_eur_3mo": 0.0,
+      "credit_limit_eur": 0.8013033116747581,
+      "limit_utilization": 0.0,
+      "grace_days": 0.0,
+      "has_credit_control": 0.0,
+      "turnover_eur_12mo": 0.0,
+      "order_count_12mo": 0.0,
+      "recency_days": 0.0,
+      "tenure_months": 0.0,
+      "return_rate_12mo": 0.0
+    },
+    "intercept": -1.6027097305393296
+  },
+  "calibration": {
+    "a": 1.0885298563346388,
+    "b": -3.2371675081813445
+  },
+  "score_mapping": {
+    "type": "log_odds_points",
+    "pdo": 20.0,
+    "anchor_offset": 600.0,
+    "score_range_lo": 400.0,
+    "score_range_hi": 800.0
+  },
+  "bands": {
+    "A": 0.02,
+    "B": 0.05,
+    "C": 0.15
+  },
+  "trained_at": "2026-06-26 12:31:28",
+  "n_rows": 2951,
+  "n_pos": 138
+}

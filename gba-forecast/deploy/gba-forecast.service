@@ -1,0 +1,17 @@
+[Unit]
+Description=GBA forecast AI service (uvicorn :8006)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/projects/gba-forecast
+EnvironmentFile=/root/projects/gba-forecast/.env
+ExecStart=/root/projects/gba-forecast/.venv/bin/python -m uvicorn app.api.main:app --host 0.0.0.0 --port 8006
+Restart=always
+RestartSec=3
+StandardOutput=append:/var/log/gba-forecast.log
+StandardError=append:/var/log/gba-forecast.log
+
+[Install]
+WantedBy=multi-user.target

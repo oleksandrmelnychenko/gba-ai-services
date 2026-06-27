@@ -1,0 +1,42 @@
+{
+  "production_model": "hgb",
+  "features": [
+    "monetary",
+    "recency_days",
+    "order_count",
+    "sig_overdue_amount",
+    "sig_days_past_terms",
+    "sig_max_overdue_days",
+    "sig_debt_lines",
+    "sig_elapsed_days",
+    "sig_cycle_days",
+    "sig_overdue_ratio",
+    "sig_n_orders",
+    "sig_drop_ratio",
+    "sig_silence_days",
+    "sig_recent_orders",
+    "sig_prior_orders",
+    "sig_top_score",
+    "sig_reco_candidates",
+    "is_reorder_due",
+    "is_debt_followup",
+    "is_churn_winback",
+    "is_cross_sell"
+  ],
+  "task_types": [
+    "reorder_due",
+    "debt_followup",
+    "churn_winback",
+    "cross_sell"
+  ],
+  "calibration": "isotonic",
+  "oot_split": {
+    "train_max": "2026-01-01",
+    "test": [
+      "2026-02-01",
+      "2026-04-01"
+    ]
+  },
+  "value_head": "see expected_value_row in train.py / score_task.py",
+  "priority_formula": "priority = 100 * p_outcome_normalized; rank by p_outcome * expected_value"
+}

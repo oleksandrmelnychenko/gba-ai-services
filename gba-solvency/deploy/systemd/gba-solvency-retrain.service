@@ -1,0 +1,20 @@
+[Unit]
+Description=GBA solvency model retrain (rebuild dataset + retrain scorecards, AUC-gated atomic swap)
+After=network-online.target gba-solvency.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/projects/gba-solvency
+# Full as-of-today retrain: rebuild dataset + vintages, retrain current + forward scorecards,
+# validate (current-state OOF AUC >= 0.90 or abort + restore), then atomically swap artifacts
+# and refresh the drift baseline. Uses gba-solvency's OWN venv (pandas/sklearn live there).
+ExecStart=/root/projects/gba-solvency/.venv/bin/python scripts/retrain.py --auc-floor 0.90
+# Belt-and-suspenders: the script restarts the live service after a successful swap so the
+# in-process scorecard lru_cache picks up the new artifacts. Harmless if already current.
+ExecStartPost=/bin/systemctl try-restart gba-solvency.service
+TimeoutStartSec=3600
+StandardOutput=append:/var/log/gba-solvency-retrain.log
+StandardError=append:/var/log/gba-solvency-retrain.log
+
+# Do NOT [Install] / WantedBy here — this unit is started by gba-solvency-retrain.timer, not at boot.

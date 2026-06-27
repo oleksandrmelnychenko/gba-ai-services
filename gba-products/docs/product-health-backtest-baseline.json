@@ -1,0 +1,247 @@
+{
+  "as_of": "2025-12-01",
+  "horizon_days": 180,
+  "model_version": "products-v2-abc",
+  "outcome_end": "2026-05-30",
+  "summary": {
+    "by_action": [
+      {
+        "action_label": "dead_stock_review",
+        "avg_demand_score": 15.5,
+        "avg_future_margin_eur": -11.07,
+        "avg_future_revenue_eur": 215.08,
+        "avg_future_units": 15.65,
+        "avg_health": 21.0,
+        "avg_margin_score": 57.0,
+        "future_zero_revenue_share": 0.1667,
+        "n": 414
+      },
+      {
+        "action_label": "discount_or_redistribute",
+        "avg_demand_score": 54.1591,
+        "avg_future_margin_eur": 118.05,
+        "avg_future_revenue_eur": 456.46,
+        "avg_future_units": 110.59,
+        "avg_health": 53.7045,
+        "avg_margin_score": 70.1864,
+        "future_zero_revenue_share": 0.0455,
+        "n": 22
+      },
+      {
+        "action_label": "fix_margin",
+        "avg_demand_score": 69.0088,
+        "avg_future_margin_eur": -31.55,
+        "avg_future_revenue_eur": 644.46,
+        "avg_future_units": 90.09,
+        "avg_health": 59.8948,
+        "avg_margin_score": 25.3254,
+        "future_zero_revenue_share": 0.2001,
+        "n": 1869
+      },
+      {
+        "action_label": "keep_push",
+        "avg_demand_score": 83.0158,
+        "avg_future_margin_eur": 293.31,
+        "avg_future_revenue_eur": 898.56,
+        "avg_future_units": 115.33,
+        "avg_health": 86.9464,
+        "avg_margin_score": 90.8158,
+        "future_zero_revenue_share": 0.0683,
+        "n": 571
+      },
+      {
+        "action_label": "monitor",
+        "avg_demand_score": 53.9461,
+        "avg_future_margin_eur": 35.52,
+        "avg_future_revenue_eur": 158.75,
+        "avg_future_units": 20.71,
+        "avg_health": 58.134,
+        "avg_margin_score": 57.7155,
+        "future_zero_revenue_share": 0.3907,
+        "n": 12395
+      },
+      {
+        "action_label": "monitor_decline",
+        "avg_demand_score": 34.6367,
+        "avg_future_margin_eur": 12.58,
+        "avg_future_revenue_eur": 87.88,
+        "avg_future_units": 15.77,
+        "avg_health": 37.585,
+        "avg_margin_score": 58.1114,
+        "future_zero_revenue_share": 0.4037,
+        "n": 3701
+      },
+      {
+        "action_label": "quality_review",
+        "avg_demand_score": 59.2609,
+        "avg_future_margin_eur": 48.41,
+        "avg_future_revenue_eur": 174.49,
+        "avg_future_units": 7.47,
+        "avg_health": 57.703,
+        "avg_margin_score": 45.9469,
+        "future_zero_revenue_share": 0.4013,
+        "n": 471
+      },
+      {
+        "action_label": "reorder_check",
+        "avg_demand_score": 78.508,
+        "avg_future_margin_eur": 517.13,
+        "avg_future_revenue_eur": 2307.99,
+        "avg_future_units": 247.43,
+        "avg_health": 72.1873,
+        "avg_margin_score": 69.0223,
+        "future_zero_revenue_share": 0.0438,
+        "n": 251
+      },
+      {
+        "action_label": "slow_mover_review",
+        "avg_demand_score": 51.0389,
+        "avg_future_margin_eur": 34.59,
+        "avg_future_revenue_eur": 229.34,
+        "avg_future_units": 19.37,
+        "avg_health": 50.13,
+        "avg_margin_score": 61.8889,
+        "future_zero_revenue_share": 0.2111,
+        "n": 180
+      },
+      {
+        "action_label": "to_order_candidate",
+        "avg_demand_score": 80.1771,
+        "avg_future_margin_eur": null,
+        "avg_future_revenue_eur": 889.23,
+        "avg_future_units": 111.76,
+        "avg_health": 72.2119,
+        "avg_margin_score": 63.1769,
+        "future_zero_revenue_share": 0.181,
+        "n": 4746
+      }
+    ],
+    "correlations": {
+      "spearman_demand_score_to_future_revenue": 0.4716,
+      "spearman_demand_score_to_future_units": 0.3865,
+      "spearman_health_to_future_margin": 0.4201,
+      "spearman_health_to_future_revenue": 0.3874,
+      "spearman_health_to_future_units": 0.3217,
+      "spearman_margin_score_to_future_margin": 0.5313
+    },
+    "deciles_low_to_high_health": [
+      {
+        "avg_future_margin_eur": -9.94,
+        "avg_future_revenue_eur": 79.03,
+        "avg_health": 30.8476,
+        "bucket": 1,
+        "future_return_rate": 0.002,
+        "future_units": 30183.0,
+        "n": 2462,
+        "total_future_revenue_eur": 194569.05
+      },
+      {
+        "avg_future_margin_eur": -4.46,
+        "avg_future_revenue_eur": 120.87,
+        "avg_health": 43.0691,
+        "bucket": 2,
+        "future_return_rate": 0.004,
+        "future_units": 44598.5,
+        "n": 2462,
+        "total_future_revenue_eur": 297574.37
+      },
+      {
+        "avg_future_margin_eur": -7.85,
+        "avg_future_revenue_eur": 84.19,
+        "avg_health": 49.5144,
+        "bucket": 3,
+        "future_return_rate": 0.0022,
+        "future_units": 26766.0,
+        "n": 2462,
+        "total_future_revenue_eur": 207269.94
+      },
+      {
+        "avg_future_margin_eur": -3.29,
+        "avg_future_revenue_eur": 265.77,
+        "avg_health": 53.9168,
+        "bucket": 4,
+        "future_return_rate": 0.0037,
+        "future_units": 63754.0,
+        "n": 2462,
+        "total_future_revenue_eur": 654327.67
+      },
+      {
+        "avg_future_margin_eur": -3.99,
+        "avg_future_revenue_eur": 56.27,
+        "avg_health": 57.725,
+        "bucket": 5,
+        "future_return_rate": 0.0023,
+        "future_units": 21856.0,
+        "n": 2462,
+        "total_future_revenue_eur": 138544.7
+      },
+      {
+        "avg_future_margin_eur": -2.59,
+        "avg_future_revenue_eur": 310.8,
+        "avg_health": 59.5654,
+        "bucket": 6,
+        "future_return_rate": 0.0012,
+        "future_units": 84769.0,
+        "n": 2462,
+        "total_future_revenue_eur": 765193.34
+      },
+      {
+        "avg_future_margin_eur": 0.58,
+        "avg_future_revenue_eur": 186.43,
+        "avg_health": 64.4499,
+        "bucket": 7,
+        "future_return_rate": 0.0031,
+        "future_units": 70900.0,
+        "n": 2462,
+        "total_future_revenue_eur": 459000.68
+      },
+      {
+        "avg_future_margin_eur": -12.97,
+        "avg_future_revenue_eur": 427.36,
+        "avg_health": 67.2232,
+        "bucket": 8,
+        "future_return_rate": 0.0017,
+        "future_units": 138716.5,
+        "n": 2462,
+        "total_future_revenue_eur": 1052160.99
+      },
+      {
+        "avg_future_margin_eur": 53.82,
+        "avg_future_revenue_eur": 838.7,
+        "avg_health": 72.8382,
+        "bucket": 9,
+        "future_return_rate": 0.0011,
+        "future_units": 214858.0,
+        "n": 2462,
+        "total_future_revenue_eur": 2064871.6
+      },
+      {
+        "avg_future_margin_eur": 232.69,
+        "avg_future_revenue_eur": 1299.39,
+        "avg_health": 80.9382,
+        "bucket": 10,
+        "future_return_rate": 0.0034,
+        "future_units": 461331.5,
+        "n": 2462,
+        "total_future_revenue_eur": 3199087.89
+      }
+    ],
+    "future_zero_revenue_share": 0.3216,
+    "health_max": 100.0,
+    "health_min": 20.9,
+    "health_p50": 57.8,
+    "n": 24620,
+    "n_with_future_margin": 4429,
+    "n_with_future_revenue": 16703,
+    "notes": [
+      "health is treated as a triage composite until these diagnostics show stable lift",
+      "future_margin_eur is only available when snapshot unit cost is known"
+    ],
+    "top_bottom_lift": {
+      "future_margin_avg_top_vs_bottom": -44.4825,
+      "future_revenue_avg_top_vs_bottom": 10.696,
+      "future_units_avg_top_vs_bottom": 9.0422,
+      "tail_fraction": 0.2
+    }
+  }
+}

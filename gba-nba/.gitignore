@@ -1,0 +1,16 @@
+.env
+.env.local
+*.pem
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+*.log
+.DS_Store
+.vscode/
+.idea/
+data/
+app/ml/artifacts/backup_*/

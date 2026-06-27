@@ -1,0 +1,15 @@
+[Unit]
+Description=GBA solvency weekly model retrain timer
+# Drives gba-solvency-retrain.service on a weekly cadence.
+
+[Timer]
+# Weekly, Monday 03:30 local time (low-traffic window; the DB read-only login is least contended).
+OnCalendar=Mon *-*-* 03:30:00
+# If the box was off at the scheduled time, run as soon as it is back up.
+Persistent=true
+# Stagger up to 10 min so a fleet-wide reboot doesn't fire every retrain at once.
+RandomizedDelaySec=600
+Unit=gba-solvency-retrain.service
+
+[Install]
+WantedBy=timers.target

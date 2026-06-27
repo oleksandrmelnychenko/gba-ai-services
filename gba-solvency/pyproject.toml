@@ -1,0 +1,37 @@
+[project]
+name = "gba-solvency"
+version = "0.1.0"
+description = "GBA Client Solvency (CreditScore-100) Service"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "pydantic>=2.10",
+    "pydantic-settings>=2.7",
+    "sqlalchemy>=2.0.36",
+    "pymssql>=2.3.1",
+    "redis>=5.2",
+    "structlog>=24.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+    "ruff>=0.8",
+    "httpx>=0.28",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "integration: DB-backed smoke against the dev DB; skipped without DB env, run via 'make integration'",
+]

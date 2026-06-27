@@ -1,0 +1,186 @@
+{
+  "dataset": {
+    "rows": 2951,
+    "positives": 138,
+    "prevalence": 0.04676380887834632
+  },
+  "primary_features": [
+    "overdue_eur_91_180",
+    "overdue_eur_61_90",
+    "overdue_eur_31_60",
+    "overdue_eur_1_30",
+    "current_debt_eur",
+    "total_debt_eur",
+    "max_overdue_days",
+    "n_open_debt_lines",
+    "debt_growth_3mo",
+    "months_with_debt_last12",
+    "new_debt_eur_3mo",
+    "credit_limit_eur",
+    "limit_utilization",
+    "grace_days",
+    "has_credit_control",
+    "turnover_eur_12mo",
+    "order_count_12mo",
+    "recency_days",
+    "tenure_months",
+    "return_rate_12mo"
+  ],
+  "tautological_excluded": [
+    "overdue_eur_180plus",
+    "pct_debt_180plus"
+  ],
+  "tier_ablation_gbm": {
+    "note": "Label is sourced from Debt/ClientInDebt; debt-aging & debt-derived features share that table and are near-mechanically coupled to SEV180. non_debt_table_only (credit terms/utilization, RFM, returns) is the genuinely independent signal.",
+    "tiers": {
+      "non_debt_table_only": {
+        "n_features": 9,
+        "auc_mean": 0.8945,
+        "ks_mean": 0.7469
+      },
+      "leading_no_aging_buckets": {
+        "n_features": 12,
+        "auc_mean": 0.9371,
+        "ks_mean": 0.8743
+      },
+      "primary_full": {
+        "n_features": 20,
+        "auc_mean": 0.9998,
+        "ks_mean": 0.9972
+      },
+      "with_tautological": {
+        "n_features": 22,
+        "auc_mean": 0.9999,
+        "ks_mean": 0.9996
+      }
+    },
+    "groups": {
+      "non_debt_table": [
+        "credit_limit_eur",
+        "limit_utilization",
+        "grace_days",
+        "has_credit_control",
+        "turnover_eur_12mo",
+        "order_count_12mo",
+        "recency_days",
+        "tenure_months",
+        "return_rate_12mo"
+      ],
+      "debt_derived": [
+        "debt_growth_3mo",
+        "months_with_debt_last12",
+        "new_debt_eur_3mo"
+      ],
+      "debt_aging": [
+        "overdue_eur_91_180",
+        "overdue_eur_61_90",
+        "overdue_eur_31_60",
+        "overdue_eur_1_30",
+        "current_debt_eur",
+        "total_debt_eur",
+        "max_overdue_days",
+        "n_open_debt_lines"
+      ]
+    }
+  },
+  "cv": {
+    "woe_scorecard_primary": {
+      "auc_mean": 0.9813073627992595,
+      "auc_std": 0.0064200104555673125,
+      "auc_folds": [
+        0.972,
+        0.9868,
+        0.988,
+        0.9843,
+        0.9754
+      ],
+      "ks_mean": 0.936368463303477,
+      "gini_mean": 0.9626147255985189,
+      "brier_mean": 0.05132240631892658,
+      "oof_auc": 0.9826864918056436
+    },
+    "woe_scorecard_with_tautological": {
+      "auc_mean": 0.9816973726442889,
+      "auc_std": 0.005249320766693949,
+      "auc_folds": [
+        0.975,
+        0.9887,
+        0.9855,
+        0.983,
+        0.9764
+      ],
+      "ks_mean": 0.9377919508479613,
+      "gini_mean": 0.9633947452885778,
+      "brier_mean": 0.051030423638090315,
+      "oof_auc": 0.9826710356162124
+    },
+    "gbm_primary": {
+      "auc_mean": 0.9997637315789468,
+      "auc_std": 0.00022645502697676023,
+      "auc_folds": [
+        0.9994,
+        1.0,
+        0.9996,
+        1.0,
+        0.9998
+      ],
+      "ks_mean": 0.9971568175066212,
+      "gini_mean": 0.9995274631578936,
+      "brier_mean": 0.0024084527255450296,
+      "oof_auc": 0.999687012164021
+    },
+    "gbm_with_tautological": {
+      "auc_mean": 0.9999237417386884,
+      "auc_std": 0.00015251652262331382,
+      "auc_folds": [
+        1.0,
+        1.0,
+        0.9996,
+        1.0,
+        1.0
+      ],
+      "ks_mean": 0.9996441281138789,
+      "gini_mean": 0.9998474834773767,
+      "brier_mean": 0.0007910965767635615,
+      "oof_auc": 0.9998866546108388
+    },
+    "ablation_auc_delta_woe": 0.0004,
+    "ablation_auc_delta_gbm": 0.0002
+  },
+  "bands": {
+    "definition": {
+      "A": "PD<2%",
+      "B": "2-5%",
+      "C": "5-15%",
+      "D": ">15%"
+    },
+    "score_mapping": "log-odds points (PDO=20), [400,800]->[0,100], higher=safer",
+    "realized": [
+      {
+        "band": "A",
+        "n": 2611,
+        "realized_pd": 0.0,
+        "mean_score": 100.0,
+        "min_score": 100.0,
+        "max_score": 100.0
+      },
+      {
+        "band": "C",
+        "n": 36,
+        "realized_pd": 0.1111111111111111,
+        "mean_score": 67.25340781571231,
+        "min_score": 67.25340781571231,
+        "max_score": 67.25340781571231
+      },
+      {
+        "band": "D",
+        "n": 304,
+        "realized_pd": 0.4407894736842105,
+        "mean_score": 51.80482275898515,
+        "min_score": 47.722666208235154,
+        "max_score": 60.59806357333244
+      }
+    ]
+  },
+  "calibration_plot": "/root/projects/gba-solvency/app/risk/artifacts/calibration_current.png"
+}
