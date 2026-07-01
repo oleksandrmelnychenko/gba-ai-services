@@ -4,16 +4,16 @@ version = "0.1.0"
 description = "GBA AI Sales Cockpit — Next Best Action task engine (stateful, MongoDB)"
 requires-python = ">=3.12"
 dependencies = [
-    "fastapi>=0.115",
-    "uvicorn[standard]>=0.34",
-    "pydantic>=2.10",
-    "pydantic-settings>=2.7",
-    "pymongo>=4.10",
-    "sqlalchemy>=2.0.36",
-    "pymssql>=2.3.1",
-    "httpx>=0.28",
-    "structlog>=24.4",
-    "apscheduler>=3.10",
+    "fastapi>=0.138.2",
+    "uvicorn[standard]>=0.49.0",
+    "pydantic>=2.13.4",
+    "pydantic-settings>=2.14.2",
+    "pymongo>=4.17.0",
+    "sqlalchemy>=2.0.51",
+    "pymssql>=2.3.13",
+    "httpx>=0.28.1",
+    "structlog>=26.1.0",
+    "apscheduler>=3.11.3",
 ]
 
 [project.optional-dependencies]
