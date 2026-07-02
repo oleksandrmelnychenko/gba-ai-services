@@ -8,6 +8,7 @@ Contract is aligned with the future gba-server (.NET) DTOs and the console.
 """
 from __future__ import annotations
 
+from datetime import date
 from enum import StrEnum
 
 from pydantic import BaseModel, Field
@@ -92,7 +93,7 @@ class PriceRequest(BaseModel):
         default=None, ge=0.0, le=100.0, description="override the config default margin floor"
     )
     use_cache: bool = True
-    as_of_date: str | None = None
+    as_of_date: date | None = None
 
 
 class BatchPriceItem(BaseModel):
@@ -107,4 +108,4 @@ class BatchPriceRequest(BaseModel):
     with_vat: bool = True
     target_margin_pct: float | None = Field(default=None, ge=0.0, le=100.0)
     use_cache: bool = True
-    as_of_date: str | None = None
+    as_of_date: date | None = None

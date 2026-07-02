@@ -93,6 +93,7 @@ class CartReplenishmentPlan(BaseModel):
     value_captured_eur: float | None = None
     selected_count: int | None = None
     deferred_count: int | None = None
+    method_used: str | None = None
     model_version: str = "procure-hist120-v1"
 
 

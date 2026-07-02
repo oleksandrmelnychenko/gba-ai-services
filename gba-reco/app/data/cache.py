@@ -86,8 +86,13 @@ def invalidate_customer(customer_id: int) -> int:
     client = _get_client()
     if client is None:
         return 0
-    pattern = f"reco:{_MODEL_VERSION}:{customer_id}:*"
-    keys = list(client.scan_iter(match=pattern, count=200))
+    patterns = (
+        f"reco:{_MODEL_VERSION}:{customer_id}:*",
+        f"copurchase:{_MODEL_VERSION}:{customer_id}:*",
+    )
+    keys: list[str] = []
+    for pattern in patterns:
+        keys.extend(client.scan_iter(match=pattern, count=200))
     return client.delete(*keys) if keys else 0
 
 

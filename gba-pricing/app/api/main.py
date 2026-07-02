@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hmac
 import time
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
@@ -28,6 +29,16 @@ settings = get_settings()
 log = get_logger("api")
 
 _OPEN_PATHS = {"/health"}
+
+
+def _is_valid_uid(value: str | None) -> bool:
+    if value is None:
+        return True
+    try:
+        uuid.UUID(str(value))
+        return True
+    except (ValueError, TypeError, AttributeError):
+        return False
 
 
 def _service():
@@ -104,6 +115,10 @@ def metrics() -> dict:
 def price(req: PriceRequest) -> PriceRecommendation:
     if req.product_id is None and req.product_net_uid is None:
         raise HTTPException(status_code=422, detail="product_id or product_net_uid required")
+    if not _is_valid_uid(req.client_agreement_net_uid):
+        raise HTTPException(status_code=422, detail="malformed client_agreement_net_uid")
+    if not _is_valid_uid(req.product_net_uid):
+        raise HTTPException(status_code=422, detail="malformed product_net_uid")
     try:
         return _service().recommend_price(
             product_id=req.product_id,
@@ -112,23 +127,41 @@ def price(req: PriceRequest) -> PriceRecommendation:
             culture=req.culture,
             with_vat=req.with_vat,
             target_margin_pct=req.target_margin_pct,
-            as_of_date=req.as_of_date,
+            as_of_date=req.as_of_date.isoformat() if req.as_of_date else None,
             use_cache=req.use_cache,
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        log.error("price_failed", product_id=req.product_id,
+        eid = uuid.uuid4().hex
+        log.error("price_failed", error_id=eid, product_id=req.product_id,
                   client_agreement_net_uid=req.client_agreement_net_uid, error=str(exc))
-        raise HTTPException(status_code=500, detail=f"price_failed: {exc}") from exc
+        raise HTTPException(status_code=500, detail=f"internal error (ref {eid})") from exc
 
 
 @app.post("/price/batch")
 def price_batch(req: BatchPriceRequest) -> dict:
     """Per-item errors are isolated so one bad pair doesn't fail the batch."""
     svc = _service()
+    as_of = req.as_of_date.isoformat() if req.as_of_date else None
     results, errors = [], []
     for item in req.items:
+        if not _is_valid_uid(item.client_agreement_net_uid):
+            errors.append({
+                "product_id": item.product_id,
+                "product_net_uid": item.product_net_uid,
+                "client_agreement_net_uid": item.client_agreement_net_uid,
+                "error": "malformed client_agreement_net_uid",
+            })
+            continue
+        if not _is_valid_uid(item.product_net_uid):
+            errors.append({
+                "product_id": item.product_id,
+                "product_net_uid": item.product_net_uid,
+                "client_agreement_net_uid": item.client_agreement_net_uid,
+                "error": "malformed product_net_uid",
+            })
+            continue
         try:
             results.append(svc.recommend_price(
                 product_id=item.product_id,
@@ -137,15 +170,26 @@ def price_batch(req: BatchPriceRequest) -> dict:
                 culture=req.culture,
                 with_vat=req.with_vat,
                 target_margin_pct=req.target_margin_pct,
-                as_of_date=req.as_of_date,
+                as_of_date=as_of,
                 use_cache=req.use_cache,
             ))
-        except Exception as exc:  # noqa: BLE001
+        except LookupError as exc:
             errors.append({
                 "product_id": item.product_id,
                 "product_net_uid": item.product_net_uid,
                 "client_agreement_net_uid": item.client_agreement_net_uid,
                 "error": str(exc),
+            })
+        except Exception as exc:  # noqa: BLE001
+            eid = uuid.uuid4().hex
+            log.error("price_batch_item_failed", error_id=eid,
+                      product_id=item.product_id, product_net_uid=item.product_net_uid,
+                      client_agreement_net_uid=item.client_agreement_net_uid, error=str(exc))
+            errors.append({
+                "product_id": item.product_id,
+                "product_net_uid": item.product_net_uid,
+                "client_agreement_net_uid": item.client_agreement_net_uid,
+                "error": f"internal error (ref {eid})",
             })
     return {"results": results, "errors": errors, "count": len(results), "failed": len(errors)}
 

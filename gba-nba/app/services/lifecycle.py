@@ -160,6 +160,10 @@ class TransitionError(Exception):
     pass
 
 
+class TaskNotFoundError(TransitionError):
+    pass
+
+
 def upsert_generated(task: Task) -> str:
     """Idempotent generation. If a task with this task_key already exists AND is still active,
     we refresh its computed fields (priority/payload/reason/contact/etc.) but PRESERVE the
@@ -224,7 +228,7 @@ def change_status(task_key: str, to: TaskStatus, by: int, reason: str | None = N
                   outcome: Outcome | None = None, snooze_until: datetime | None = None) -> dict:
     doc = mongo.tasks().find_one({"task_key": task_key})
     if not doc:
-        raise TransitionError(f"task not found: {task_key}")
+        raise TaskNotFoundError(f"task not found: {task_key}")
     current = TaskStatus(doc["status"])
     if to not in ALLOWED_TRANSITIONS.get(current, set()):
         raise TransitionError(f"illegal transition {current.value} -> {to.value}")
@@ -275,7 +279,7 @@ def add_note(task_key: str, author_id: int, text: str) -> dict:
         {"$push": {"notes": note}, "$set": {"updated_at": now}},
         return_document=ReturnDocument.AFTER)
     if not updated:
-        raise TransitionError(f"task not found: {task_key}")
+        raise TaskNotFoundError(f"task not found: {task_key}")
     _event(task_key, "note", by=author_id, reason=text[:120])
     return updated
 

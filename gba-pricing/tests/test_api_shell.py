@@ -15,6 +15,11 @@ from app.domain.models import (
 )
 
 
+CA_UID = "11111111-1111-1111-1111-111111111111"
+CA_UID_B = "22222222-2222-2222-2222-222222222222"
+CA_UID_C = "33333333-3333-3333-3333-333333333333"
+
+
 def _headers() -> dict[str, str]:
     if not main.settings.internal_api_key:
         return {}
@@ -59,10 +64,43 @@ def test_price_requires_product_identifier():
     client = TestClient(main.app)
     resp = client.post(
         "/price",
-        json={"client_agreement_net_uid": "ca-uid"},
+        json={"client_agreement_net_uid": CA_UID},
         headers=_headers(),
     )
     assert resp.status_code == 422
+
+
+def test_price_rejects_malformed_agreement_uid(monkeypatch):
+    _install_fake_service(monkeypatch)
+    client = TestClient(main.app)
+    resp = client.post(
+        "/price",
+        json={"product_id": 7, "client_agreement_net_uid": "not-a-uuid"},
+        headers=_headers(),
+    )
+    assert resp.status_code == 422
+
+
+def test_price_rejects_malformed_as_of_date(monkeypatch):
+    _install_fake_service(monkeypatch)
+    client = TestClient(main.app)
+    resp = client.post(
+        "/price",
+        json={"product_id": 7, "client_agreement_net_uid": CA_UID, "as_of_date": "15-06-2026"},
+        headers=_headers(),
+    )
+    assert resp.status_code == 422
+
+
+def test_price_accepts_iso_as_of_date(monkeypatch):
+    _install_fake_service(monkeypatch)
+    client = TestClient(main.app)
+    resp = client.post(
+        "/price",
+        json={"product_id": 7, "client_agreement_net_uid": CA_UID, "as_of_date": "2026-06-15"},
+        headers=_headers(),
+    )
+    assert resp.status_code == 200
 
 
 def test_price_with_fake_service(monkeypatch):
@@ -70,7 +108,7 @@ def test_price_with_fake_service(monkeypatch):
     client = TestClient(main.app)
     resp = client.post(
         "/price",
-        json={"product_id": 7, "client_agreement_net_uid": "ca-uid"},
+        json={"product_id": 7, "client_agreement_net_uid": CA_UID},
         headers=_headers(),
     )
     assert resp.status_code == 200
@@ -95,12 +133,27 @@ def test_price_batch_isolates_errors(monkeypatch):
 
     client = TestClient(main.app)
     resp = client.post("/price/batch", json={"items": [
-        {"product_id": 1, "client_agreement_net_uid": "a"},
-        {"product_id": 99, "client_agreement_net_uid": "b"},
-        {"product_id": 2, "client_agreement_net_uid": "c"},
+        {"product_id": 1, "client_agreement_net_uid": CA_UID},
+        {"product_id": 99, "client_agreement_net_uid": CA_UID_B},
+        {"product_id": 2, "client_agreement_net_uid": CA_UID_C},
     ]}, headers=_headers())
     assert resp.status_code == 200
     body = resp.json()
     assert body["count"] == 2
     assert body["failed"] == 1
     assert body["errors"][0]["product_id"] == 99
+    assert "boom" not in body["errors"][0]["error"]
+
+
+def test_price_batch_reports_malformed_uid(monkeypatch):
+    _install_fake_service(monkeypatch)
+    client = TestClient(main.app)
+    resp = client.post("/price/batch", json={"items": [
+        {"product_id": 1, "client_agreement_net_uid": CA_UID},
+        {"product_id": 2, "client_agreement_net_uid": "not-a-uuid"},
+    ]}, headers=_headers())
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["count"] == 1
+    assert body["failed"] == 1
+    assert body["errors"][0]["error"] == "malformed client_agreement_net_uid"

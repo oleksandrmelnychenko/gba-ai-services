@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import hmac
 import time
+import uuid
 from contextlib import asynccontextmanager
+from datetime import date
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -65,7 +67,7 @@ async def timing(request: Request, call_next):
 class RecommendRequest(BaseModel):
     customer_id: int = Field(..., description="dbo.ClientAgreement.ClientID")
     top_n: int = Field(default=25, ge=1, le=200)
-    as_of_date: str | None = None
+    as_of_date: date | None = None
     include_discovery: bool = True
     use_cache: bool = True
     region_scope: bool = Field(
@@ -79,7 +81,7 @@ class RecommendRequest(BaseModel):
 class BatchRequest(BaseModel):
     customer_ids: list[int] = Field(..., min_length=1, max_length=500)
     top_n: int = Field(default=25, ge=1, le=200)
-    as_of_date: str | None = None
+    as_of_date: date | None = None
     include_discovery: bool = True
     use_cache: bool = True
     region_scope: bool = False
@@ -117,20 +119,23 @@ def metrics() -> dict:
 def recommend(req: RecommendRequest) -> RecommendationResult:
     try:
         return service.get_recommendations(
-            customer_id=req.customer_id, as_of_date=req.as_of_date, top_n=req.top_n,
+            customer_id=req.customer_id,
+            as_of_date=req.as_of_date.isoformat() if req.as_of_date else None,
+            top_n=req.top_n,
             include_discovery=req.include_discovery, use_cache=req.use_cache,
             region_scope=req.region_scope,
         )
     except Exception as exc:  # noqa: BLE001
-        log.error("recommend_failed", customer_id=req.customer_id, error=str(exc))
-        raise HTTPException(status_code=500, detail=f"recommendation_failed: {exc}") from exc
+        error_id = uuid.uuid4().hex
+        log.error("recommend_failed", customer_id=req.customer_id, error_id=error_id, error=str(exc))
+        raise HTTPException(status_code=500, detail=f"recommendation_failed (ref {error_id})") from exc
 
 
 @app.post("/recommend/copurchase", response_model=RecommendationResult)
 def recommend_copurchase(req: RecommendRequest) -> RecommendationResult:
     """Item-item co-purchase recommender — the discovery source for cross-sell (faster than the
     v3.2 user-Jaccard and competitive in eval). Synthetic/ubiquitous lines already excluded."""
-    as_of = req.as_of_date or time.strftime("%Y-%m-%d")
+    as_of = req.as_of_date.isoformat() if req.as_of_date else time.strftime("%Y-%m-%d")
     key = cache.make_copurchase_key(req.customer_id, as_of, req.top_n)
     if req.use_cache:
         cached = cache.get(key)
@@ -145,8 +150,9 @@ def recommend_copurchase(req: RecommendRequest) -> RecommendationResult:
     try:
         result = copurchase.recommend(req.customer_id, as_of, top_n=req.top_n, include_owned=False)
     except Exception as exc:  # noqa: BLE001
-        log.error("copurchase_failed", customer_id=req.customer_id, error=str(exc))
-        raise HTTPException(status_code=500, detail=f"copurchase_failed: {exc}") from exc
+        error_id = uuid.uuid4().hex
+        log.error("copurchase_failed", customer_id=req.customer_id, error_id=error_id, error=str(exc))
+        raise HTTPException(status_code=500, detail=f"copurchase_failed (ref {error_id})") from exc
     if req.use_cache:
         cache.set(key, result.model_dump(mode="json"), ttl=_COPURCHASE_TTL)
     return result
@@ -157,15 +163,20 @@ def recommend_batch(req: BatchRequest) -> dict:
     """Batch endpoint (maps to .NET RecommendationsBatchEndpoint). Per-customer errors
     are isolated so one bad id doesn't fail the batch."""
     results, errors = [], []
+    as_of = req.as_of_date.isoformat() if req.as_of_date else None
     for cid in req.customer_ids:
         try:
             results.append(service.get_recommendations(
-                customer_id=cid, as_of_date=req.as_of_date, top_n=req.top_n,
+                customer_id=cid, as_of_date=as_of, top_n=req.top_n,
                 include_discovery=req.include_discovery, use_cache=req.use_cache,
                 region_scope=req.region_scope,
             ))
         except Exception as exc:  # noqa: BLE001
-            errors.append({"customer_id": cid, "error": str(exc)})
+            error_id = uuid.uuid4().hex
+            log.error("recommend_batch_item_failed", customer_id=cid, error_id=error_id,
+                      error=str(exc))
+            errors.append({"customer_id": cid, "error": f"recommendation_failed (ref {error_id})",
+                           "error_id": error_id})
     return {"results": results, "errors": errors, "count": len(results), "failed": len(errors)}
 
 

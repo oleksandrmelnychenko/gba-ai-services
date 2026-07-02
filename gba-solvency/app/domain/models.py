@@ -4,9 +4,11 @@ Contract is aligned with the future gba-server (.NET) DTOs and the console chart
 """
 from __future__ import annotations
 
+import uuid
+from datetime import date
 from enum import IntEnum, StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class SalePaymentStatusType(IntEnum):
@@ -146,6 +148,7 @@ class TrendPoint(BaseModel):
 
 class SolvencyCharts(BaseModel):
     client_id: int
+    applicable: bool = True
     limit_utilization_gauge: GaugeChart
     payment_discipline_donut: list[DonutSlice]
     open_invoice_aging_bars: list[AgingBar]
@@ -164,13 +167,24 @@ class SolvencyCharts(BaseModel):
 class ScoreRequest(BaseModel):
     client_id: int | None = Field(default=None, description="dbo.ClientAgreement.ClientID")
     client_net_uid: str | None = Field(default=None, description="dbo.Client.NetUID alternative")
-    as_of_date: str | None = None
+    as_of_date: date | None = None
     window_months: int = Field(default=12, ge=1, le=60)
     use_cache: bool = True
+
+    @field_validator("client_net_uid")
+    @classmethod
+    def _validate_net_uid(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        try:
+            uuid.UUID(v)
+        except (ValueError, AttributeError, TypeError) as exc:
+            raise ValueError("client_net_uid must be a valid GUID") from exc
+        return v
 
 
 class BatchScoreRequest(BaseModel):
     client_ids: list[int] = Field(..., min_length=1, max_length=500)
-    as_of_date: str | None = None
+    as_of_date: date | None = None
     window_months: int = Field(default=12, ge=1, le=60)
     use_cache: bool = True

@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import hmac
 import time
+import uuid
 from contextlib import asynccontextmanager
+from datetime import date
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -178,13 +180,17 @@ def score(req: ScoreRequest) -> SolvencyScore:
     try:
         return _service().score_client(
             client_id=req.client_id, client_net_uid=req.client_net_uid,
-            as_of_date=req.as_of_date, window_months=req.window_months, use_cache=req.use_cache,
+            as_of_date=req.as_of_date.isoformat() if req.as_of_date else None,
+            window_months=req.window_months, use_cache=req.use_cache,
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        log.error("score_failed", client_id=req.client_id, error=str(exc))
-        raise HTTPException(status_code=500, detail=f"score_failed: {exc}") from exc
+        err_id = uuid.uuid4().hex
+        log.error("score_failed", client_id=req.client_id, error_id=err_id, error=str(exc))
+        raise HTTPException(
+            status_code=500, detail=f"internal error (ref {err_id})"
+        ) from exc
 
 
 @app.post("/score/batch")
@@ -196,7 +202,7 @@ def score_batch(req: BatchScoreRequest) -> dict:
     """
     results, errors = _service().score_batch(
         client_ids=req.client_ids,
-        as_of_date=req.as_of_date,
+        as_of_date=req.as_of_date.isoformat() if req.as_of_date else None,
         window_months=req.window_months,
         use_cache=req.use_cache,
     )
@@ -204,16 +210,25 @@ def score_batch(req: BatchScoreRequest) -> dict:
 
 
 @app.get("/charts/{client_id}", response_model=SolvencyCharts)
-def charts(client_id: int, as_of_date: str | None = None, months: int = 12) -> SolvencyCharts:
+def charts(
+    client_id: int,
+    as_of_date: date | None = None,
+    months: int = Query(default=12, ge=1, le=60),
+) -> SolvencyCharts:
     try:
         return _service().build_charts(
-            client_id=client_id, as_of_date=as_of_date, window_months=months,
+            client_id=client_id,
+            as_of_date=as_of_date.isoformat() if as_of_date else None,
+            window_months=months,
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        log.error("charts_failed", client_id=client_id, error=str(exc))
-        raise HTTPException(status_code=500, detail=f"charts_failed: {exc}") from exc
+        err_id = uuid.uuid4().hex
+        log.error("charts_failed", client_id=client_id, error_id=err_id, error=str(exc))
+        raise HTTPException(
+            status_code=500, detail=f"internal error (ref {err_id})"
+        ) from exc
 
 
 @app.delete("/cache/{client_id}")

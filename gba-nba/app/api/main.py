@@ -5,7 +5,7 @@ import hmac
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -102,6 +102,16 @@ def _resolve_manager(manager_net_uid: str) -> int:
     return manager_id
 
 
+def _as_of(as_of_date: date | None) -> str | None:
+    return as_of_date.isoformat() if as_of_date else None
+
+
+def _guard_generation(stats: dict) -> None:
+    total = stats.get("generators_total", 0)
+    if total and stats.get("generators_failed", 0) >= total:
+        raise HTTPException(status_code=502, detail="generation_failed: all task generators errored")
+
+
 @app.get("/health")
 def health() -> dict:
     db_ok = True
@@ -145,6 +155,8 @@ def set_status(task_key: str, req: StatusRequest) -> dict:
                                       outcome=outcome, snooze_until=req.snooze_until)
         doc["_id"] = str(doc["_id"])
         return doc
+    except lifecycle.TaskNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except lifecycle.TransitionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -160,17 +172,19 @@ def add_note(task_key: str, req: NoteRequest) -> dict:
 
 
 @app.post("/generate/manager/{manager_id}")
-def generate(manager_id: int, as_of_date: str | None = None) -> dict:
+def generate(manager_id: int, as_of_date: date | None = None) -> dict:
     from app.services import orchestrator
     started = time.time()
     try:
-        stats = orchestrator.generate_for_manager(manager_id, as_of_date)
+        stats = orchestrator.generate_for_manager(manager_id, _as_of(as_of_date))
         METRICS.record_request((time.time() - started) * 1000)
-        return stats
     except Exception as exc:  # noqa: BLE001
         METRICS.record_request((time.time() - started) * 1000, error=True)
-        log.error("generation_failed", manager_id=manager_id, error=str(exc))
-        raise HTTPException(status_code=500, detail="generation_failed") from exc
+        error_id = uuid.uuid4().hex
+        log.error("generation_failed", manager_id=manager_id, error_id=error_id, error=str(exc))
+        raise HTTPException(status_code=500, detail=f"generation_failed ({error_id})") from exc
+    _guard_generation(stats)
+    return stats
 
 
 @app.get("/cockpit/inbox")
@@ -226,31 +240,38 @@ def cockpit_notes(manager_net_uid: str, req: CockpitNoteRequest) -> dict:
 
 
 @app.post("/cockpit/generate")
-def cockpit_generate(manager_net_uid: str, as_of_date: str | None = None) -> dict:
+def cockpit_generate(manager_net_uid: str, as_of_date: date | None = None) -> dict:
     from app.services import orchestrator
     manager_id = _resolve_manager(manager_net_uid)
-    return orchestrator.generate_for_manager(manager_id, as_of_date)
+    stats = orchestrator.generate_for_manager(manager_id, _as_of(as_of_date))
+    _guard_generation(stats)
+    return stats
 
 
 @app.get("/cockpit/target")
-def cockpit_target(manager_net_uid: str, as_of_date: str | None = None) -> dict:
+def cockpit_target(manager_net_uid: str, as_of_date: date | None = None) -> dict:
     """The manager's monthly minimum target + daily pace (shipped & paid) for their dashboard."""
     from app.services import targets
     manager_id = _resolve_manager(manager_net_uid)
-    result = targets.compute_target(manager_id, as_of=as_of_date)
+    result = targets.compute_target(manager_id, as_of=_as_of(as_of_date))
     result["manager_name"] = signals_repository.manager_names([manager_id]).get(manager_id)
     return result
 
 
 @app.get("/cockpit/dashboard")
-def cockpit_dashboard(manager_net_uid: str, as_of_date: str | None = None) -> dict:
+def cockpit_dashboard(manager_net_uid: str, as_of_date: date | None = None) -> dict:
     """Chart-ready manager dashboard DTO (snake_case), computed from the SAME signals the cockpit
     uses — the MongoDB task store (task_type/urgency/status mix) and the EUR-correct debt
     aggregation (value_at_risk + aging). No scores are recomputed. Internal-key gated."""
     manager_id = _resolve_manager(manager_net_uid)
-    as_of = as_of_date or datetime.now(UTC).strftime("%Y-%m-%d")
-    counts = lifecycle.dashboard_counts(manager_id)
-    debt = signals_repository.debt_dashboard_for_manager(manager_id, as_of)
+    as_of = _as_of(as_of_date) or datetime.now(UTC).strftime("%Y-%m-%d")
+    try:
+        counts = lifecycle.dashboard_counts(manager_id)
+        debt = signals_repository.debt_dashboard_for_manager(manager_id, as_of)
+    except Exception as exc:  # noqa: BLE001
+        error_id = uuid.uuid4().hex
+        log.error("dashboard_failed", manager_id=manager_id, error_id=error_id, error=str(exc))
+        raise HTTPException(status_code=500, detail=f"dashboard_failed ({error_id})") from exc
     return {
         "manager_id": manager_id,
         "as_of": as_of,
@@ -263,7 +284,7 @@ def cockpit_dashboard(manager_net_uid: str, as_of_date: str | None = None) -> di
 
 
 @app.get("/cockpit/head/dashboard")
-def cockpit_head_dashboard(manager_net_uid: str, as_of_date: str | None = None) -> dict:
+def cockpit_head_dashboard(manager_net_uid: str, as_of_date: date | None = None) -> dict:
     """Chart-ready head/team dashboard DTO (snake_case): per-manager open tasks / critical / debt
     value-at-risk (EUR), plus the escalation count and department value-at-risk. Reuses the same
     head/team role gate and per-manager aggregations. Non-head caller -> benign {is_head: false}
@@ -272,7 +293,7 @@ def cockpit_head_dashboard(manager_net_uid: str, as_of_date: str | None = None) 
     if not signals_repository.is_head_of_sales(manager_net_uid):
         return {"is_head": False, "as_of": None, "teams": [],
                 "escalated_count": 0, "total_value_at_risk_eur": 0.0}
-    as_of = as_of_date or datetime.now(UTC).strftime("%Y-%m-%d")
+    as_of = _as_of(as_of_date) or datetime.now(UTC).strftime("%Y-%m-%d")
     teams = []
     total_var = 0.0
     for mid in signals_repository.all_managers():
@@ -292,16 +313,17 @@ def cockpit_head_dashboard(manager_net_uid: str, as_of_date: str | None = None) 
 
 
 @app.get("/targets/overview")
-def targets_overview(manager_net_uid: str, as_of_date: str | None = None) -> dict:
+def targets_overview(manager_net_uid: str, as_of_date: date | None = None) -> dict:
     """Head-of-sales view: target + pace for every active manager. HEAD-ONLY (team data)."""
     from app.services import targets
     _resolve_manager(manager_net_uid)
     if not signals_repository.is_head_of_sales(manager_net_uid):
         raise HTTPException(status_code=403, detail="forbidden")
     rows = []
+    as_of = _as_of(as_of_date)
     for mid in signals_repository.all_managers():
         try:
-            rows.append(targets.compute_target(mid, as_of=as_of_date))
+            rows.append(targets.compute_target(mid, as_of=as_of))
         except Exception:  # noqa: BLE001
             continue
     return {"count": len(rows), "managers": rows}
@@ -312,7 +334,7 @@ def _summarize_metric(metric: dict) -> dict:
 
 
 @app.get("/head/team")
-def head_team(manager_net_uid: str, as_of_date: str | None = None) -> dict:
+def head_team(manager_net_uid: str, as_of_date: date | None = None) -> dict:
     """Head-of-sales dashboard: target/attainment/pace + task throughput for every manager.
     gba-nba is the authority on role. Unknown caller -> 404. A non-head caller gets a benign
     {is_head: false} with NO team data (200) — not a 403, because the console treats any 403 as a
@@ -327,11 +349,12 @@ def head_team(manager_net_uid: str, as_of_date: str | None = None) -> dict:
               "generated_month": 0, "done_month": 0, "sold_month": 0, "dismissed_month": 0,
               "revenue_month": 0.0}
     as_of = None
+    as_of_str = _as_of(as_of_date)
     mids = signals_repository.all_managers()
     names = signals_repository.manager_names(mids)
     for mid in mids:
         try:
-            target = targets.compute_target(mid, as_of=as_of_date)
+            target = targets.compute_target(mid, as_of=as_of_str)
         except Exception:  # noqa: BLE001
             continue
         as_of = target["as_of"]

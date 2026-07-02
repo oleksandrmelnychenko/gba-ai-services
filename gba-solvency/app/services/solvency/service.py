@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
@@ -13,6 +14,7 @@ from app.domain.models import (
     CurrencyExposure,
     ForwardRisk,
     ForwardRiskBand,
+    GaugeChart,
     Rating,
     SolvencyCharts,
     SolvencyScore,
@@ -99,6 +101,28 @@ def _not_applicable(cid: int, as_of: str, window_months: int, settings) -> Solve
         as_of_date=as_of,
         window_months=window_months,
         model_version=settings.model_version,
+    )
+
+
+def _not_applicable_charts(cid: int, as_of: str, window_months: int) -> SolvencyCharts:
+    """The non-buyer gate result for /charts: applicable=false, every series empty.
+
+    Mirrors score_client's non-buyer gate — a provider-only client has no buyer-side signal, so
+    the charts (score sparkline, discipline donut, aging) would be built from no-data fallbacks and
+    render a misleading flat-100 trajectory. Return empty series instead of a fabricated one.
+    """
+    return SolvencyCharts(
+        client_id=cid,
+        applicable=False,
+        limit_utilization_gauge=GaugeChart(value=0.0),
+        payment_discipline_donut=[],
+        open_invoice_aging_bars=[],
+        turnover_vs_exposure=[],
+        score_sparkline=[],
+        turnover_trend=[],
+        aging_over_time_heatmap="not_applicable",
+        as_of_date=as_of,
+        window_months=window_months,
     )
 
 
@@ -253,8 +277,12 @@ def score_batch(
                     resolved[cid] = _hydrate_score(cached)
                     continue
             pending.append(cid)
-        except Exception as exc:  # noqa: BLE001
+        except LookupError as exc:
             errors.append({"client_id": cid, "error": str(exc)})
+        except Exception as exc:  # noqa: BLE001
+            err_id = uuid.uuid4().hex
+            log.error("score_batch_item_failed", client_id=cid, error_id=err_id, error=str(exc))
+            errors.append({"client_id": cid, "error": f"internal error (ref {err_id})"})
 
     # Phase 2 — ONE set-based feature pull for every applicable, uncached buyer.
     if pending:
@@ -285,7 +313,11 @@ def score_batch(
                     )
                 resolved[cid] = result
             except Exception as exc:  # noqa: BLE001
-                errors.append({"client_id": cid, "error": str(exc)})
+                err_id = uuid.uuid4().hex
+                log.error(
+                    "score_batch_item_failed", client_id=cid, error_id=err_id, error=str(exc)
+                )
+                errors.append({"client_id": cid, "error": f"internal error (ref {err_id})"})
 
     # reassemble in caller order
     for cid in ordered_ids:
@@ -313,6 +345,13 @@ def build_charts(
     if not repo.client_exists(client_id):
         raise LookupError(f"client_id not found: {client_id}")
     as_of = _as_of(as_of_date)
+
+    if not repo.has_buyer_role(client_id):
+        result = _not_applicable_charts(client_id, as_of, window_months)
+        METRICS.record_request((datetime.now() - started).total_seconds() * 1000)
+        log.info("charts_not_applicable", client_id=client_id)
+        return result
+
     key = cache.make_charts_key(client_id, as_of, window_months)
 
     cached = cache.get(key)

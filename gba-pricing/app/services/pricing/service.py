@@ -4,7 +4,6 @@ from datetime import datetime
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
-from app.core.metrics import METRICS
 from app.data import cache
 from app.data import pricing_repository as repo
 from app.domain.models import (
@@ -63,7 +62,7 @@ def recommend_price(
 
     Resolves both entities (LookupError -> 404 at the API), pulls baseline/cost/peer/segment from
     the repository, then delegates the pure A+B math to the engine. Redis-cached on
-    (product, agreement, as_of); graceful-degrade on cache failure.
+    (product, agreement, as_of, margin, vat, culture); graceful-degrade on cache failure.
     """
     started = datetime.now()
     settings = get_settings()
@@ -84,83 +83,73 @@ def recommend_price(
     pid = product["id"]
     p_net_uid = product["net_uid"]
     ca_net_uid = agreement["client_agreement_netuid"]
-    key = cache.make_key(pid, ca_net_uid, as_of)
+    key = cache.make_key(pid, ca_net_uid, as_of, margin, with_vat, culture)
 
     if use_cache:
         cached = cache.get(key)
         if cached is not None:
-            result = _hydrate(cached)
-            METRICS.record_request((datetime.now() - started).total_seconds() * 1000)
-            return result
+            return _hydrate(cached)
 
-    error = False
-    try:
-        baseline = repo.baseline_price(p_net_uid, ca_net_uid, culture, with_vat)
-        if baseline is None or baseline <= 0:
-            result = _no_baseline_recommendation(pid, ca_net_uid, as_of)
-            if use_cache:
-                cache.set(key, result.model_dump(mode="json"))
-            latency = (datetime.now() - started).total_seconds() * 1000
-            METRICS.record_request(latency, error=False)
-            log.info(
-                "recommend",
-                product_id=pid,
-                client_agreement_netuid=ca_net_uid,
-                baseline_price=result.baseline_price,
-                recommended_price=result.recommended_price,
-                price_floor=result.price_floor,
-                suggested_discount_pct=result.suggested_discount_pct,
-                confidence=result.confidence.value,
-                rationale=result.rationale,
-                latency_ms=round(latency, 2),
-            )
-            return result
-
-        list_markup = repo.base_list_price_and_markup(pid, agreement["agreement_id"])
-        seg_culture = list_markup.get("culture") if list_markup else culture
-        base_pricing_id = list_markup.get("base_pricing_id") if list_markup else None
-
-        pg_id = repo.product_group_id(pid)
-        group_disc = (
-            (repo.active_group_discount(agreement["client_agreement_id"], pg_id) or 0.0)
-            if pg_id is not None else 0.0
-        )
-        applied_disc = 0.0 if repo.is_promotional(pid, agreement["agreement_id"]) else group_disc
-        marked_up = _marked_up_from_baseline(baseline, applied_disc)
-
-        cost = repo.unit_cost_eur(pid)
-        peer = repo.peer_band(pid, as_of, window, fx_date)
-
-        segment = (
-            repo.segment_discount_distribution(pg_id, base_pricing_id, seg_culture)
-            if pg_id is not None and base_pricing_id is not None
-            else {"p75": None, "p90": None, "n": 0}
-        )
-
-        elasticity_estimate = estimate_elasticity(pid, pg_id, as_of, window)
-
-        result = engine.build_recommendation(
+    baseline = repo.baseline_price(p_net_uid, ca_net_uid, culture, with_vat)
+    if baseline is None or baseline <= 0:
+        result = _no_baseline_recommendation(pid, ca_net_uid, as_of)
+        if use_cache:
+            cache.set(key, result.model_dump(mode="json"))
+        latency = (datetime.now() - started).total_seconds() * 1000
+        log.info(
+            "recommend",
             product_id=pid,
             client_agreement_netuid=ca_net_uid,
-            baseline=baseline,
-            marked_up=marked_up,
-            cost=cost,
-            peer=peer,
-            segment=segment,
-            target_margin_pct=margin,
-            as_of_date=as_of,
-            elasticity_estimate=elasticity_estimate,
+            baseline_price=result.baseline_price,
+            recommended_price=result.recommended_price,
+            price_floor=result.price_floor,
+            suggested_discount_pct=result.suggested_discount_pct,
+            confidence=result.confidence.value,
+            rationale=result.rationale,
+            latency_ms=round(latency, 2),
         )
-    except Exception:
-        error = True
-        METRICS.record_request((datetime.now() - started).total_seconds() * 1000, error=True)
-        raise
+        return result
+
+    list_markup = repo.base_list_price_and_markup(pid, agreement["agreement_id"])
+    seg_culture = list_markup.get("culture") if list_markup else culture
+    base_pricing_id = list_markup.get("base_pricing_id") if list_markup else None
+
+    pg_id = repo.product_group_id(pid)
+    group_disc = (
+        (repo.active_group_discount(agreement["client_agreement_id"], pg_id) or 0.0)
+        if pg_id is not None else 0.0
+    )
+    applied_disc = 0.0 if repo.is_promotional(pid, agreement["agreement_id"]) else group_disc
+    marked_up = _marked_up_from_baseline(baseline, applied_disc)
+
+    cost = repo.unit_cost_eur(pid)
+    peer = repo.peer_band(pid, as_of, window, fx_date)
+
+    segment = (
+        repo.segment_discount_distribution(pg_id, base_pricing_id, seg_culture)
+        if pg_id is not None and base_pricing_id is not None
+        else {"p75": None, "p90": None, "n": 0}
+    )
+
+    elasticity_estimate = estimate_elasticity(pid, pg_id, as_of, window)
+
+    result = engine.build_recommendation(
+        product_id=pid,
+        client_agreement_netuid=ca_net_uid,
+        baseline=baseline,
+        marked_up=marked_up,
+        cost=cost,
+        peer=peer,
+        segment=segment,
+        target_margin_pct=margin,
+        as_of_date=as_of,
+        elasticity_estimate=elasticity_estimate,
+    )
 
     if use_cache:
         cache.set(key, result.model_dump(mode="json"))
 
     latency = (datetime.now() - started).total_seconds() * 1000
-    METRICS.record_request(latency, error=error)
     log.info(
         "recommend",
         product_id=pid,

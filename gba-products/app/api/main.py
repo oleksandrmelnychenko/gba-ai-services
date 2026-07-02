@@ -4,7 +4,7 @@ from __future__ import annotations
 import hmac
 import time
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,6 +16,7 @@ from app.core.metrics import METRICS
 from app.data import cache
 from app.data import signals_repository as sig
 from app.data.db import dispose, get_engine
+from app.domain.models import AbcClass, InventoryBand, LifecycleStage, XyzClass
 from app.services import margin_returns, portfolio, stock_health, substitution
 
 log = get_logger("api")
@@ -80,11 +81,11 @@ def metrics() -> dict:
 
 
 @app.get("/assortment/stock")
-def assortment_stock(as_of_date: str | None = None, limit: int = 100) -> dict:
+def assortment_stock(as_of_date: date | None = None, limit: int = 100) -> dict:
     """Portfolio inventory-health snapshot: on-hand stock bucketed into days-of-cover bands,
     with EUR value per band and the top SKUs by frozen capital. Internal-key gated."""
     started = time.time()
-    as_of = as_of_date or _today()
+    as_of = as_of_date.isoformat() if as_of_date else _today()
     try:
         key = cache.make_key("assortment", "stock", as_of)
         snap = cache.get(key)
@@ -161,6 +162,20 @@ _SORTS = {
 _SORT_ALIASES = {"demand_score": "demand", "margin_score": "margin", "region_revenue": "regional_revenue"}
 _REGIONAL_SORTS = {"regional_revenue", "regional_units"}
 _PORTFOLIO_ROW_FIELDS = {"health", "demand_score", "margin_score", "action_label"}
+_FILTER_VALUES = {
+    "band": {b.value for b in InventoryBand} | {"unknown"},
+    "abc": {a.value for a in AbcClass} | {"unknown"},
+    "xyz": {x.value for x in XyzClass} | {"unknown"},
+    "lifecycle": {s.value for s in LifecycleStage} | {"unknown"},
+}
+
+
+def _normalize_filter(field: str, value: str) -> str:
+    for canon in _FILTER_VALUES[field]:
+        if canon.casefold() == value.casefold():
+            return canon
+    raise HTTPException(status_code=422,
+                        detail={"error": f"unknown_{field}", "allowed": sorted(_FILTER_VALUES[field])})
 
 
 def _portfolio_cache_compatible(build: dict) -> bool:
@@ -178,10 +193,10 @@ def _portfolio_cache_compatible(build: dict) -> bool:
 
 
 @app.get("/assortment/overview")
-def assortment_overview(as_of_date: str | None = None) -> dict:
+def assortment_overview(as_of_date: date | None = None) -> dict:
     """Portfolio summary: counts by band / lifecycle / ABC / XYZ + totals + avg health. Internal-key gated."""
     started = time.time()
-    as_of = as_of_date or _today()
+    as_of = as_of_date.isoformat() if as_of_date else _today()
     try:
         build = _portfolio(as_of)
         METRICS.record_request((time.time() - started) * 1000)
@@ -194,7 +209,7 @@ def assortment_overview(as_of_date: str | None = None) -> dict:
 
 
 @app.get("/assortment/health")
-def assortment_health(as_of_date: str | None = None, band: str | None = None, abc: str | None = None,
+def assortment_health(as_of_date: date | None = None, band: str | None = None, abc: str | None = None,
                       xyz: str | None = None, lifecycle: str | None = None,
                       sort: str = "health_asc", limit: int = 100, stocked_only: bool = True,
                       region_id: int | None = None, region_window_days: int | None = None) -> dict:
@@ -202,20 +217,22 @@ def assortment_health(as_of_date: str | None = None, band: str | None = None, ab
     on-hand-stocked subset (the actual inventory-health decisions); stocked_only=false includes the
     order-to-demand active catalog. Internal-key gated."""
     started = time.time()
-    as_of = as_of_date or _today()
+    as_of = as_of_date.isoformat() if as_of_date else _today()
     resolved_sort = _SORT_ALIASES.get(sort, sort)
     if resolved_sort not in _SORTS:
         allowed = sorted([*_SORTS, *_SORT_ALIASES])
         raise HTTPException(status_code=400, detail={"error": "unknown_sort", "allowed": allowed})
     if resolved_sort in _REGIONAL_SORTS and region_id is None:
         raise HTTPException(status_code=400, detail={"error": "regional_sort_requires_region_id"})
+    filters = {field: _normalize_filter(field, val)
+               for field, val in (("band", band), ("abc", abc), ("xyz", xyz), ("lifecycle", lifecycle))
+               if val}
     try:
         rows = _portfolio(as_of)["rows"]
         if stocked_only:
             rows = [r for r in rows if r["band"] != "order_to_demand"]
-        for field, val in (("band", band), ("abc", abc), ("xyz", xyz), ("lifecycle", lifecycle)):
-            if val:
-                rows = [r for r in rows if r[field] == val]
+        for field, val in filters.items():
+            rows = [r for r in rows if r[field] == val]
         win = None
         if region_id is not None:
             win = _region_window(region_window_days)
@@ -238,11 +255,11 @@ def assortment_health(as_of_date: str | None = None, band: str | None = None, ab
 
 
 @app.get("/assortment/regions")
-def assortment_regions(as_of_date: str | None = None, window_days: int | None = None,
+def assortment_regions(as_of_date: date | None = None, window_days: int | None = None,
                        limit: int = 50) -> dict:
     """Regional portfolio demand summary by Client.RegionID. Internal-key gated."""
     started = time.time()
-    as_of = as_of_date or _today()
+    as_of = as_of_date.isoformat() if as_of_date else _today()
     win = _region_window(window_days)
     try:
         key = cache.make_key("assortment", f"regions:{win}", as_of)
@@ -261,10 +278,10 @@ def assortment_regions(as_of_date: str | None = None, window_days: int | None = 
 
 
 @app.get("/product/{product_id}")
-def product_profile(product_id: int, as_of_date: str | None = None) -> dict:
+def product_profile(product_id: int, as_of_date: date | None = None) -> dict:
     """Full per-SKU 360 profile (the product card). Internal-key gated."""
     started = time.time()
-    as_of = as_of_date or _today()
+    as_of = as_of_date.isoformat() if as_of_date else _today()
     try:
         row = next((r for r in _portfolio(as_of)["rows"] if r["product_id"] == product_id), None)
         meta = sig.product_meta([product_id]).get(product_id, {})
@@ -279,11 +296,11 @@ def product_profile(product_id: int, as_of_date: str | None = None) -> dict:
 
 
 @app.get("/product/{product_id}/regions")
-def product_regions(product_id: int, as_of_date: str | None = None, window_days: int | None = None,
+def product_regions(product_id: int, as_of_date: date | None = None, window_days: int | None = None,
                     limit: int = 20) -> dict:
     """Per-product demand split by Client.RegionID. Internal-key gated."""
     started = time.time()
-    as_of = as_of_date or _today()
+    as_of = as_of_date.isoformat() if as_of_date else _today()
     win = _region_window(window_days)
     try:
         rows = sig.regional_product_sales(as_of, win, product_ids=[product_id])
@@ -303,10 +320,10 @@ def product_regions(product_id: int, as_of_date: str | None = None, window_days:
 
 
 @app.get("/product/{product_id}/substitutes")
-def product_substitutes(product_id: int, as_of_date: str | None = None, limit: int = 20) -> dict:
+def product_substitutes(product_id: int, as_of_date: date | None = None, limit: int = 20) -> dict:
     """Ranked interchangeable replacements (ProductAnalogue + OE fallback), in-stock + healthy first."""
     started = time.time()
-    as_of = as_of_date or _today()
+    as_of = as_of_date.isoformat() if as_of_date else _today()
     try:
         lookup = {r["product_id"]: r for r in _portfolio(as_of)["rows"]}
         result = substitution.substitutes(product_id, lookup, limit)
@@ -319,10 +336,10 @@ def product_substitutes(product_id: int, as_of_date: str | None = None, limit: i
 
 
 @app.get("/assortment/margin")
-def assortment_margin(as_of_date: str | None = None, limit: int = 20) -> dict:
+def assortment_margin(as_of_date: date | None = None, limit: int = 20) -> dict:
     """Margin leaders / laggards / below-cost alerts + portfolio margin summary. Internal-key gated."""
     started = time.time()
-    as_of = as_of_date or _today()
+    as_of = as_of_date.isoformat() if as_of_date else _today()
     try:
         rows = _portfolio(as_of)["rows"]
         METRICS.record_request((time.time() - started) * 1000)
@@ -338,11 +355,11 @@ def assortment_margin(as_of_date: str | None = None, limit: int = 20) -> dict:
 
 
 @app.get("/assortment/returns")
-def assortment_returns(as_of_date: str | None = None, min_rate: float | None = None,
+def assortment_returns(as_of_date: date | None = None, min_rate: float | None = None,
                        limit: int = 20) -> dict:
     """High-return SKUs + returns summary. Internal-key gated."""
     started = time.time()
-    as_of = as_of_date or _today()
+    as_of = as_of_date.isoformat() if as_of_date else _today()
     rate = settings.returns_high_min_rate if min_rate is None else min_rate
     try:
         rows = _portfolio(as_of)["rows"]

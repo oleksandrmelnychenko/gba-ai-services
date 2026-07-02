@@ -320,8 +320,10 @@ def build_cart_plan(as_of: str, only_needed: bool = True, limit: int = 200,
         values = [_profit_at_risk(it) for it in items]
         costs = [it.line_cost_eur or 0.0 for it in items]
         if method == "milp":
+            method_used = "milp"
             chosen = milp_opt.select_within_budget(values, costs, budget_eur, s.milp_time_limit)
         else:
+            method_used = "greedy"
             chosen = set()
             used_g = 0.0
             for i in sorted(range(len(items)), key=lambda i: -(items[i].value_density or 0.0)):
@@ -340,6 +342,7 @@ def build_cart_plan(as_of: str, only_needed: bool = True, limit: int = 200,
             budget_eur=budget_eur, budget_used_eur=round(used, 2),
             value_captured_eur=round(value, 2),
             selected_count=len(chosen), deferred_count=len(items) - len(chosen),
+            method_used=method_used,
         )
 
     items.sort(key=lambda x: (_URGENCY_ORDER[x.urgency], x.days_of_cover))

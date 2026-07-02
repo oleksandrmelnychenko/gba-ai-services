@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import hmac
 import time
+import uuid
 from contextlib import asynccontextmanager
+from datetime import date
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -62,22 +65,22 @@ async def timing(request: Request, call_next):
 
 class PlanRequest(BaseModel):
     producer_id: int = Field(..., description="dbo.SupplyOrganization.ID")
-    as_of_date: str | None = None
+    as_of_date: date | None = None
     only_needed: bool = True
 
 
 class CartPlanRequest(BaseModel):
-    as_of_date: str | None = None
+    as_of_date: date | None = None
     only_needed: bool = True
     limit: int | None = 200
-    budget_eur: float | None = None
-    method: str = "greedy"
+    budget_eur: float | None = Field(default=None, ge=0)
+    method: Literal["greedy", "milp"] = "greedy"
     active_days: int | None = None
 
 
 class PlanChartsRequest(BaseModel):
     producer_id: int | None = None
-    as_of_date: str | None = None
+    as_of_date: date | None = None
     top_n: int = 15
 
 
@@ -102,7 +105,7 @@ def metrics() -> dict:
 def plan_producer(req: PlanRequest) -> ProducerPurchasePlan:
     started = time.time()
     try:
-        as_of = req.as_of_date or _today()
+        as_of = req.as_of_date.isoformat() if req.as_of_date else _today()
         key = cache.make_key("producer", req.producer_id, as_of) if req.only_needed else None
         if key is not None:
             cached = cache.get(key)
@@ -118,15 +121,16 @@ def plan_producer(req: PlanRequest) -> ProducerPurchasePlan:
         return plan
     except Exception as exc:  # noqa: BLE001
         METRICS.record_request((time.time() - started) * 1000, error=True)
-        log.error("plan_failed", producer_id=req.producer_id, error=str(exc))
-        raise HTTPException(status_code=500, detail="plan_failed") from exc
+        err_id = uuid.uuid4().hex
+        log.error("plan_failed", producer_id=req.producer_id, error_id=err_id, error=str(exc))
+        raise HTTPException(status_code=500, detail=f"plan_failed:{err_id}") from exc
 
 
 @app.post("/plan/cart", response_model=CartReplenishmentPlan)
 def plan_cart(req: CartPlanRequest) -> CartReplenishmentPlan:
     started = time.time()
     try:
-        as_of = req.as_of_date or _today()
+        as_of = req.as_of_date.isoformat() if req.as_of_date else _today()
         limit = req.limit if req.limit is not None else 200
         budget = req.budget_eur
         key = (cache.make_key("cart", limit, as_of) if budget is None and req.active_days is None
@@ -144,15 +148,16 @@ def plan_cart(req: CartPlanRequest) -> CartReplenishmentPlan:
         return plan
     except Exception as exc:  # noqa: BLE001
         METRICS.record_request((time.time() - started) * 1000, error=True)
-        log.error("cart_plan_failed", error=str(exc))
-        raise HTTPException(status_code=500, detail="cart_plan_failed") from exc
+        err_id = uuid.uuid4().hex
+        log.error("cart_plan_failed", error_id=err_id, error=str(exc))
+        raise HTTPException(status_code=500, detail=f"cart_plan_failed:{err_id}") from exc
 
 
 @app.post("/plan/charts", response_model=PlanCharts)
 def plan_charts(req: PlanChartsRequest) -> PlanCharts:
     started = time.time()
     try:
-        as_of = req.as_of_date or _today()
+        as_of = req.as_of_date.isoformat() if req.as_of_date else _today()
         top_n = req.top_n
         producer_key = req.producer_id if req.producer_id is not None else "all"
         key = cache.make_key("charts", f"{producer_key}:{top_n}", as_of)
@@ -169,8 +174,9 @@ def plan_charts(req: PlanChartsRequest) -> PlanCharts:
         return charts
     except Exception as exc:  # noqa: BLE001
         METRICS.record_request((time.time() - started) * 1000, error=True)
-        log.error("plan_charts_failed", producer_id=req.producer_id, error=str(exc))
-        raise HTTPException(status_code=500, detail="plan_charts_failed") from exc
+        err_id = uuid.uuid4().hex
+        log.error("plan_charts_failed", producer_id=req.producer_id, error_id=err_id, error=str(exc))
+        raise HTTPException(status_code=500, detail=f"plan_charts_failed:{err_id}") from exc
 
 
 class ProducerProfileUpdate(BaseModel):

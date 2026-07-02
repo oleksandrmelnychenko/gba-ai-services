@@ -1,9 +1,11 @@
 """Redis cache — ONE documented key scheme.
 
 Key scheme (single source of truth):
-    price:{model_version}:{product}:{agreement}:{asof}
-where {product} is the product id, {agreement} is the client-agreement NetUID. The model
-version is embedded so a model bump auto-invalidates old entries.
+    price:{model_version}:{product}:{agreement}:{asof}:{margin}:{vat}:{culture}
+where {product} is the product id, {agreement} is the client-agreement NetUID, and the pricing
+params (target margin, VAT flag, culture) are folded in so a cached result is only reused for the
+exact params it was computed with. The model version is embedded so a model bump auto-invalidates
+old entries.
 
 Graceful degradation: if Redis is down, every call is a no-op miss — the service still works
 (just uncached). Never let cache failure break a recommendation.
@@ -49,8 +51,12 @@ def _get_client() -> redis.Redis | None:
     return _client
 
 
-def make_key(product: int | str, agreement: str, as_of: str) -> str:
-    return f"price:{_model_version()}:{product}:{agreement}:{as_of}"
+def make_key(product: int | str, agreement: str, as_of: str,
+             target_margin_pct: float, with_vat: bool, culture: str) -> str:
+    return (
+        f"price:{_model_version()}:{product}:{agreement}:{as_of}"
+        f":{target_margin_pct}:{int(with_vat)}:{culture}"
+    )
 
 
 def get(key: str) -> dict[str, Any] | None:
@@ -84,7 +90,7 @@ def invalidate(product: int | str, agreement: str) -> int:
     client = _get_client()
     if client is None:
         return 0
-    pattern = f"price:{_model_version()}:{product}:{agreement}:*"
+    pattern = f"price:{_model_version()}:{product}:{str(agreement).lower()}:*"
     keys = list(client.scan_iter(match=pattern, count=200))
     return client.delete(*keys) if keys else 0
 

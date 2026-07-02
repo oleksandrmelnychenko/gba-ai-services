@@ -156,10 +156,12 @@ def generate_for_manager(manager_id: int, as_of: str | None = None) -> dict:
 
     # collect candidates from all generators
     candidates = []
+    generators_failed = 0
     for gen in _GENERATORS:
         try:
             candidates.extend(gen.generate(manager_id, as_of, window))
         except Exception as exc:  # noqa: BLE001
+            generators_failed += 1
             log.warning("generator_failed", generator=gen.__name__, manager_id=manager_id, error=str(exc))
 
     # pace coupling: behind monthly target -> lift revenue (shipped) / debt (paid) task priority.
@@ -248,17 +250,18 @@ def generate_for_manager(manager_id: int, as_of: str | None = None) -> dict:
             if lifecycle.is_muted(manager_id, task.client_id, task.task_type.value):
                 continue
             if per_client[task.client_id] >= s.max_tasks_per_client_per_day:
-                counters["skipped_capped"] += 1
                 continue
             lifecycle.upsert_generated(task)
             per_client[task.client_id] += 1
             per_type[TaskType.DEBT_FOLLOWUP] += 1
             active += 1
             counters["persisted"] += 1
+            counters["skipped_capped"] -= 1
             admitted += 1
         counters["crit_debt_reserved"] = admitted
 
     stats = {"manager_id": manager_id, "as_of": as_of, "candidates": len(candidates),
+             "generators_total": len(_GENERATORS), "generators_failed": generators_failed,
              "by_type": {tt.value: n for tt, n in per_type.items()}, **counters}
     log.info("generation_done", **stats)
     return stats

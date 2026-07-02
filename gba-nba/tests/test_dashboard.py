@@ -135,6 +135,19 @@ def test_manager_dashboard_unknown_404(client):
                       params={"manager_net_uid": UNKNOWN_UID}).status_code == 404
 
 
+def test_manager_dashboard_malformed_as_of_date_422(client):
+    resp = client.get("/cockpit/dashboard",
+                      params={"manager_net_uid": MGR_UID, "as_of_date": "not-a-date"})
+    assert resp.status_code == 422
+
+
+def test_manager_dashboard_iso_as_of_date_ok(client):
+    resp = client.get("/cockpit/dashboard",
+                      params={"manager_net_uid": MGR_UID, "as_of_date": "2026-06-15"})
+    assert resp.status_code == 200
+    assert resp.json()["as_of"] == "2026-06-15"
+
+
 # ---------------- head dashboard ----------------
 
 def test_head_dashboard_shape(client):
