@@ -55,7 +55,9 @@ def test_forecast_endpoint_for_avantazh_client():
 
     from app.api import main
 
+    from app.core.config import get_settings
     client = TestClient(main.app)
+    client.headers["X-Internal-Api-Key"] = get_settings().internal_api_key
 
     assert client.get("/health").status_code == 200
 
@@ -76,7 +78,9 @@ def test_unknown_netuid_returns_empty_not_error():
 
     from app.api import main
 
+    from app.core.config import get_settings
     client = TestClient(main.app)
+    client.headers["X-Internal-Api-Key"] = get_settings().internal_api_key
     resp = client.get("/forecast/sales", params={"client_net_id": "00000000-0000-0000-0000-000000000000"})
     assert resp.status_code == 200
     assert resp.json() == {"ByClient": [], "ByProduct": [], "ByClientAndProduct": []}

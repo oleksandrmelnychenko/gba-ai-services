@@ -81,7 +81,9 @@ def test_mvp_endpoints_via_testclient():
 
     from app.api import main
     from app.services import portfolio
+    from app.core.config import get_settings
     client = TestClient(main.app)
+    client.headers["X-Internal-Api-Key"] = get_settings().internal_api_key
 
     assert client.get("/health").status_code == 200
     ov = client.get("/assortment/overview")
@@ -106,7 +108,9 @@ def test_regional_endpoints_via_testclient():
     from fastapi.testclient import TestClient
 
     from app.api import main
+    from app.core.config import get_settings
     client = TestClient(main.app)
+    client.headers["X-Internal-Api-Key"] = get_settings().internal_api_key
 
     regions = client.get("/assortment/regions", params={"limit": 3})
     assert regions.status_code == 200
@@ -132,7 +136,9 @@ def test_phase3_endpoints_via_testclient():
     from fastapi.testclient import TestClient
 
     from app.api import main
+    from app.core.config import get_settings
     client = TestClient(main.app)
+    client.headers["X-Internal-Api-Key"] = get_settings().internal_api_key
 
     margin = client.get("/assortment/margin", params={"limit": 5})
     assert margin.status_code == 200

@@ -114,20 +114,22 @@ def overdue_cohort() -> list[dict]:
 
     rows = query(
         """
-        SELECT TOP 30
-               cid.ClientID AS client_id,
-               SUM(dbo.GetExchangedToEuroValue(d.Total, a.CurrencyID, :asof)) AS sev_eur
-        FROM dbo.ClientInDebt cid
-        JOIN dbo.Debt d ON d.ID = cid.DebtID
-        JOIN dbo.Agreement a ON a.ID = cid.AgreementID
-        JOIN dbo.ClientInRole cir ON cir.ClientID = cid.ClientID
-        JOIN dbo.ClientType ct ON ct.ID = cir.ClientTypeID
-        WHERE cid.Deleted = 0 AND d.Deleted = 0 AND d.Created <= :asof
-              AND DATEDIFF(day, d.Created, :asof) > a.NumberDaysDebt + 180
-              AND cir.Deleted = 0 AND ct.[Type] = 0
-        GROUP BY cid.ClientID
-        HAVING SUM(dbo.GetExchangedToEuroValue(d.Total, a.CurrencyID, :asof)) >= 250
-        ORDER BY SUM(dbo.GetExchangedToEuroValue(d.Total, a.CurrencyID, :asof)) DESC
+        SELECT TOP 30 client_id, SUM(eur) AS sev_eur
+        FROM (
+            SELECT cid.ClientID AS client_id,
+                   dbo.GetExchangedToEuroValue(d.Total, a.CurrencyID, :asof) AS eur
+            FROM dbo.ClientInDebt cid
+            JOIN dbo.Debt d ON d.ID = cid.DebtID
+            JOIN dbo.Agreement a ON a.ID = cid.AgreementID
+            JOIN dbo.ClientInRole cir ON cir.ClientID = cid.ClientID
+            JOIN dbo.ClientType ct ON ct.ID = cir.ClientTypeID
+            WHERE cid.Deleted = 0 AND d.Deleted = 0 AND d.Created <= :asof
+                  AND DATEDIFF(day, d.Created, :asof) > a.NumberDaysDebt + 180
+                  AND cir.Deleted = 0 AND ct.[Type] = 0
+        ) t
+        GROUP BY client_id
+        HAVING SUM(eur) >= 250
+        ORDER BY SUM(eur) DESC
         """,
         {"asof": _AS_OF},
     )

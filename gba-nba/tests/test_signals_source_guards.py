@@ -14,7 +14,7 @@ from app.core import config
 from app.data import signals_repository as sig
 from app.ml import dataset as ds
 
-_OVERDUE_SRC = inspect.getsource(sig.overdue_debts_for_manager)
+_OVERDUE_SRC = sig._EUR_VALUE_CTE + "\n" + inspect.getsource(sig.overdue_debts_for_manager)
 _PAID_SRC = inspect.getsource(sig.monthly_paid)
 
 
@@ -37,8 +37,11 @@ _SALES_SPINE_FUNCS = [
 
 def test_overdue_debt_wraps_total_in_euro_conversion():
     norm = _norm(_OVERDUE_SRC)
-    assert "GetExchangedToEuroValue(d.Total" in norm, \
-        "overdue debt must convert Debt.Total to EUR via dbo.GetExchangedToEuroValue"
+    assert "SUM(eur_value)" in norm, \
+        "overdue debt must sum the per-row EUR-converted value (eur_value), not a raw total"
+    assert "er.rate" in norm and "cr.rate" in norm, \
+        "Debt.Total must be converted to EUR via the exchange-rate joins (set-based reproduction " \
+        "of dbo.GetExchangedToEuroValue), not treated as already-EUR"
     assert "ISNULL(a.CurrencyID, 2)" in norm, \
         "conversion must default missing agreement currency to EUR (2), not assume the debt is EUR"
 
