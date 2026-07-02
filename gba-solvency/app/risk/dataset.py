@@ -574,23 +574,29 @@ def features_one(client_id: int, feature_date: str, window_months: int = 12) -> 
         {"fd": feature_date, "cid": client_id},
     )
 
-    # GROUP 2 — trajectory (mirrors feat_debt_trajectory, one client)
+    # GROUP 2 — trajectory (mirrors feat_debt_trajectory, one client). The per-line EUR and month
+    # key are projected once per row in a derived table (same shape as GROUP 1) so the scalar FX
+    # runs once per debt line, instead of a CROSS APPLY that re-drives it; the windowed SUMs and
+    # COUNT DISTINCT over those columns are bit-identical.
     _sql_traj = (
         """
         SELECT
-            SUM(CASE WHEN d.Created > DATEADD(month, -3, :fd) THEN e ELSE 0 END) AS new3,
-            SUM(CASE WHEN d.Created > DATEADD(month, -6, :fd)
-                      AND d.Created <= DATEADD(month, -3, :fd) THEN e ELSE 0 END) AS prev3,
-            COUNT(DISTINCT CASE WHEN d.Created > DATEADD(month, -12, :fd)
-                                THEN FORMAT(d.Created, 'yyyy-MM') END) AS months12
-        FROM dbo.ClientInDebt cid
-        JOIN dbo.Debt d ON d.ID = cid.DebtID
-        JOIN dbo.Agreement a ON a.ID = cid.AgreementID
-        CROSS APPLY (SELECT dbo.GetExchangedToEuroValue(d.Total, a.CurrencyID, :fd) AS e) x
-        WHERE cid.Deleted = 0
-              AND d.Deleted = 0
-              AND cid.ClientID = :cid
-              AND d.Created <= :fd
+            SUM(CASE WHEN created > DATEADD(month, -3, :fd) THEN e ELSE 0 END) AS new3,
+            SUM(CASE WHEN created > DATEADD(month, -6, :fd)
+                      AND created <= DATEADD(month, -3, :fd) THEN e ELSE 0 END) AS prev3,
+            COUNT(DISTINCT CASE WHEN created > DATEADD(month, -12, :fd) THEN mk END) AS months12
+        FROM (
+            SELECT d.Created AS created,
+                   FORMAT(d.Created, 'yyyy-MM') AS mk,
+                   dbo.GetExchangedToEuroValue(d.Total, a.CurrencyID, :fd) AS e
+            FROM dbo.ClientInDebt cid
+            JOIN dbo.Debt d ON d.ID = cid.DebtID
+            JOIN dbo.Agreement a ON a.ID = cid.AgreementID
+            WHERE cid.Deleted = 0
+                  AND d.Deleted = 0
+                  AND cid.ClientID = :cid
+                  AND d.Created <= :fd
+        ) t
         """,
         {"fd": feature_date, "cid": client_id},
     )

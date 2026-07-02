@@ -17,6 +17,7 @@ import math
 from datetime import date, datetime
 
 from app.core.config import get_settings
+from app.data import cache
 from app.data import cost_repository as cost_repo
 from app.data import feedback
 from app.data import masters
@@ -299,6 +300,17 @@ def build_plan(producer_id: int, as_of: str, only_needed: bool = True,
     )
 
 
+def _cart_producer_plan(producer_id: int, as_of: str, only_needed: bool,
+                        abc_map: dict[int, str], producer_name) -> ProducerPurchasePlan:
+    key = cache.make_key("producer", producer_id, as_of) if only_needed else None
+    if key is not None:
+        cached = cache.get(key)
+        if cached is not None:
+            return ProducerPurchasePlan.model_validate(cached)
+    return build_plan(producer_id, as_of, only_needed=only_needed, abc_map=abc_map,
+                      producer_name=producer_name)
+
+
 def build_cart_plan(as_of: str, only_needed: bool = True, limit: int = 200,
                     budget_eur: float | None = None,
                     method: str = "greedy",
@@ -310,8 +322,8 @@ def build_cart_plan(as_of: str, only_needed: bool = True, limit: int = 200,
 
     items: list[ReorderSuggestion] = []
     for producer_id in producer_ids:
-        plan = build_plan(producer_id, as_of, only_needed=only_needed, abc_map=abc_map,
-                          producer_name=names.get(producer_id))
+        plan = _cart_producer_plan(producer_id, as_of, only_needed, abc_map,
+                                   names.get(producer_id))
         items.extend(sug for sug in plan.items if sug.suggested_qty > 0)
 
     if budget_eur is not None and budget_eur > 0:

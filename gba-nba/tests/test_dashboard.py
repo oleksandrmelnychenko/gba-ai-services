@@ -62,6 +62,8 @@ def client(monkeypatch):
     monkeypatch.setattr(main.signals_repository, "all_managers", lambda: [1, 2])
     monkeypatch.setattr(main.signals_repository, "debt_dashboard_for_manager",
                         lambda mid, as_of: _DEBT.get(mid, {"value_at_risk_eur": 0.0, "debt_aging": []}))
+    monkeypatch.setattr(main.signals_repository, "debt_dashboards_for_all_managers",
+                        lambda as_of: dict(_DEBT))
     return TestClient(main.app)
 
 

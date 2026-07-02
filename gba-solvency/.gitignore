@@ -18,7 +18,7 @@ venv/
 benchmarks/*.json
 
 # Generated modeling datasets (large, regenerable via scripts/build_risk_dataset.py)
-data/
+/data/
 
 # OS / IDE
 .DS_Store

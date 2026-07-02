@@ -216,13 +216,13 @@ def monthly_units(as_of: str, months: int,
     return query(
         f"""
         SELECT oi.ProductID AS product_id,
-               FORMAT(o.Created, 'yyyy-MM') AS ym,
+               CONVERT(char(7), o.Created, 126) AS ym,
                SUM(oi.Qty) AS units
         FROM dbo.OrderItem oi
         JOIN dbo.[Order] o ON o.ID = oi.OrderID
         WHERE oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL AND oi.ProductID <> :synth
               AND o.Created >= DATEADD(month, -:months, :asof) AND o.Created < :asof{flt}
-        GROUP BY oi.ProductID, FORMAT(o.Created, 'yyyy-MM')
+        GROUP BY oi.ProductID, CONVERT(char(7), o.Created, 126)
         """,
         params,
     )

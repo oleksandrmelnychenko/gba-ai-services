@@ -296,12 +296,9 @@ def cockpit_head_dashboard(manager_net_uid: str, as_of_date: date | None = None)
     as_of = _as_of(as_of_date) or datetime.now(UTC).strftime("%Y-%m-%d")
     teams = []
     total_var = 0.0
+    debt_by_manager = signals_repository.debt_dashboards_for_all_managers(as_of)
     for mid in signals_repository.all_managers():
-        try:
-            debt = signals_repository.debt_dashboard_for_manager(mid, as_of)
-        except Exception:  # noqa: BLE001
-            continue
-        var = debt["value_at_risk_eur"]
+        var = debt_by_manager.get(mid, {}).get("value_at_risk_eur", 0.0)
         total_var += var
         teams.append({"manager_id": mid,
                       "open_tasks": lifecycle.active_count(mid),
