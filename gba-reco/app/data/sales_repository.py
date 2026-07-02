@@ -232,11 +232,13 @@ def customer_products_bulk(customer_ids: list[int], as_of_date: str) -> dict[int
 
 
 def collaborative_products(
-    similar: list[tuple[int, float]], owned: set[int], as_of_date: str
+    similar: list[tuple[int, float]], as_of_date: str, customer_id: int
 ) -> dict[int, float]:
     """Products bought by similar customers (weighted by similarity), excluding owned.
 
-    Built with a parameterized VALUES list + IN clause (no string concatenation).
+    Owned products are excluded server-side via NOT EXISTS against the target's own order
+    history (computed in-SQL from customer_id), so no per-product parameter list is sent —
+    a client with a very wide history no longer overflows the driver's parameter budget.
     """
     if not similar:
         return {}
@@ -245,10 +247,16 @@ def collaborative_products(
     for i, (cid, sim) in enumerate(similar):
         sim_params[f"sc{i}"] = cid
         sim_params[f"sv{i}"] = sim
-    owned_ph, owned_params = in_clause("o", list(owned) or [0])
     rows = query(
         f"""
-        WITH Sim AS (
+        WITH Owned AS (
+            SELECT DISTINCT oi.ProductID AS pid
+            FROM dbo.ClientAgreement ca
+            JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
+            JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
+            WHERE ca.ClientID = :cid AND o.Created < :asof AND oi.ProductID IS NOT NULL
+        ),
+        Sim AS (
             SELECT customer_id, similarity FROM (VALUES {sim_rows}) AS t(customer_id, similarity)
         ),
         NeighborProducts AS (
@@ -263,7 +271,7 @@ def collaborative_products(
             JOIN Sim s ON ca.ClientID = s.customer_id
             WHERE o.Created < :asof
                   AND oi.ProductID IS NOT NULL
-                  AND oi.ProductID NOT IN {owned_ph}
+                  AND NOT EXISTS (SELECT 1 FROM Owned ow WHERE ow.pid = oi.ProductID)
         )
         SELECT np.pid AS pid,
                SUM(s.similarity) / COUNT(DISTINCT s.customer_id) AS score
@@ -272,7 +280,7 @@ def collaborative_products(
         GROUP BY np.pid
         HAVING COUNT(DISTINCT s.customer_id) >= 2
         """,
-        {"asof": as_of_date, **sim_params, **owned_params},
+        {"asof": as_of_date, "cid": customer_id, **sim_params},
     )
     return {int(r["pid"]): float(r["score"]) for r in rows}
 

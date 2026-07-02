@@ -10,9 +10,12 @@ import math
 from datetime import datetime
 
 from app.core.config import get_settings
+from app.core.logging import get_logger
 from app.data import cache
 from app.data import sales_repository as repo
 from app.domain.models import ProductRec, RecommendationResult, RecSource, Segment
+
+log = get_logger("recommender")
 
 # Segment-specific repurchase weights (frequency, recency). Re-tuned on the leave-last-basket
 # harness (n=493) after the recency-scale fix put freq and recency on the same [0,1] scale.
@@ -194,16 +197,20 @@ def recommend(
 
     discovery: list[ProductRec] = []
     if discovery_n > 0:
-        sims = _similar_customers(customer_id, as_of, region_id=region_id)
-        collab = {pid: v for pid, v in repo.collaborative_products(sims, owned, as_of).items()
-                  if pid not in excl}
-        d_ranked = sorted(collab.items(), key=lambda x: x[1], reverse=True)
-        discovery = [
-            ProductRec(product_id=pid, score=float(sc), rank=i + 1, segment=segment.value,
-                       source=RecSource.DISCOVERY)
-            for i, (pid, sc) in enumerate(d_ranked[: discovery_n + 5])
-        ]
-        discovery = _diversity_filter(discovery, s.max_per_group)[:discovery_n]
+        try:
+            sims = _similar_customers(customer_id, as_of, region_id=region_id)
+            collab = {pid: v for pid, v in repo.collaborative_products(sims, as_of, customer_id).items()
+                      if pid not in excl}
+            d_ranked = sorted(collab.items(), key=lambda x: x[1], reverse=True)
+            discovery = [
+                ProductRec(product_id=pid, score=float(sc), rank=i + 1, segment=segment.value,
+                           source=RecSource.DISCOVERY)
+                for i, (pid, sc) in enumerate(d_ranked[: discovery_n + 5])
+            ]
+            discovery = _diversity_filter(discovery, s.max_per_group)[:discovery_n]
+        except Exception as exc:  # noqa: BLE001
+            log.warning("discovery_degraded", customer_id=customer_id, error=str(exc))
+            discovery = []
 
     combined = repurchase + discovery
     if include_discovery and len(combined) < top_n:
