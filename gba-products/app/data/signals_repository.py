@@ -17,6 +17,9 @@ LOAD-BEARING DATA RULES (verified on ConcordDb_V5):
     So we JOIN ConsignmentItem -> Consignment (ci.ConsignmentID) -> ProductIncome (c.ProductIncomeID) and
     EXCLUDE SourceDocumentType=1 from BOTH the qty/value and the derived cost (a lot with no ProductIncome
     — e.g. a pure transfer — is kept via pi.ID IS NULL). Real supply lots are SourceDocumentType IN (2,3).
+    Legacy PI docs (pre-source-identity era) carry SourceDocumentType NULL and are KEPT: the exclusion is
+    only for positively identified type-1 docs, and NULL <> 1 evaluates to NULL in SQL — the predicate
+    must spell out IS NULL or the untyped historical lot layer silently vanishes from every stock signal.
     gba-pricing (pricing_repository.unit_cost_eur) and gba-procure deliberately exclude these too.
   - Sellable warehouses: Storage.Deleted=0 AND ForDefective=0 AND (AvailableForReSale=1 OR IsResale=1).
   - SALE-side OrderItem.PricePerItem is ALREADY EUR — never wrap/convert it.
@@ -52,7 +55,7 @@ _STOCK_FROM = """
     WHERE rsa.Deleted = 0 AND rsa.RemainingQty > 0
           AND s.Deleted = 0 AND s.ForDefective = 0
           AND (s.AvailableForReSale = 1 OR s.IsResale = 1)
-          AND (pi.ID IS NULL OR pi.SourceDocumentType <> :debt_doc_type)
+          AND (pi.ID IS NULL OR pi.SourceDocumentType IS NULL OR pi.SourceDocumentType <> :debt_doc_type)
 """
 
 # The synthetic "Ввід боргів" (debt-entry) product carries accounting noise — it is a 1С

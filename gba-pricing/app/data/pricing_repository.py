@@ -268,7 +268,7 @@ def unit_cost_eur(product_id: int) -> dict[str, Any]:
                    AND ci.AccountingPrice > 0
                    AND ci.RemainingQty > 0
                    AND ci.ProductID <> :synthetic
-                   AND (pi.ID IS NULL OR pi.SourceDocumentType <> :debt_doc_type)) AS median_cost,
+                   AND (pi.ID IS NULL OR pi.SourceDocumentType IS NULL OR pi.SourceDocumentType <> :debt_doc_type)) AS median_cost,
             (SELECT COUNT(*)
              FROM dbo.ConsignmentItem ci
              JOIN dbo.Consignment c ON c.ID = ci.ConsignmentID
@@ -278,7 +278,7 @@ def unit_cost_eur(product_id: int) -> dict[str, Any]:
                    AND ci.AccountingPrice > 0
                    AND ci.RemainingQty > 0
                    AND ci.ProductID <> :synthetic
-                   AND (pi.ID IS NULL OR pi.SourceDocumentType <> :debt_doc_type)) AS lot_count,
+                   AND (pi.ID IS NULL OR pi.SourceDocumentType IS NULL OR pi.SourceDocumentType <> :debt_doc_type)) AS lot_count,
             (SELECT TOP 1 ci.AccountingPrice
              FROM dbo.ConsignmentItem ci
              JOIN dbo.Consignment c ON c.ID = ci.ConsignmentID
@@ -287,7 +287,7 @@ def unit_cost_eur(product_id: int) -> dict[str, Any]:
                    AND ci.Deleted = 0
                    AND ci.AccountingPrice > 0
                    AND ci.ProductID <> :synthetic
-                   AND (pi.ID IS NULL OR pi.SourceDocumentType <> :debt_doc_type)
+                   AND (pi.ID IS NULL OR pi.SourceDocumentType IS NULL OR pi.SourceDocumentType <> :debt_doc_type)
              ORDER BY ci.ID DESC) AS latest_cost
         """,
         {
