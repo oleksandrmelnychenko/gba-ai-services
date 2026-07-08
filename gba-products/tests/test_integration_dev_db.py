@@ -49,6 +49,7 @@ def test_per_product_signals_for_a_stocked_sku():
     meta = sig.product_meta([pid])
     assert isinstance(vel, list) and isinstance(price, list) and isinstance(rets, list)
     assert pid in meta and "name" in meta[pid]
+    assert "primary_producer_id" in meta[pid] and "primary_producer_name" in meta[pid]
 
 
 def test_snapshot_runs_end_to_end():
@@ -80,8 +81,8 @@ def test_mvp_endpoints_via_testclient():
     from fastapi.testclient import TestClient
 
     from app.api import main
-    from app.services import portfolio
     from app.core.config import get_settings
+    from app.services import portfolio
     client = TestClient(main.app)
     client.headers["X-Internal-Api-Key"] = get_settings().internal_api_key
 

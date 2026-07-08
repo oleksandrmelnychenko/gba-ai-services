@@ -295,7 +295,7 @@ def regional_demand_summary(as_of: str, window_days: int) -> list[dict]:
 
 
 def product_meta(product_ids: Sequence[int]) -> dict[int, dict]:
-    """Name / VendorCode / HasAnalogue / IsForSale per product (chunked to respect the param cap)."""
+    """Product display metadata plus the latest supply producer (chunked to respect the param cap)."""
     out: dict[int, dict] = {}
     ids = [int(x) for x in product_ids]
     for i in range(0, len(ids), 1000):
@@ -303,9 +303,35 @@ def product_meta(product_ids: Sequence[int]) -> dict[int, dict]:
         ph, params = in_clause("p", chunk)
         rows = query(
             f"""
-            SELECT ID AS product_id, Name AS name, VendorCode AS vendor_code,
-                   HasAnalogue AS has_analogue, IsForSale AS is_for_sale
-            FROM dbo.Product WHERE Deleted = 0 AND ID IN {ph}
+            WITH latest_producer AS (
+                SELECT product_id, producer_id, producer_name
+                FROM (
+                    SELECT soi.ProductID AS product_id,
+                           so.ClientID AS producer_id,
+                           COALESCE(NULLIF(c.SupplierName, ''),
+                                    NULLIF(c.FullName, ''),
+                                    NULLIF(c.Name, ''),
+                                    CONVERT(nvarchar(32), so.ClientID)) AS producer_name,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY soi.ProductID
+                               ORDER BY so.DateFrom DESC, so.ID DESC
+                           ) AS rn
+                    FROM dbo.SupplyOrder so
+                    JOIN dbo.SupplyOrderItem soi ON soi.SupplyOrderID = so.ID
+                    LEFT JOIN dbo.Client c ON c.ID = so.ClientID
+                    WHERE so.Deleted = 0 AND soi.Deleted = 0
+                          AND so.ClientID IS NOT NULL
+                          AND soi.ProductID IN {ph}
+                ) ranked
+                WHERE rn = 1
+            )
+            SELECT p.ID AS product_id, p.Name AS name, p.VendorCode AS vendor_code,
+                   p.HasAnalogue AS has_analogue, p.IsForSale AS is_for_sale,
+                   lp.producer_id AS primary_producer_id,
+                   lp.producer_name AS primary_producer_name
+            FROM dbo.Product p
+            LEFT JOIN latest_producer lp ON lp.product_id = p.ID
+            WHERE p.ID IN {ph}
             """,
             params,
         )

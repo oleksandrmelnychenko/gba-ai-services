@@ -44,7 +44,7 @@ def test_stock_excludes_1c_debt_import_lots():
     assert "ci.ConsignmentID" in _SRC
     assert "dbo.ProductIncome" in _SRC  # Consignment -> ProductIncome FK hop
     assert "c.ProductIncomeID" in _SRC
-    assert "pi.ID IS NULL OR pi.SourceDocumentType <> :debt_doc_type" in _SRC
+    assert "pi.ID IS NULL OR pi.SourceDocumentType IS NULL OR pi.SourceDocumentType <> :debt_doc_type" in _SRC
     # mirror gba-pricing's exact intent: the debt document type is 1 and parameter-bound.
     assert "_DEBT_IMPORT_SOURCE_DOCUMENT_TYPE = 1" in _SRC
 
