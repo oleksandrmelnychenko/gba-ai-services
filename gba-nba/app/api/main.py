@@ -33,7 +33,7 @@ def _debt_dash_warmer() -> None:
     ~44s cold aggregation (which exceeds the gba-server 30s proxy timeout)."""
     while True:
         try:
-            _debt_dashboards_cached(datetime.now(UTC).strftime("%Y-%m-%d"))
+            _debt_dashboards_cached(datetime.now(UTC).strftime("%Y-%m-%d"), allow_stale=False)
         except Exception as exc:  # noqa: BLE001
             log.warning("debt_dash_warm_failed", error=str(exc))
         time.sleep(_DEBT_DASH_TTL_S * 0.9)
@@ -296,17 +296,30 @@ _EMPTY_DEBT_DASH = {
 }
 
 
-def _debt_dashboards_cached(as_of: str) -> dict[int, dict]:
+_debt_dash_compute_lock = threading.Lock()
+
+
+def _debt_dashboards_cached(as_of: str, *, allow_stale: bool = True) -> dict[int, dict]:
+    """Stale-while-revalidate: requests are served whatever is cached (the background
+    warmer refreshes every ~9 min) and NEVER wait out the ~44-70s recompute — a request
+    that lands mid-refresh must not block on it. Inline compute happens only when the
+    cache is completely empty (first seconds after boot)."""
     with _debt_dash_lock:
         fresh = (
             _debt_dash_state["as_of"] == as_of
             and time.monotonic() - _debt_dash_state["at"] < _DEBT_DASH_TTL_S
         )
-        if fresh:
-            return _debt_dash_state["values"]
-        values = signals_repository.debt_dashboards_for_all_managers(as_of)
-        _debt_dash_state.update({"at": time.monotonic(), "as_of": as_of, "values": values})
-        return values
+        values = _debt_dash_state["values"]
+        if fresh or (allow_stale and values):
+            return values
+    with _debt_dash_compute_lock:
+        with _debt_dash_lock:
+            if _debt_dash_state["values"] and allow_stale:
+                return _debt_dash_state["values"]
+        computed = signals_repository.debt_dashboards_for_all_managers(as_of)
+        with _debt_dash_lock:
+            _debt_dash_state.update({"at": time.monotonic(), "as_of": as_of, "values": computed})
+        return computed
 
 
 @app.get("/cockpit/dashboard")
