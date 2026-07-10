@@ -10,6 +10,7 @@ still works (just uncached). Never let cache failure break recommendations.
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import redis
@@ -20,14 +21,17 @@ from app.core.metrics import METRICS
 
 log = get_logger("cache")
 
-_MODEL_VERSION = "v33-realdata-202606"
+# v34: recs remapped onto live catalog rows (live_remap) — bump kills warm-cached
+# entries that still carry dead product ids.
+_MODEL_VERSION = "v34-liveremap-202607"
+_RETRY_COOLDOWN_S = 30.0
 _client: redis.Redis | None = None
-_unavailable = False
+_unavailable_until = 0.0
 
 
 def _get_client() -> redis.Redis | None:
-    global _client, _unavailable
-    if _unavailable:
+    global _client, _unavailable_until
+    if _unavailable_until and time.monotonic() < _unavailable_until:
         return None
     if _client is None:
         s = get_settings()
@@ -37,11 +41,14 @@ def _get_client() -> redis.Redis | None:
                 decode_responses=True, socket_connect_timeout=2, socket_timeout=2,
             )
             _client.ping()
+            _unavailable_until = 0.0
             log.info("redis_connected", host=s.redis_host, port=s.redis_port)
         except Exception as exc:  # noqa: BLE001
-            log.warning("redis_unavailable", error=str(exc))
+            # Cool-down, not a permanent flag: a Redis blip at startup must not
+            # disable caching (and the nightly warm) for the process lifetime.
+            log.warning("redis_unavailable", error=str(exc), retry_in_s=_RETRY_COOLDOWN_S)
             _client = None
-            _unavailable = True
+            _unavailable_until = time.monotonic() + _RETRY_COOLDOWN_S
     return _client
 
 
@@ -90,10 +97,14 @@ def invalidate_customer(customer_id: int) -> int:
         f"reco:{_MODEL_VERSION}:{customer_id}:*",
         f"copurchase:{_MODEL_VERSION}:{customer_id}:*",
     )
-    keys: list[str] = []
-    for pattern in patterns:
-        keys.extend(client.scan_iter(match=pattern, count=200))
-    return client.delete(*keys) if keys else 0
+    try:
+        keys: list[str] = []
+        for pattern in patterns:
+            keys.extend(client.scan_iter(match=pattern, count=200))
+        return client.delete(*keys) if keys else 0
+    except Exception as exc:  # noqa: BLE001
+        log.warning("cache_invalidate_failed", customer_id=customer_id, error=str(exc))
+        return 0
 
 
 def invalidate_copurchase(customer_id: int) -> int:
@@ -101,8 +112,12 @@ def invalidate_copurchase(customer_id: int) -> int:
     if client is None:
         return 0
     pattern = f"copurchase:{_MODEL_VERSION}:{customer_id}:*"
-    keys = list(client.scan_iter(match=pattern, count=200))
-    return client.delete(*keys) if keys else 0
+    try:
+        keys = list(client.scan_iter(match=pattern, count=200))
+        return client.delete(*keys) if keys else 0
+    except Exception as exc:  # noqa: BLE001
+        log.warning("cache_invalidate_failed", customer_id=customer_id, error=str(exc))
+        return 0
 
 
 def _neg_key(customer_id: int) -> str:

@@ -14,6 +14,7 @@ from app.core.logging import get_logger
 from app.data import cache
 from app.data import sales_repository as repo
 from app.domain.models import ProductRec, RecommendationResult, RecSource, Segment
+from app.services.recommendations import live_remap
 
 log = get_logger("recommender")
 
@@ -215,6 +216,9 @@ def recommend(
     combined = repurchase + discovery
     if include_discovery and len(combined) < top_n:
         combined = _backfill(combined, customer_id, as_of, top_n, segment, excl)
+    # History carries product ids of soft-deleted catalog generations (re-syncs mint new
+    # rows); translate onto live rows so the gba-server hydration doesn't drop the list.
+    combined = live_remap.remap_recs_to_live(combined)
     for i, r in enumerate(combined):
         r.rank = i + 1
 

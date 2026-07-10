@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hmac
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -126,6 +127,12 @@ def plan_producer(req: PlanRequest) -> ProducerPurchasePlan:
         raise HTTPException(status_code=500, detail=f"plan_failed:{err_id}") from exc
 
 
+# Single-flight: a cold cart build is tens of seconds of DB work — when the as_of
+# rolls at midnight (or Redis was flushed), concurrent requests must not each run
+# their own build. One builds, the rest wait on the lock and re-read the cache.
+_CART_BUILD_LOCK = threading.Lock()
+
+
 @app.post("/plan/cart", response_model=CartReplenishmentPlan)
 def plan_cart(req: CartPlanRequest) -> CartReplenishmentPlan:
     started = time.time()
@@ -133,16 +140,30 @@ def plan_cart(req: CartPlanRequest) -> CartReplenishmentPlan:
         as_of = req.as_of_date.isoformat() if req.as_of_date else _today()
         limit = req.limit if req.limit is not None else 200
         budget = req.budget_eur
-        key = (cache.make_key("cart", limit, as_of) if budget is None and req.active_days is None
-               else cache.make_key("cartbudget", f"{limit}:{budget}:{req.method}:{req.active_days}", as_of))
+        # Canonical = exactly what the scheduler warms (only_needed=True, no budget/window).
+        # Variants carry every plan-shaping parameter in the key (a shared key once served
+        # the wrong only_needed plan for 8 days) and live 1h so the slider can't grow Redis.
+        canonical = budget is None and req.active_days is None and req.only_needed
+        key = (cache.make_key("cart", limit, as_of) if canonical
+               else cache.make_key(
+                   "cartbudget",
+                   f"{limit}:{budget}:{req.method}:{req.active_days}:{int(req.only_needed)}",
+                   as_of,
+               ))
         cached = cache.get(key)
         if cached is not None:
             METRICS.record_request((time.time() - started) * 1000)
             log.info("cart_plan_cache_hit", items=cached.get("item_count"))
             return CartReplenishmentPlan.model_validate(cached)
-        plan = policy.build_cart_plan(as_of, only_needed=req.only_needed, limit=limit,
-                                      budget_eur=budget, method=req.method, active_days=req.active_days)
-        cache.set(key, plan.model_dump(mode="json"), ttl=691200)
+        with _CART_BUILD_LOCK:
+            cached = cache.get(key)
+            if cached is not None:
+                METRICS.record_request((time.time() - started) * 1000)
+                log.info("cart_plan_cache_hit", items=cached.get("item_count"))
+                return CartReplenishmentPlan.model_validate(cached)
+            plan = policy.build_cart_plan(as_of, only_needed=req.only_needed, limit=limit,
+                                          budget_eur=budget, method=req.method, active_days=req.active_days)
+            cache.set(key, plan.model_dump(mode="json"), ttl=691200 if canonical else 3600)
         METRICS.record_request((time.time() - started) * 1000)
         log.info("cart_plan_built", items=plan.item_count)
         return plan
@@ -205,7 +226,11 @@ def get_producer_profile(producer_id: int) -> dict:
 @app.post("/masters/producer")
 def set_producer_profile(req: ProducerProfileUpdate) -> dict:
     try:
-        return masters.upsert_producer_profile(req.producer_id, req.model_dump(exclude_none=True))
+        result = masters.upsert_producer_profile(req.producer_id, req.model_dump(exclude_none=True))
+        # Cached plans embed the old profile for up to 8 days — drop them so the
+        # edit is visible on the very next plan request.
+        cache.invalidate_plans(req.producer_id)
+        return result
     except Exception as exc:  # noqa: BLE001
         log.error("producer_profile_upsert_failed", producer_id=req.producer_id, error=str(exc))
         raise HTTPException(status_code=503, detail="masters_store_unavailable") from exc
@@ -214,7 +239,9 @@ def set_producer_profile(req: ProducerProfileUpdate) -> dict:
 @app.post("/masters/seed-terms")
 def seed_terms(min_orders: int = 3, overwrite: bool = False) -> dict:
     try:
-        return masters.seed_derived_terms(min_orders=min_orders, overwrite=overwrite)
+        result = masters.seed_derived_terms(min_orders=min_orders, overwrite=overwrite)
+        cache.invalidate_plans()
+        return result
     except Exception as exc:  # noqa: BLE001
         log.error("seed_terms_failed", error=str(exc))
         raise HTTPException(status_code=503, detail="masters_store_unavailable") from exc
@@ -228,10 +255,12 @@ def get_product_terms(producer_id: int) -> dict:
 @app.post("/masters/product-terms")
 def set_product_terms(req: ProductTermsUpdate) -> dict:
     try:
-        return masters.upsert_product_terms(
+        result = masters.upsert_product_terms(
             req.producer_id, req.product_id,
             req.model_dump(exclude_none=True, exclude={"producer_id", "product_id"}),
         )
+        cache.invalidate_plans(req.producer_id)
+        return result
     except Exception as exc:  # noqa: BLE001
         log.error("product_terms_upsert_failed", producer_id=req.producer_id, error=str(exc))
         raise HTTPException(status_code=503, detail="masters_store_unavailable") from exc
@@ -249,8 +278,10 @@ class FeedbackRequest(BaseModel):
 @app.post("/feedback")
 def record_feedback(req: FeedbackRequest) -> dict:
     try:
-        return feedback.record(req.producer_id, req.product_id, req.suggested_qty,
-                               req.final_qty, req.action, req.abc, _today())
+        result = feedback.record(req.producer_id, req.product_id, req.suggested_qty,
+                                 req.final_qty, req.action, req.abc, _today())
+        cache.invalidate_plans(req.producer_id)
+        return result
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001

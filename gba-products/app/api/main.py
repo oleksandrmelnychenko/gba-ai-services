@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hmac
+import threading
 import time
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime
@@ -27,6 +28,7 @@ _OPEN_PATHS = {"/health"}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    settings.validate_runtime_configuration()
     get_engine()
     if not settings.internal_api_key:
         log.warning("internal_api_key_not_set", note="gba-products running OPEN — set INTERNAL_API_KEY")
@@ -45,7 +47,9 @@ app.add_middleware(CORSMiddleware, allow_origins=settings.cors_allow_origins,
 async def require_internal_key(request: Request, call_next):
     if settings.internal_api_key and request.url.path not in _OPEN_PATHS:
         provided = request.headers.get("X-Internal-Api-Key", "")
-        if not hmac.compare_digest(provided, settings.internal_api_key):
+        # Compare bytes: compare_digest raises TypeError on non-ASCII str input,
+        # turning garbage headers into 500s instead of a clean 401.
+        if not hmac.compare_digest(provided.encode("utf-8"), settings.internal_api_key.encode("utf-8")):
             return JSONResponse(status_code=401, content={"detail": "unauthorized"})
     return await call_next(request)
 
@@ -60,6 +64,23 @@ async def timing(request: Request, call_next):
 
 def _today() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%d")
+
+
+_AS_OF_MIN = date(2015, 1, 1)
+_WINDOW_DAYS_MAX = 3650
+
+
+def _resolve_as_of(as_of_date: date | None) -> str:
+    """Clamp as_of to a sane range: pre-1753 dates crash MSSQL date conversion (500),
+    and every distinct as_of mints a fresh cache key that triggers a full portfolio build."""
+    if as_of_date is None:
+        return _today()
+    if as_of_date < _AS_OF_MIN or as_of_date.isoformat() > _today():
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "as_of_date_out_of_range", "min": _AS_OF_MIN.isoformat(), "max": _today()},
+        )
+    return as_of_date.isoformat()
 
 
 @app.get("/health")
@@ -85,13 +106,16 @@ def assortment_stock(as_of_date: date | None = None, limit: int = 100) -> dict:
     """Portfolio inventory-health snapshot: on-hand stock bucketed into days-of-cover bands,
     with EUR value per band and the top SKUs by frozen capital. Internal-key gated."""
     started = time.time()
-    as_of = as_of_date.isoformat() if as_of_date else _today()
+    as_of = _resolve_as_of(as_of_date)
     try:
         key = cache.make_key("assortment", "stock", as_of)
         snap = cache.get(key)
         if snap is None:
-            snap = stock_health.snapshot(as_of)
-            cache.set(key, snap)
+            with _BUILD_LOCK:
+                snap = cache.get(key)
+                if snap is None:
+                    snap = stock_health.snapshot(as_of)
+                    cache.set(key, snap)
         METRICS.record_request((time.time() - started) * 1000)
         out = dict(snap)
         out["rows"] = out.get("rows", [])[:max(0, limit)]
@@ -102,12 +126,21 @@ def assortment_stock(as_of_date: date | None = None, limit: int = 100) -> dict:
         raise HTTPException(status_code=500, detail="assortment_stock_failed") from exc
 
 
+# Single-flight: the portfolio build is six full-table aggregations; when the hourly
+# TTL expires, concurrent requests must not each launch their own build (thundering
+# herd saturates the threadpool + MSSQL). One builds, the rest wait and re-read.
+_BUILD_LOCK = threading.Lock()
+
+
 def _portfolio(as_of: str) -> dict:
     key = cache.make_key("assortment", "portfolio", as_of)
     build = cache.get(key)
     if build is None or not _portfolio_cache_compatible(build):
-        build = portfolio.build_portfolio(as_of)
-        cache.set(key, build)
+        with _BUILD_LOCK:
+            build = cache.get(key)
+            if build is None or not _portfolio_cache_compatible(build):
+                build = portfolio.build_portfolio(as_of)
+                cache.set(key, build)
     return build
 
 
@@ -118,7 +151,7 @@ def _attach_meta(rows: list[dict]) -> list[dict]:
 
 
 def _region_window(window_days: int | None) -> int:
-    return max(1, int(window_days or settings.dead_window_days))
+    return min(max(1, int(window_days or settings.dead_window_days)), _WINDOW_DAYS_MAX)
 
 
 def _regional_sales(as_of: str, window_days: int, region_id: int) -> list[dict]:
@@ -196,7 +229,7 @@ def _portfolio_cache_compatible(build: dict) -> bool:
 def assortment_overview(as_of_date: date | None = None) -> dict:
     """Portfolio summary: counts by band / lifecycle / ABC / XYZ + totals + avg health. Internal-key gated."""
     started = time.time()
-    as_of = as_of_date.isoformat() if as_of_date else _today()
+    as_of = _resolve_as_of(as_of_date)
     try:
         build = _portfolio(as_of)
         METRICS.record_request((time.time() - started) * 1000)
@@ -217,7 +250,7 @@ def assortment_health(as_of_date: date | None = None, band: str | None = None, a
     on-hand-stocked subset (the actual inventory-health decisions); stocked_only=false includes the
     order-to-demand active catalog. Internal-key gated."""
     started = time.time()
-    as_of = as_of_date.isoformat() if as_of_date else _today()
+    as_of = _resolve_as_of(as_of_date)
     resolved_sort = _SORT_ALIASES.get(sort, sort)
     if resolved_sort not in _SORTS:
         allowed = sorted([*_SORTS, *_SORT_ALIASES])
@@ -259,7 +292,7 @@ def assortment_regions(as_of_date: date | None = None, window_days: int | None =
                        limit: int = 50) -> dict:
     """Regional portfolio demand summary by Client.RegionID. Internal-key gated."""
     started = time.time()
-    as_of = as_of_date.isoformat() if as_of_date else _today()
+    as_of = _resolve_as_of(as_of_date)
     win = _region_window(window_days)
     try:
         key = cache.make_key("assortment", f"regions:{win}", as_of)
@@ -281,7 +314,7 @@ def assortment_regions(as_of_date: date | None = None, window_days: int | None =
 def product_profile(product_id: int, as_of_date: date | None = None) -> dict:
     """Full per-SKU 360 profile (the product card). Internal-key gated."""
     started = time.time()
-    as_of = as_of_date.isoformat() if as_of_date else _today()
+    as_of = _resolve_as_of(as_of_date)
     try:
         row = next((r for r in _portfolio(as_of)["rows"] if r["product_id"] == product_id), None)
         meta = sig.product_meta([product_id]).get(product_id, {})
@@ -300,7 +333,7 @@ def product_regions(product_id: int, as_of_date: date | None = None, window_days
                     limit: int = 20) -> dict:
     """Per-product demand split by Client.RegionID. Internal-key gated."""
     started = time.time()
-    as_of = as_of_date.isoformat() if as_of_date else _today()
+    as_of = _resolve_as_of(as_of_date)
     win = _region_window(window_days)
     try:
         rows = sig.regional_product_sales(as_of, win, product_ids=[product_id])
@@ -323,7 +356,7 @@ def product_regions(product_id: int, as_of_date: date | None = None, window_days
 def product_substitutes(product_id: int, as_of_date: date | None = None, limit: int = 20) -> dict:
     """Ranked interchangeable replacements (ProductAnalogue + OE fallback), in-stock + healthy first."""
     started = time.time()
-    as_of = as_of_date.isoformat() if as_of_date else _today()
+    as_of = _resolve_as_of(as_of_date)
     try:
         lookup = {r["product_id"]: r for r in _portfolio(as_of)["rows"]}
         result = substitution.substitutes(product_id, lookup, limit)
@@ -339,7 +372,7 @@ def product_substitutes(product_id: int, as_of_date: date | None = None, limit: 
 def assortment_margin(as_of_date: date | None = None, limit: int = 20) -> dict:
     """Margin leaders / laggards / below-cost alerts + portfolio margin summary. Internal-key gated."""
     started = time.time()
-    as_of = as_of_date.isoformat() if as_of_date else _today()
+    as_of = _resolve_as_of(as_of_date)
     try:
         rows = _portfolio(as_of)["rows"]
         METRICS.record_request((time.time() - started) * 1000)
@@ -359,7 +392,7 @@ def assortment_returns(as_of_date: date | None = None, min_rate: float | None = 
                        limit: int = 20) -> dict:
     """High-return SKUs + returns summary. Internal-key gated."""
     started = time.time()
-    as_of = as_of_date.isoformat() if as_of_date else _today()
+    as_of = _resolve_as_of(as_of_date)
     rate = settings.returns_high_min_rate if min_rate is None else min_rate
     try:
         rows = _portfolio(as_of)["rows"]

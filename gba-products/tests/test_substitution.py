@@ -117,7 +117,12 @@ pytestmark_integration = pytest.mark.integration
 
 @pytest.mark.integration
 def test_analogues_for_live_target():
-    """Live: target 25804318 (Фонарь задний правый) has a curated analogue set incl. an OE-only add."""
+    """Live: a for-sale product with curated analogues yields a ranked substitute set.
+
+    Preferred target is 25804318 (Фонарь задний правый, historically >100 candidates); when
+    the dev DB no longer has it live (soft-deleted by a sync/reset), fall back to the live
+    product with the most curated links so the test tracks data instead of a pinned row.
+    """
     try:
         from app.data import catalog_repository as cat
         from app.data.db import query
@@ -125,15 +130,35 @@ def test_analogues_for_live_target():
     except Exception:
         pytest.skip("dev DB not reachable")
 
-    card = cat.product_card(25804318)
+    target_id = 25804318
+    card = cat.product_card(target_id)
+
+    if not card:
+        rows = query(
+            """
+            SELECT TOP 1 a.BaseProductID AS pid
+            FROM dbo.ProductAnalogue a
+            JOIN dbo.Product p ON p.ID = a.BaseProductID
+            WHERE a.Deleted = 0 AND p.Deleted = 0 AND p.IsForSale = 1 AND p.HasAnalogue = 1
+            GROUP BY a.BaseProductID
+            ORDER BY COUNT(*) DESC
+            """
+        )
+
+        if not rows:
+            pytest.skip("no live for-sale product with curated analogues in dev DB")
+
+        target_id = int(rows[0]["pid"])
+        card = cat.product_card(target_id)
+
     assert card and card["is_for_sale"] and card["has_analogue"]
-    cands = cat.analogues_for(25804318)
-    assert len(cands) > 100
-    assert all(int(c["product_id"]) != 25804318 for c in cands)
+    cands = cat.analogues_for(target_id)
+    assert len(cands) > 0
+    assert all(int(c["product_id"]) != target_id for c in cands)
     sources = {c["source"] for c in cands}
     assert "analogue" in sources  # curated links present
 
     # substitutes() with an empty lookup must still rank and never raise
-    out = substitution.substitutes(25804318, {})
+    out = substitution.substitutes(target_id, {})
     assert out["found"] is True and out["count"] == len(cands)
     assert out["in_stock_count"] == 0  # empty lookup => nothing known to be in stock

@@ -80,7 +80,8 @@ def test_milp_finds_optimal_knapsack_beating_greedy():
     from app.services.optimization import milp
     values = [6.0, 5.0, 5.0]
     costs = [6.0, 5.0, 5.0]
-    chosen = milp.select_within_budget(values, costs, 10.0)
+    chosen, used_milp = milp.select_within_budget(values, costs, 10.0)
+    assert used_milp is True
     assert sum(values[i] for i in chosen) == 10.0
     assert chosen == {1, 2}
     greedy = milp._greedy(values, costs, 10.0)

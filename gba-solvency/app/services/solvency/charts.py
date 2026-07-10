@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 
@@ -148,7 +149,19 @@ def _score_sparkline(client_id: int, as_of: str, window_months: int) -> list[Sco
         )
 
 
+# The documented connection budget (_DIRECT_WORKERS + _MAX_DB_WORKERS * _FEATURES_ONE_FANOUT
+# <= pool ceiling 20) holds for ONE build; two concurrent chart builds demand up to 36
+# connections and stall the pool for every other request. Serialize builds process-wide —
+# the second user waits on the semaphore instead of timing out the whole pool.
+_BUILD_SEMAPHORE = threading.Semaphore(1)
+
+
 def build_charts(client_id: int, as_of_date: str | None, window_months: int) -> SolvencyCharts:
+    with _BUILD_SEMAPHORE:
+        return _build_charts_locked(client_id, as_of_date, window_months)
+
+
+def _build_charts_locked(client_id: int, as_of_date: str | None, window_months: int) -> SolvencyCharts:
     settings = get_settings()
     as_of = as_of_date or settings.resolve_fx_date(None)
     fx_date = settings.resolve_fx_date(as_of_date)

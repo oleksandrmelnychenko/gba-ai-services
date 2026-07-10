@@ -12,11 +12,12 @@ log = get_logger("optimization")
 
 
 def select_within_budget(values: list[float], costs: list[float], budget: float,
-                         time_limit: int = 10) -> set[int]:
-    """Indices to include. Exact CBC MILP; falls back to greedy value-density on any solver issue."""
+                         time_limit: int = 10) -> tuple[set[int], bool]:
+    """Indices to include + whether the exact MILP produced them (False = greedy fallback),
+    so the plan's method_used reflects what actually ran instead of hiding solver breakage."""
     n = len(values)
     if n == 0 or budget <= 0:
-        return set()
+        return set(), True
     try:
         import pulp
 
@@ -28,11 +29,11 @@ def select_within_budget(values: list[float], costs: list[float], budget: float,
         if pulp.LpStatus[status] in ("Optimal", "Not Solved"):
             chosen = {i for i in range(n) if (x[i].value() or 0) > 0.5}
             if chosen or pulp.LpStatus[status] == "Optimal":
-                return chosen
+                return chosen, True
         log.warning("milp_non_optimal", status=pulp.LpStatus[status])
     except Exception as exc:  # noqa: BLE001
         log.warning("milp_failed_fallback_greedy", error=str(exc))
-    return _greedy(values, costs, budget)
+    return _greedy(values, costs, budget), False
 
 
 def _greedy(values: list[float], costs: list[float], budget: float) -> set[int]:

@@ -158,6 +158,9 @@ def recommend(
                    segment="COPURCHASE", source=src)
         for i, (pid, (score, src)) in enumerate(ranked)
     ]
+    # Translate dead catalog-generation ids onto live rows (see live_remap docstring).
+    from app.services.recommendations import live_remap
+    recs = live_remap.remap_recs_to_live(recs)
     discovery = sum(1 for r in recs if r.source == RecSource.DISCOVERY)
     latency = (datetime.now() - started).total_seconds() * 1000
     return RecommendationResult(

@@ -332,8 +332,8 @@ def build_cart_plan(as_of: str, only_needed: bool = True, limit: int = 200,
         values = [_profit_at_risk(it) for it in items]
         costs = [it.line_cost_eur or 0.0 for it in items]
         if method == "milp":
-            method_used = "milp"
-            chosen = milp_opt.select_within_budget(values, costs, budget_eur, s.milp_time_limit)
+            chosen, used_milp = milp_opt.select_within_budget(values, costs, budget_eur, s.milp_time_limit)
+            method_used = "milp" if used_milp else "greedy"
         else:
             method_used = "greedy"
             chosen = set()

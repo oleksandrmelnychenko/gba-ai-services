@@ -6,6 +6,7 @@ module is imported lazily inside handlers so this shell stays importable during 
 from __future__ import annotations
 
 import hmac
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -130,6 +131,29 @@ def _drift_summary_cached() -> dict | None:
     return {"drift_level": report.get("drift_level"), "psi_score": report.get("psi_score")}
 
 
+# The synthetic-line check aggregates 1.9M OrderItem rows (~2.7s DB CPU) and /health
+# is unauthenticated — cache it in-process so health probes can't saturate MSSQL.
+_SYNTHETIC_CHECK_TTL_S = 6 * 3600.0
+_synthetic_check_lock = threading.Lock()
+_synthetic_check_state: dict = {"at": 0.0, "ok": None}
+
+
+def _synthetic_drift_ok_cached() -> bool | None:
+    now = time.monotonic()
+    with _synthetic_check_lock:
+        if now - _synthetic_check_state["at"] < _SYNTHETIC_CHECK_TTL_S:
+            return _synthetic_check_state["ok"]
+    try:
+        from app.data import solvency_repository as repo
+        ok = bool(repo.synthetic_line_drift_check()["ok"])
+    except Exception:  # noqa: BLE001
+        ok = None
+    with _synthetic_check_lock:
+        _synthetic_check_state["at"] = time.monotonic()
+        _synthetic_check_state["ok"] = ok
+    return ok
+
+
 @app.get("/health")
 def health() -> dict:
     db_ok = True
@@ -138,13 +162,7 @@ def health() -> dict:
             c.exec_driver_sql("SELECT 1")
     except Exception:
         db_ok = False
-    synthetic_drift_ok = None
-    if db_ok:
-        try:
-            from app.data import solvency_repository as repo
-            synthetic_drift_ok = bool(repo.synthetic_line_drift_check()["ok"])
-        except Exception:
-            synthetic_drift_ok = None
+    synthetic_drift_ok = _synthetic_drift_ok_cached() if db_ok else None
     drift = _drift_summary_cached()
     return {
         "status": "healthy" if db_ok and synthetic_drift_ok is not False else "degraded",
@@ -165,7 +183,12 @@ def monitor_endpoint(force: bool = False) -> dict:
     is logged by the monitor whenever drift_level is not ok.
     """
     from app.risk import monitor
-    return monitor.drift_report(force=force)
+    try:
+        return monitor.drift_report(force=force)
+    except Exception as exc:  # noqa: BLE001
+        err_id = uuid.uuid4().hex
+        log.error("monitor_failed", error_id=err_id, error=str(exc))
+        raise HTTPException(status_code=500, detail=f"internal error (ref {err_id})") from exc
 
 
 @app.get("/metrics")
@@ -200,12 +223,17 @@ def score_batch(req: BatchScoreRequest) -> dict:
     Uses the set-based score_batch (a handful of queries for the whole id-list) instead of an
     N-pass per-client loop; results are bit-identical to score_client per id.
     """
-    results, errors = _service().score_batch(
-        client_ids=req.client_ids,
-        as_of_date=req.as_of_date.isoformat() if req.as_of_date else None,
-        window_months=req.window_months,
-        use_cache=req.use_cache,
-    )
+    try:
+        results, errors = _service().score_batch(
+            client_ids=req.client_ids,
+            as_of_date=req.as_of_date.isoformat() if req.as_of_date else None,
+            window_months=req.window_months,
+            use_cache=req.use_cache,
+        )
+    except Exception as exc:  # noqa: BLE001
+        err_id = uuid.uuid4().hex
+        log.error("score_batch_failed", clients=len(req.client_ids), error_id=err_id, error=str(exc))
+        raise HTTPException(status_code=500, detail=f"internal error (ref {err_id})") from exc
     return {"results": results, "errors": errors, "count": len(results), "failed": len(errors)}
 
 
@@ -233,4 +261,9 @@ def charts(
 
 @app.delete("/cache/{client_id}")
 def clear_cache(client_id: int) -> dict:
-    return {"deleted": cache.invalidate_client(client_id)}
+    try:
+        return {"deleted": cache.invalidate_client(client_id)}
+    except Exception as exc:  # noqa: BLE001
+        err_id = uuid.uuid4().hex
+        log.error("cache_clear_failed", client_id=client_id, error_id=err_id, error=str(exc))
+        raise HTTPException(status_code=500, detail=f"internal error (ref {err_id})") from exc

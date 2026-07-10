@@ -250,7 +250,7 @@ def _drift_level(psi: float) -> str:
 # Cached live drift report
 # --------------------------------------------------------------------------------------------
 _lock = threading.Lock()
-_cache: dict[str, Any] = {"report": None, "ts": 0.0}
+_cache: dict[str, Any] = {"report": None, "ts": 0.0, "computing": False}
 
 
 def _load_baseline() -> dict[str, Any] | None:
@@ -317,8 +317,13 @@ def _compute_report(sample_size: int, as_of: str | None) -> dict[str, Any]:
     top = sorted(feat_psi.items(), key=lambda kv: kv[1], reverse=True)
     psi_top_features = [{"feature": k, "psi": v, "level": _drift_level(v)} for k, v in top[:5]]
 
-    worst = max([psi_score or 0.0, *(feat_psi.values() or [0.0])])
-    level = _drift_level(worst)
+    if n_scored == 0:
+        # An empty cohort means the monitor is blind (e.g. a sync quiesce emptied the
+        # buyer sample) — report "unknown", never a green-lit "ok".
+        level = "unknown"
+    else:
+        worst = max([psi_score or 0.0, *(feat_psi.values() or [0.0])])
+        level = _drift_level(worst)
 
     return {
         "psi_score": round(psi_score, 4) if psi_score is not None else None,
@@ -347,8 +352,21 @@ def drift_report(
         fresh = cached is not None and (now - _cache["ts"]) < refresh_hours * 3600
         if fresh and not force:
             return cached
+        # In-flight dedup: concurrent callers during the stale window must not each run
+        # their own ~2s 300-buyer sampling (each holds a DB connection). One computes,
+        # the rest serve the previous report (or a stub on the very first run).
+        if _cache.get("computing") and not force:
+            return cached if cached is not None else {
+                "psi_score": None, "psi_top_features": [], "drift_level": "unknown",
+                "n_scored": 0, "as_of": as_of, "baseline_created_at": None,
+            }
+        _cache["computing"] = True
 
-    report = _compute_report(sample_size, as_of)
+    try:
+        report = _compute_report(sample_size, as_of)
+    finally:
+        with _lock:
+            _cache["computing"] = False
 
     with _lock:
         _cache["report"] = report

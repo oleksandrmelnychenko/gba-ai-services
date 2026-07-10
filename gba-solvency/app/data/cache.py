@@ -10,6 +10,7 @@ still works (just uncached). Never let cache failure break scoring.
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import redis
@@ -20,8 +21,9 @@ from app.core.metrics import METRICS
 
 log = get_logger("cache")
 
+_RETRY_COOLDOWN_S = 30.0
 _client: redis.Redis | None = None
-_unavailable = False
+_unavailable_until = 0.0
 
 
 def _model_version() -> str:
@@ -29,8 +31,8 @@ def _model_version() -> str:
 
 
 def _get_client() -> redis.Redis | None:
-    global _client, _unavailable
-    if _unavailable:
+    global _client, _unavailable_until
+    if _unavailable_until and time.monotonic() < _unavailable_until:
         return None
     if _client is None:
         s = get_settings()
@@ -40,11 +42,14 @@ def _get_client() -> redis.Redis | None:
                 decode_responses=True, socket_connect_timeout=2, socket_timeout=2,
             )
             _client.ping()
+            _unavailable_until = 0.0
             log.info("redis_connected", host=s.redis_host, port=s.redis_port, db=s.redis_db)
         except Exception as exc:  # noqa: BLE001
-            log.warning("redis_unavailable", error=str(exc))
+            # Cool-down, not a permanent flag: a Redis blip during deploy must not
+            # disable score/charts caching until the next service restart.
+            log.warning("redis_unavailable", error=str(exc), retry_in_s=_RETRY_COOLDOWN_S)
             _client = None
-            _unavailable = True
+            _unavailable_until = time.monotonic() + _RETRY_COOLDOWN_S
     return _client
 
 
@@ -69,7 +74,11 @@ def get(key: str) -> dict[str, Any] | None:
         METRICS.record_cache(hit=False)
         return None
     METRICS.record_cache(hit=True)
-    return json.loads(raw)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        log.warning("cache_decode_failed", key=key, error=str(exc))
+        return None
 
 
 def set(key: str, value: dict[str, Any], ttl: int | None = None) -> None:

@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
@@ -219,7 +220,16 @@ def upsert_generated(task: Task) -> str:
             "generated_at": now,
             **computed,
         }
-        mongo.tasks().insert_one(doc)
+        try:
+            mongo.tasks().insert_one(doc)
+        except DuplicateKeyError:
+            # TOCTOU with a concurrent generation run (manager double-click vs the 09:00
+            # scheduler): the other writer won the insert — fall through to the refresh
+            # path instead of 500ing the whole generate run.
+            mongo.tasks().update_one({"task_key": task.task_key}, {"$set": computed})
+            _event(task.task_key, "refresh", by="system")
+
+            return task.task_key
         _event(task.task_key, "generated", by="system")
     return task.task_key
 

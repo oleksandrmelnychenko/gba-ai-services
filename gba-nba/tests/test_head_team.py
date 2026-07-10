@@ -102,11 +102,15 @@ def test_unknown_manager_404(client):
     assert resp.json()["detail"] == "unknown_manager"
 
 
-def test_head_tasks_non_head_403(client):
-    # /head/tasks is HEAD-ONLY team data -> 403 for a non-head (unlike /head/team's benign is_head:false)
+def test_head_tasks_non_head_benign(client):
+    # Non-head -> benign empty board with is_head=false (200, NOT 403): the console board
+    # mounts before the role resolves, and the gba-server proxy mislabels 403 as
+    # ai_auth_misconfigured. Same contract as every other /head route.
     resp = client.get("/head/tasks", params={"manager_net_uid": MGR_UID})
-    assert resp.status_code == 403
-    assert resp.json()["detail"] == "forbidden"
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["is_head"] is False
+    assert body["total"] == 0 and body["tasks"] == [] and body["managers"] == []
 
 
 def test_head_tasks_unknown_404(client):
@@ -127,7 +131,8 @@ def test_head_tasks_shape_for_head(client):
                                              "statuses": "open,in_progress", "limit": 50})
     assert resp.status_code == 200
     body = resp.json()
-    assert set(body) == {"total", "tasks", "by_status", "managers"}
+    assert set(body) == {"is_head", "total", "tasks", "by_status", "managers"}
+    assert body["is_head"] is True
     assert body["total"] == 3
     assert body["by_status"] == {"open": 2, "in_progress": 1, "done": 0, "snoozed": 0,
                                  "dismissed": 0}

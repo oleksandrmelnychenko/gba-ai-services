@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hmac
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -27,6 +28,17 @@ settings = get_settings()
 _OPEN_PATHS = {"/health"}
 
 
+def _debt_dash_warmer() -> None:
+    """Keep the all-managers debt dashboard cache warm so no request ever pays the
+    ~44s cold aggregation (which exceeds the gba-server 30s proxy timeout)."""
+    while True:
+        try:
+            _debt_dashboards_cached(datetime.now(UTC).strftime("%Y-%m-%d"))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("debt_dash_warm_failed", error=str(exc))
+        time.sleep(_DEBT_DASH_TTL_S * 0.9)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
@@ -35,6 +47,7 @@ async def lifespan(app: FastAPI):
         log.warning("mongo_index_setup_failed", error=str(exc))
     if not settings.internal_api_key:
         log.warning("internal_api_key_not_set", note="gba-nba running OPEN — set INTERNAL_API_KEY")
+    threading.Thread(target=_debt_dash_warmer, daemon=True, name="debt-dash-warmer").start()
     log.info("service_starting", service="gba-nba")
     yield
     mongo.close()
@@ -234,7 +247,12 @@ def cockpit_notes(manager_net_uid: str, req: CockpitNoteRequest) -> dict:
         raise HTTPException(status_code=404, detail="task not found")
     if task["manager_id"] != manager_id:
         raise HTTPException(status_code=403, detail="forbidden")
-    doc = lifecycle.add_note(req.task_key, manager_id, req.text)
+    try:
+        doc = lifecycle.add_note(req.task_key, manager_id, req.text)
+    except lifecycle.TaskNotFoundError as exc:
+        # Race with sweep_expired: the task passed the ownership check above but was
+        # purged before the note landed — a 404, not a 500.
+        raise HTTPException(status_code=404, detail="task not found") from exc
     doc["_id"] = str(doc["_id"])
     return doc
 
@@ -258,6 +276,39 @@ def cockpit_target(manager_net_uid: str, as_of_date: date | None = None) -> dict
     return result
 
 
+# The all-managers debt aggregation is the dominant dashboard cost (~44s live — past the
+# gba-server 30s proxy timeout, so uncached the head charts are effectively broken).
+# Cache it in-process per as_of; the single-manager dashboard slices the same result
+# (per-manager DTOs are exactly equal — same rows, same fold). Compute is serialized so
+# concurrent misses wait for one build instead of stacking 44s queries.
+_DEBT_DASH_TTL_S = 600.0
+_debt_dash_lock = threading.Lock()
+_debt_dash_state: dict = {"at": 0.0, "as_of": None, "values": {}}
+
+_EMPTY_DEBT_DASH = {
+    "value_at_risk_eur": 0.0,
+    "debt_aging": [
+        {"bucket": "0-30", "amount_eur": 0.0, "count": 0},
+        {"bucket": "31-60", "amount_eur": 0.0, "count": 0},
+        {"bucket": "61-90", "amount_eur": 0.0, "count": 0},
+        {"bucket": "90+", "amount_eur": 0.0, "count": 0},
+    ],
+}
+
+
+def _debt_dashboards_cached(as_of: str) -> dict[int, dict]:
+    with _debt_dash_lock:
+        fresh = (
+            _debt_dash_state["as_of"] == as_of
+            and time.monotonic() - _debt_dash_state["at"] < _DEBT_DASH_TTL_S
+        )
+        if fresh:
+            return _debt_dash_state["values"]
+        values = signals_repository.debt_dashboards_for_all_managers(as_of)
+        _debt_dash_state.update({"at": time.monotonic(), "as_of": as_of, "values": values})
+        return values
+
+
 @app.get("/cockpit/dashboard")
 def cockpit_dashboard(manager_net_uid: str, as_of_date: date | None = None) -> dict:
     """Chart-ready manager dashboard DTO (snake_case), computed from the SAME signals the cockpit
@@ -267,7 +318,7 @@ def cockpit_dashboard(manager_net_uid: str, as_of_date: date | None = None) -> d
     as_of = _as_of(as_of_date) or datetime.now(UTC).strftime("%Y-%m-%d")
     try:
         counts = lifecycle.dashboard_counts(manager_id)
-        debt = signals_repository.debt_dashboard_for_manager(manager_id, as_of)
+        debt = _debt_dashboards_cached(as_of).get(manager_id) or _EMPTY_DEBT_DASH
     except Exception as exc:  # noqa: BLE001
         error_id = uuid.uuid4().hex
         log.error("dashboard_failed", manager_id=manager_id, error_id=error_id, error=str(exc))
@@ -296,7 +347,7 @@ def cockpit_head_dashboard(manager_net_uid: str, as_of_date: date | None = None)
     as_of = _as_of(as_of_date) or datetime.now(UTC).strftime("%Y-%m-%d")
     teams = []
     total_var = 0.0
-    debt_by_manager = signals_repository.debt_dashboards_for_all_managers(as_of)
+    debt_by_manager = _debt_dashboards_cached(as_of)
     for mid in signals_repository.all_managers():
         var = debt_by_manager.get(mid, {}).get("value_at_risk_eur", 0.0)
         total_var += var
@@ -311,11 +362,12 @@ def cockpit_head_dashboard(manager_net_uid: str, as_of_date: date | None = None)
 
 @app.get("/targets/overview")
 def targets_overview(manager_net_uid: str, as_of_date: date | None = None) -> dict:
-    """Head-of-sales view: target + pace for every active manager. HEAD-ONLY (team data)."""
+    """Head-of-sales view: target + pace for every active manager. Non-head caller -> benign
+    {is_head: false} (200, not 403 — same contract as every other /head route)."""
     from app.services import targets
     _resolve_manager(manager_net_uid)
     if not signals_repository.is_head_of_sales(manager_net_uid):
-        raise HTTPException(status_code=403, detail="forbidden")
+        return {"is_head": False, "count": 0, "managers": []}
     rows = []
     as_of = _as_of(as_of_date)
     for mid in signals_repository.all_managers():
@@ -400,6 +452,7 @@ class TeamBoardManager(BaseModel):
 
 
 class TeamBoardResponse(BaseModel):
+    is_head: bool = True
     total: int
     tasks: list[TeamBoardTask]
     by_status: dict[str, int]
@@ -411,12 +464,14 @@ def head_tasks(manager_net_uid: str, statuses: str = "open,in_progress", manager
                urgency: str | None = None, skip: int = 0, limit: int = 50) -> TeamBoardResponse:
     """Head-of-sales team-wide live board: ALL managers' tasks (optionally filtered to one manager via
     manager_id), status $in the csv `statuses` (default open,in_progress), optional urgency. Sorted to
-    surface actively-worked + most-urgent first. HEAD-ONLY (team data) -> 403 for a non-head caller.
-    Unknown caller -> 404. Returns the page, the total over the filter, a by_status rollup, and the
-    full manager list (for the board's filter dropdown)."""
+    surface actively-worked + most-urgent first. Unknown caller -> 404. A non-head caller gets a
+    benign empty board with is_head=false (200, NOT 403 — the console treats 403 as session expiry
+    and the gba-server proxy mislabels it as ai_auth_misconfigured; the board mounts before the
+    role resolves, so non-heads DO hit this route). Returns the page, the total over the filter,
+    a by_status rollup, and the full manager list (for the board's filter dropdown)."""
     _resolve_manager(manager_net_uid)
     if not signals_repository.is_head_of_sales(manager_net_uid):
-        raise HTTPException(status_code=403, detail="forbidden")
+        return TeamBoardResponse(is_head=False, total=0, tasks=[], by_status={}, managers=[])
     status_list = [s.strip() for s in statuses.split(",") if s.strip()] or ["open", "in_progress"]
     mgr_filter = [manager_id] if manager_id is not None else None
     tasks, total, by_status = lifecycle.team_tasks(

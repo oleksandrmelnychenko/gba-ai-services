@@ -17,7 +17,10 @@ def get_client() -> MongoClient:
     global _client
     if _client is None:
         s = get_settings()
-        _client = MongoClient(s.mongo_uri, serverSelectionTimeoutMS=3000, tz_aware=True)
+        _client = MongoClient(
+            s.mongo_uri, serverSelectionTimeoutMS=3000, connectTimeoutMS=5000,
+            socketTimeoutMS=20000, tz_aware=True,
+        )
         log.info("mongo_connected", db=s.mongo_db)
     return _client
 
@@ -55,6 +58,11 @@ def ensure_indexes() -> None:
     t.create_index([("escalated_to", ASCENDING), ("status", ASCENDING)], name="ix_escalated")
 
     task_events().create_index([("task_key", ASCENDING), ("at", ASCENDING)], name="ix_event_task")
+    # task_events is write-only audit (nothing reads it in the serving path) and every daily
+    # run appends a refresh-event per active task — expire instead of growing forever.
+    task_events().create_index(
+        [("at", ASCENDING)], name="ttl_events", expireAfterSeconds=180 * 24 * 3600,
+    )
     manager_prefs().create_index([("manager_id", ASCENDING)], unique=True, name="uq_mgr")
     log.info("mongo_indexes_ensured")
 

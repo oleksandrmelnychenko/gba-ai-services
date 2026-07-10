@@ -51,7 +51,9 @@ app.add_middleware(
 async def require_internal_key(request: Request, call_next):
     if settings.internal_api_key and request.url.path not in _OPEN_PATHS:
         provided = request.headers.get("X-Internal-Api-Key", "")
-        if not hmac.compare_digest(provided, settings.internal_api_key):
+        # Compare bytes: compare_digest raises TypeError on non-ASCII str input,
+        # turning garbage headers into 500s instead of a clean 401.
+        if not hmac.compare_digest(provided.encode("utf-8"), settings.internal_api_key.encode("utf-8")):
             return JSONResponse(status_code=401, content={"detail": "unauthorized"})
     return await call_next(request)
 
@@ -158,13 +160,25 @@ def recommend_copurchase(req: RecommendRequest) -> RecommendationResult:
     return result
 
 
+_BATCH_BUDGET_S = 60.0
+
+
 @app.post("/recommend/batch")
 def recommend_batch(req: BatchRequest) -> dict:
     """Batch endpoint (maps to .NET RecommendationsBatchEndpoint). Per-customer errors
-    are isolated so one bad id doesn't fail the batch."""
+    are isolated so one bad id doesn't fail the batch. A wall-clock budget bounds the
+    request: uncached compute is 3-6s/client, so an unbounded 500-id batch would hold a
+    threadpool worker for tens of minutes; leftover ids are reported as errors instead."""
     results, errors = [], []
     as_of = req.as_of_date.isoformat() if req.as_of_date else None
-    for cid in req.customer_ids:
+    started = time.monotonic()
+    for index, cid in enumerate(req.customer_ids):
+        if time.monotonic() - started > _BATCH_BUDGET_S:
+            for rest in req.customer_ids[index:]:
+                errors.append({"customer_id": rest, "error": "batch_budget_exhausted"})
+            log.warning("recommend_batch_budget_exhausted", processed=index,
+                        total=len(req.customer_ids), budget_s=_BATCH_BUDGET_S)
+            break
         try:
             results.append(service.get_recommendations(
                 customer_id=cid, as_of_date=as_of, top_n=req.top_n,

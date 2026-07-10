@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     db_password: str = Field(default="", description="Set in .env; never hardcode")
     db_pool_size: int = 10
     db_max_overflow: int = 10
+    db_login_timeout_seconds: int = 5
+    db_query_timeout_seconds: int = 30
 
     redis_host: str = "127.0.0.1"
     redis_port: int = 6379
@@ -28,8 +30,9 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     # Shared secret the trusted gba-server proxy must present (X-Internal-Api-Key).
-    # Empty = open (dev only); set in every non-local deployment.
+    # Fail-closed: startup refuses without a key unless ALLOW_OPEN_INTERNAL_API=true (local only).
     internal_api_key: str = ""
+    allow_open_internal_api: bool = False
     cors_allow_origins: list[str] = Field(
         default_factory=lambda: [
             "http://localhost:8083",
@@ -84,6 +87,12 @@ class Settings(BaseSettings):
     w_stability: float = 0.12
     w_returns: float = 0.03
     w_abc: float = 0.22
+
+    def validate_runtime_configuration(self) -> None:
+        if not self.internal_api_key and not self.allow_open_internal_api:
+            raise RuntimeError(
+                "INTERNAL_API_KEY is required. Set ALLOW_OPEN_INTERNAL_API=true only for local/dev."
+            )
 
     @property
     def sqlalchemy_url(self) -> str:

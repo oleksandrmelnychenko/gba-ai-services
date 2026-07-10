@@ -26,6 +26,10 @@ def get_engine() -> Engine:
             max_overflow=s.db_max_overflow,
             pool_pre_ping=True,
             pool_recycle=3600,
+            pool_timeout=30,
+            # pymssql default timeout=0 waits forever — a stalled MSSQL would pin
+            # threadpool threads until the whole service froze (incl. /health).
+            connect_args={"timeout": 60, "login_timeout": 10},
             echo=False,
         )
     return _engine

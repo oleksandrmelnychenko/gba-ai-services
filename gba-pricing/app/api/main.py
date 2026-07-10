@@ -196,4 +196,16 @@ def price_batch(req: BatchPriceRequest) -> dict:
 
 @app.delete("/cache/{product}/{client_agreement_net_uid}")
 def clear_cache(product: str, client_agreement_net_uid: str) -> dict:
-    return {"deleted": cache.invalidate(product, client_agreement_net_uid)}
+    # Keys are stored under the numeric product ID; a NetUID here would silently
+    # match nothing and leave the stale price cached. Resolve it first.
+    resolved: int | str = product
+    if not product.isdigit():
+        try:
+            from app.data import pricing_repository as repo
+
+            row = repo.resolve_product(None, product)
+            if row:
+                resolved = row["id"]
+        except Exception as exc:  # noqa: BLE001
+            log.warning("cache_clear_resolve_failed", product=product, error=str(exc))
+    return {"deleted": cache.invalidate(resolved, client_agreement_net_uid)}
