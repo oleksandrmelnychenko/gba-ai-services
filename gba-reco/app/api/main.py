@@ -78,6 +78,11 @@ class RecommendRequest(BaseModel):
         "(Client.RegionID). Opt-in; off = identical to prior behaviour. Measured neutral on "
         "the offline eval (see docs/eval-baseline.md) — do not enable as a default.",
     )
+    product_ids: list[int] | None = Field(
+        default=None, max_length=50,
+        description="copurchase only: explicit co-occurrence seeds (per-cart-line cross-sell) "
+        "instead of the client's own purchase history",
+    )
 
 
 class BatchRequest(BaseModel):
@@ -138,7 +143,10 @@ def recommend_copurchase(req: RecommendRequest) -> RecommendationResult:
     """Item-item co-purchase recommender — the discovery source for cross-sell (faster than the
     v3.2 user-Jaccard and competitive in eval). Synthetic/ubiquitous lines already excluded."""
     as_of = req.as_of_date.isoformat() if req.as_of_date else time.strftime("%Y-%m-%d")
+    seeds = sorted(set(req.product_ids)) if req.product_ids else None
     key = cache.make_copurchase_key(req.customer_id, as_of, req.top_n)
+    if seeds:
+        key = f"{key}:s{','.join(map(str, seeds))}"
     if req.use_cache:
         cached = cache.get(key)
         if cached is not None:
@@ -150,7 +158,8 @@ def recommend_copurchase(req: RecommendRequest) -> RecommendationResult:
             ]
             return RecommendationResult(**cached)
     try:
-        result = copurchase.recommend(req.customer_id, as_of, top_n=req.top_n, include_owned=False)
+        result = copurchase.recommend(req.customer_id, as_of, top_n=req.top_n, include_owned=False,
+                                      seed_product_ids=seeds)
     except Exception as exc:  # noqa: BLE001
         error_id = uuid.uuid4().hex
         log.error("copurchase_failed", customer_id=req.customer_id, error_id=error_id, error=str(exc))

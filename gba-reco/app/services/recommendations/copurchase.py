@@ -120,14 +120,20 @@ def recommend(
     as_of_date: str,
     top_n: int = 25,
     include_owned: bool = True,
+    seed_product_ids: list[int] | None = None,
 ) -> RecommendationResult:
-    """Hybrid: repurchase (client's own freq) blended with co-purchase item-CF for discovery."""
+    """Hybrid: repurchase (client's own freq) blended with co-purchase item-CF for discovery.
+
+    With `seed_product_ids` the co-occurrence is seeded by those explicit products (the sale
+    wizard's per-cart-line cross-sell: «з ЦИМ товаром зазвичай беруть ще й це») instead of the
+    client's own purchase history — so it works even for clients with no valid sales yet."""
     from datetime import datetime
     started = datetime.now()
 
     excl = repo.ubiquitous_product_ids(get_settings().ubiquity_exclude_pct) | cache.get_negatives(customer_id)
     own = {p: f for p, f in _client_products_with_freq(customer_id, as_of_date).items() if p not in excl}
-    co = {p: s for p, s in _cooccurring_products(list(own.keys()), as_of_date).items() if p not in excl}
+    seeds = [p for p in seed_product_ids if p not in excl] if seed_product_ids else list(own.keys())
+    co = {p: s for p, s in _cooccurring_products(seeds, as_of_date).items() if p not in excl}
 
     # normalize each signal
     def _norm(d: dict[int, float]) -> dict[int, float]:
@@ -152,6 +158,10 @@ def recommend(
     if not include_owned:
         # discovery-only (new-to-client co-purchase items) — the cross-sell use case
         ranked = [item for item in ranked if item[1][1] == RecSource.DISCOVERY]
+    if seed_product_ids:
+        # never recommend the seed itself (it is already in the caller's cart)
+        seed_set = set(seed_product_ids)
+        ranked = [item for item in ranked if item[0] not in seed_set]
     ranked = ranked[:top_n]
     recs = [
         ProductRec(product_id=pid, score=round(score, 4), rank=i + 1,
