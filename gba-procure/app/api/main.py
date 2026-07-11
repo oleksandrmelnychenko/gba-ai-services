@@ -31,11 +31,25 @@ settings = get_settings()
 _OPEN_PATHS = {"/health"}
 
 
+def _warm_cart_on_startup() -> None:
+    """Warm the canonical cart plan in the background so an API restart self-heals:
+    the full all-producer build is ~70s cold and would 503 the first /plan/cart
+    (past the gba-server proxy timeout). The scheduler warms it daily; this closes
+    the gap on every API (re)start without blocking boot."""
+    try:
+        from app.services.replenishment import worker
+        stats = worker.warm_cart()
+        log.info("cart_warm_on_startup_done", **stats)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("cart_warm_on_startup_failed", error=str(exc))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     get_engine()
     if not settings.internal_api_key:
         log.warning("internal_api_key_not_set", note="gba-procure running OPEN — set INTERNAL_API_KEY")
+    threading.Thread(target=_warm_cart_on_startup, daemon=True, name="cart-warm").start()
     log.info("service_starting", service="gba-procure")
     yield
     dispose()
