@@ -135,6 +135,8 @@ def _suggest_one(
         suggested_qty=round(suggested_qty, 2),
         reorder_point=round(reorder_point, 2),
         safety_stock=round(safety_stock, 2),
+        lead_demand=round(lead_demand, 2),
+        order_up_to=round(order_up_to, 2),
         days_of_cover=round(days_of_cover, 1) if days_of_cover != float("inf") else 99999.0,
         urgency=urgency, forecast=forecast, inventory=inv, reason=reason,
     )
@@ -288,6 +290,10 @@ def build_plan(producer_id: int, as_of: str, only_needed: bool = True,
     items.sort(key=lambda x: (_URGENCY_ORDER[x.urgency], -x.suggested_qty))
 
     resolved_name = repo.producer_name(producer_id) if producer_name is _UNSET else producer_name
+    # Stamp producer_name onto every line so the warehouse lens (cart plan spanning all
+    # producers) can group by producer without a second lookup.
+    for it in items:
+        it.producer_name = resolved_name
     return ProducerPurchasePlan(
         producer_id=producer_id,
         producer_name=resolved_name,

@@ -39,9 +39,14 @@ class CheaperAlt(BaseModel):
 class ReorderSuggestion(BaseModel):
     product_id: int
     producer_id: int
+    producer_name: str | None = None
     suggested_qty: float
     reorder_point: float
     safety_stock: float
+    # Explicit proof components so the console can render the full breakdown:
+    #   lead_demand + safety_stock = reorder_point ; order_up_to − position = suggested_qty.
+    lead_demand: float | None = None
+    order_up_to: float | None = None
     days_of_cover: float = Field(description="Days current position lasts at forecast demand")
     urgency: Urgency
     forecast: DemandForecast
