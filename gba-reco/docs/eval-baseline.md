@@ -190,3 +190,25 @@ wired so the existing toggle is no longer dead, but it must remain opt-in and ga
 sign-off, since it is at best neutral on the current eval and removes cross-region discovery signal.
 The implementation is left behind an opt-in flag (default off) so it is a no-op unless explicitly
 requested.
+
+## 2026-07-11 — clean-catalog re-baseline + learned-ranking experiments
+
+After the catalog canon remap (order history re-pointed from dead product
+generations onto live rows) the SAME V3.2 on the full case population scores
+**hit@10 0.368 / MRR 0.279 (n=435)** — up from 0.247 on the broken catalog.
+The data cure alone was worth more than any model change below.
+
+| experiment | hit@10 | MRR | verdict |
+|---|---|---|---|
+| v3.2 (clean data, n=435) | 0.368 | 0.279 | champion |
+| v3.2 + logreg reranker (n=435) | 0.354 | 0.278 | ✗ do not ship |
+| ALS fold @2026-06-01 (n=215) | 0.042 | 0.029 | ✗ loses to global_popular |
+
+ALS: the dev matrix is too sparse (84% cold-start) for factorization — revisit
+on prod-scale data. Reranker (app/services/recommendations/reranker.py, numpy
+logreg over 7 point-in-time features, trained on second-to-last-order holdout,
+47,315 rows / 638 positives): learned weights essentially re-derive the V3.2
+blend (recency +0.98, inv_rank +0.43, score +0.24, pop +0.23; raw bought-count
+NEGATIVE −0.26 once recency is controlled) — the hand-tuned ordering is already
+near-optimal for these features. Keep as an offline tool; retrain when cockpit
+sold/dismissed feedback accumulates enough positives.
