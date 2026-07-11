@@ -139,7 +139,10 @@ def plan_cart(req: CartPlanRequest) -> CartReplenishmentPlan:
     try:
         as_of = req.as_of_date.isoformat() if req.as_of_date else _today()
         limit = req.limit if req.limit is not None else 200
-        budget = req.budget_eur
+        # budget <= 0 means "no budget limit" (the warehouse lens sends 0) — treat it as
+        # canonical so it hits the scheduler-warmed key instead of a cold per-request build
+        # (the full all-producer plan is ~70s cold, past the gba-server 60s proxy timeout).
+        budget = req.budget_eur if req.budget_eur and req.budget_eur > 0 else None
         # Canonical = exactly what the scheduler warms (only_needed=True, no budget/window).
         # Variants carry every plan-shaping parameter in the key (a shared key once served
         # the wrong only_needed plan for 8 days) and live 1h so the slider can't grow Redis.
