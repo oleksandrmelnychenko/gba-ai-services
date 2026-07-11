@@ -17,10 +17,11 @@ from app.core.metrics import METRICS
 
 log = get_logger("cache")
 
+# v5: ReorderSuggestion gained product meta (name/oe/image);
 # v4: ReorderSuggestion gained proof fields (lead_demand/order_up_to/producer_name);
 # v3: /plan/cart keys became only_needed-aware (a shared v2 key could hold either
 # variant's plan for 8 days) — the bump kills all stale entries; scheduler re-warms.
-_VER = "v4"
+_VER = "v5"
 _RETRY_COOLDOWN_S = 30.0
 _client: redis.Redis | None = None
 _unavailable_until = 0.0

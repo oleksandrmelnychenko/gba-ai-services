@@ -292,8 +292,16 @@ def build_plan(producer_id: int, as_of: str, only_needed: bool = True,
     resolved_name = repo.producer_name(producer_id) if producer_name is _UNSET else producer_name
     # Stamp producer_name onto every line so the warehouse lens (cart plan spanning all
     # producers) can group by producer without a second lookup.
+    # Product meta (name / OE number / photo) so the console renders a readable товар.
+    meta = repo.product_meta([it.product_id for it in items]) if items else {}
     for it in items:
         it.producer_name = resolved_name
+        m = meta.get(it.product_id)
+        if m:
+            it.product_name = m["name"]
+            it.vendor_code = m["vendor_code"]
+            it.oe_number = m["oe_number"]
+            it.image_url = m["image_url"]
     return ProducerPurchasePlan(
         producer_id=producer_id,
         producer_name=resolved_name,

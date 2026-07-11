@@ -152,6 +152,42 @@ def producer_names(producer_ids: list[int]) -> dict[int, str]:
     return {int(r["pid"]): r["name"] for r in rows if r["name"]}
 
 
+def product_meta(product_ids: list[int]) -> dict[int, dict]:
+    """{product_id: {name, vendor_code, oe_number, image_url}} for the plan rows — so the
+    console shows a readable товар (name + original number + photo) instead of a bare id.
+    Chunked; primary image is the first non-deleted ProductImage."""
+    meta: dict[int, dict] = {}
+    for i in range(0, len(product_ids), 1000):
+        chunk = product_ids[i:i + 1000]
+        if not chunk:
+            continue
+        ph, params = in_clause("p", chunk)
+        rows = query(
+            f"""
+            SELECT p.ID AS pid,
+                   name = CASE WHEN p.NameUA IS NULL OR p.NameUA = '' THEN p.Name ELSE p.NameUA END,
+                   vendor_code = p.VendorCode,
+                   oe_number = p.MainOriginalNumber,
+                   image_url = (
+                       SELECT TOP 1 pi.ImageUrl FROM dbo.ProductImage pi
+                       WHERE pi.ProductID = p.ID AND pi.Deleted = 0 AND pi.ImageUrl IS NOT NULL
+                       ORDER BY pi.ID
+                   )
+            FROM dbo.Product p
+            WHERE p.ID IN {ph}
+            """,
+            params,
+        )
+        for r in rows:
+            meta[int(r["pid"])] = {
+                "name": r["name"] or None,
+                "vendor_code": r["vendor_code"] or None,
+                "oe_number": r["oe_number"] or None,
+                "image_url": r["image_url"] or None,
+            }
+    return meta
+
+
 def products_for_producer(producer_id: int, as_of: str, history_days: int) -> list[int]:
     """Products this producer has supplied (candidates for replenishment)."""
     rows = query(

@@ -38,6 +38,10 @@ class CheaperAlt(BaseModel):
 
 class ReorderSuggestion(BaseModel):
     product_id: int
+    product_name: str | None = None
+    vendor_code: str | None = None
+    oe_number: str | None = None
+    image_url: str | None = None
     producer_id: int
     producer_name: str | None = None
     suggested_qty: float
