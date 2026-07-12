@@ -231,6 +231,38 @@ def monthly_units(as_of: str, months: int,
     )
 
 
+def monthly_product_sales(product_id: int, window_start: str, as_of: str) -> list[dict]:
+    """Calendar-month actual sales for one product over ``[window_start, as_of)``.
+
+    This intentionally repeats the canonical sales-spine rules used by the portfolio signals:
+    ``Order.Created`` is the business date, ``IsValidForCurrentSale`` selects the live line, and
+    ``OrderItem.PricePerItem`` is already EUR. The caller owns the dense month grid because SQL only
+    returns months with sales.
+    """
+    return query(
+        """
+        SELECT CONVERT(char(7), o.Created, 126) AS ym,
+               SUM(oi.Qty) AS units,
+               COUNT(DISTINCT o.ID) AS order_count,
+               SUM(oi.Qty * oi.PricePerItem) AS revenue_eur,
+               SUM(oi.Qty * oi.PricePerItem) / NULLIF(SUM(oi.Qty), 0) AS avg_price_eur
+        FROM dbo.OrderItem oi
+        JOIN dbo.[Order] o ON o.ID = oi.OrderID
+        WHERE oi.IsValidForCurrentSale = 1
+              AND oi.ProductID = :product_id AND oi.ProductID <> :synth
+              AND o.Created >= :window_start AND o.Created < :asof
+        GROUP BY CONVERT(char(7), o.Created, 126)
+        ORDER BY ym
+        """,
+        {
+            "product_id": int(product_id),
+            "window_start": window_start,
+            "asof": as_of,
+            "synth": _SYNTHETIC_PRODUCT_ID,
+        },
+    )
+
+
 def regional_product_sales(as_of: str, window_days: int, product_ids: Sequence[int] | None = None,
                            region_id: int | None = None) -> list[dict]:
     """Per-product regional demand over the window.

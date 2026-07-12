@@ -140,3 +140,18 @@ def test_regional_demand_uses_client_region_id_not_region_code():
     assert "oi.IsValidForCurrentSale = 1" in body
     assert "o.Created" in body
     assert "oi.ProductID <> :synth" in body
+
+
+def test_product_monthly_analytics_uses_canonical_sales_spine_and_actual_eur_revenue():
+    start = _SRC.index("def monthly_product_sales")
+    end = _SRC.index("\ndef ", start)
+    body = _SRC[start:end]
+
+    assert "oi.IsValidForCurrentSale = 1" in body
+    assert "o.Created >= :window_start AND o.Created < :asof" in body
+    assert "oi.ProductID = :product_id" in body
+    assert "oi.ProductID <> :synth" in body
+    assert "COUNT(DISTINCT o.ID) AS order_count" in body
+    assert "SUM(oi.Qty * oi.PricePerItem) AS revenue_eur" in body
+    assert "SUM(oi.Qty * oi.PricePerItem) / NULLIF(SUM(oi.Qty), 0) AS avg_price_eur" in body
+    assert "GetExchangedToEuroValue" not in body

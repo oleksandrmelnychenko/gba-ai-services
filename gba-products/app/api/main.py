@@ -6,8 +6,9 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime
+from typing import Annotated
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -17,8 +18,8 @@ from app.core.metrics import METRICS
 from app.data import cache
 from app.data import signals_repository as sig
 from app.data.db import dispose, get_engine
-from app.domain.models import AbcClass, InventoryBand, LifecycleStage, XyzClass
-from app.services import margin_returns, portfolio, stock_health, substitution
+from app.domain.models import AbcClass, InventoryBand, LifecycleStage, ProductAnalyticsResponse, XyzClass
+from app.services import margin_returns, portfolio, product_analytics, stock_health, substitution
 
 log = get_logger("api")
 settings = get_settings()
@@ -310,22 +311,66 @@ def assortment_regions(as_of_date: date | None = None, window_days: int | None =
         raise HTTPException(status_code=500, detail="assortment_regions_failed") from exc
 
 
+def _product_snapshot(build: dict, product_id: int) -> dict:
+    """Existing product-profile fields without the top-level as-of wrapper."""
+    row = next((r for r in build["rows"] if int(r["product_id"]) == product_id), None)
+    meta = sig.product_meta([product_id]).get(product_id, {})
+    snapshot = {"product_id": product_id, "found": row is not None}
+    if row is not None:
+        snapshot.update(row)
+    snapshot.update(meta)
+    snapshot["product_id"] = product_id
+    return snapshot
+
+
 @app.get("/product/{product_id}")
 def product_profile(product_id: int, as_of_date: date | None = None) -> dict:
     """Full per-SKU 360 profile (the product card). Internal-key gated."""
     started = time.time()
     as_of = _resolve_as_of(as_of_date)
     try:
-        row = next((r for r in _portfolio(as_of)["rows"] if r["product_id"] == product_id), None)
-        meta = sig.product_meta([product_id]).get(product_id, {})
+        snapshot = _product_snapshot(_portfolio(as_of), product_id)
         METRICS.record_request((time.time() - started) * 1000)
-        if row is None:
-            return {"product_id": product_id, "as_of": as_of, "found": False, **meta}
-        return {"as_of": as_of, "found": True, **{**row, **meta}}
+        return {"as_of": as_of, **snapshot}
     except Exception as exc:  # noqa: BLE001
         METRICS.record_request((time.time() - started) * 1000, error=True)
         log.error("product_profile_failed", product_id=product_id, error=str(exc))
         raise HTTPException(status_code=500, detail="product_profile_failed") from exc
+
+
+@app.get("/product/{product_id}/analytics", response_model=ProductAnalyticsResponse)
+def product_sales_analytics(
+    product_id: int,
+    as_of_date: date | None = None,
+    months: Annotated[int, Query(ge=1, le=24)] = 12,
+) -> ProductAnalyticsResponse:
+    """Current product snapshot plus dense actual monthly sales. Internal-key gated.
+
+    The sales window ends at ``as_of`` exclusively, matching the other service signals. Stock fields
+    come from the current/non-historical portfolio snapshot (which may be cached); the response
+    explicitly discloses that no stock history exists.
+    """
+    started = time.time()
+    as_of = _resolve_as_of(as_of_date)
+    try:
+        build = _portfolio(as_of)
+        snapshot = _product_snapshot(build, product_id)
+        window_start = product_analytics.sales_window_start(as_of, months)
+        monthly_rows = sig.monthly_product_sales(product_id, window_start, as_of)
+        response = product_analytics.build_product_analytics(
+            product_id=product_id,
+            as_of=as_of,
+            months=months,
+            model_version=str(build["model_version"]),
+            snapshot=snapshot,
+            monthly_rows=monthly_rows,
+        )
+        METRICS.record_request((time.time() - started) * 1000)
+        return response
+    except Exception as exc:  # noqa: BLE001
+        METRICS.record_request((time.time() - started) * 1000, error=True)
+        log.error("product_analytics_failed", product_id=product_id, error=str(exc))
+        raise HTTPException(status_code=500, detail="product_analytics_failed") from exc
 
 
 @app.get("/product/{product_id}/regions")
