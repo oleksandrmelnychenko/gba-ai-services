@@ -17,9 +17,7 @@ from pydantic import BaseModel, Field
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.core.metrics import METRICS
-from app.data import cache
-from app.data import feedback
-from app.data import masters
+from app.data import cache, feedback, masters
 from app.data.db import dispose, get_engine
 from app.domain.models import CartReplenishmentPlan, PlanCharts, ProducerPurchasePlan
 from app.services.replenishment import policy
@@ -38,7 +36,15 @@ def _warm_cart_on_startup() -> None:
     the gap on every API (re)start without blocking boot."""
     try:
         from app.services.replenishment import worker
-        stats = worker.warm_cart()
+
+        as_of = _today()
+        key = cache.make_key("cart", worker.CART_LIMIT, as_of)
+        with _CART_BUILD_LOCK:
+            cached = cache.get(key)
+            if cached is not None:
+                log.info("cart_warm_on_startup_skipped", key=key, reason="already_cached")
+                return
+            stats = worker.warm_cart(as_of=as_of, cart_limit=worker.CART_LIMIT)
         log.info("cart_warm_on_startup_done", **stats)
     except Exception as exc:  # noqa: BLE001
         log.warning("cart_warm_on_startup_failed", error=str(exc))

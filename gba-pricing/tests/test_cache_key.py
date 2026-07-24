@@ -20,3 +20,9 @@ def test_make_key_stable_for_same_params():
     a = cache.make_key(7, "ca-uid", "2026-06-15", 12.0, True, "uk")
     b = cache.make_key(7, "ca-uid", "2026-06-15", 12.0, True, "uk")
     assert a == b
+
+
+def test_make_key_normalizes_agreement_uid_case():
+    lower = cache.make_key(7, "ca-uid", "2026-06-15", 12.0, True, "uk")
+    upper = cache.make_key(7, "CA-UID", "2026-06-15", 12.0, True, "uk")
+    assert lower == upper

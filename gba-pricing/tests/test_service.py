@@ -31,6 +31,10 @@ def _wire_repo(monkeypatch, **over):
     monkeypatch.setattr(service.repo, "peer_band", lambda *a, **k: over.get(
         "peer", {"p25": 17.0, "p50": 18.5, "p75": 19.5, "n": 12}))
     monkeypatch.setattr(service.repo, "product_group_id", lambda *a, **k: over.get("pg_id", 106))
+    monkeypatch.setattr(service.repo, "active_group_discount", lambda *a, **k: over.get(
+        "group_discount", 0.0))
+    monkeypatch.setattr(service.repo, "is_promotional", lambda *a, **k: over.get(
+        "is_promotional", False))
     monkeypatch.setattr(service.repo, "segment_discount_distribution", lambda *a, **k: over.get(
         "segment", {"p75": 12.0, "p90": 18.0, "n": 40}))
 

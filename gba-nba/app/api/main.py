@@ -300,21 +300,20 @@ _debt_dash_compute_lock = threading.Lock()
 
 
 def _debt_dashboards_cached(as_of: str, *, allow_stale: bool = True) -> dict[int, dict]:
-    """Stale-while-revalidate: requests are served whatever is cached (the background
-    warmer refreshes every ~9 min) and NEVER wait out the ~44-70s recompute — a request
-    that lands mid-refresh must not block on it. Inline compute happens only when the
-    cache is completely empty (first seconds after boot)."""
+    """Stale-while-revalidate: requests use cached data for the same as_of (the
+    background warmer refreshes every ~9 min) and NEVER wait out the ~44-70s
+    recompute. Inline compute happens only when that as_of has no cached value."""
     with _debt_dash_lock:
-        fresh = (
-            _debt_dash_state["as_of"] == as_of
-            and time.monotonic() - _debt_dash_state["at"] < _DEBT_DASH_TTL_S
-        )
+        same_as_of = _debt_dash_state["as_of"] == as_of
+        fresh = same_as_of and time.monotonic() - _debt_dash_state["at"] < _DEBT_DASH_TTL_S
         values = _debt_dash_state["values"]
-        if fresh or (allow_stale and values):
+        if fresh or (allow_stale and same_as_of and values):
             return values
     with _debt_dash_compute_lock:
         with _debt_dash_lock:
-            if _debt_dash_state["values"] and allow_stale:
+            same_as_of = _debt_dash_state["as_of"] == as_of
+            fresh = same_as_of and time.monotonic() - _debt_dash_state["at"] < _DEBT_DASH_TTL_S
+            if _debt_dash_state["values"] and (fresh or (allow_stale and same_as_of)):
                 return _debt_dash_state["values"]
         computed = signals_repository.debt_dashboards_for_all_managers(as_of)
         with _debt_dash_lock:

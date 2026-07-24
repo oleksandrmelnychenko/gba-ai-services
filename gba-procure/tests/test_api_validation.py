@@ -43,3 +43,17 @@ def test_charts_malformed_date_422():
     r = client.post("/plan/charts", headers=_HEADERS,
                     json={"as_of_date": "2026-13-99"})
     assert r.status_code == 422
+
+
+def test_startup_cart_warmer_skips_an_existing_canonical_plan(monkeypatch):
+    from app.api import main
+    from app.services.replenishment import worker
+
+    monkeypatch.setattr(main, "_today", lambda: "2026-06-15")
+    monkeypatch.setattr(main.cache, "get", lambda key: {"item_count": 3})
+    calls = []
+    monkeypatch.setattr(worker, "warm_cart", lambda **kwargs: calls.append(kwargs))
+
+    main._warm_cart_on_startup()
+
+    assert calls == []

@@ -5,6 +5,7 @@ EUR-correct debt aggregation (value_at_risk + aging buckets) the manager DTO is 
 """
 from __future__ import annotations
 
+import time
 from datetime import UTC, datetime, timedelta
 
 import mongomock
@@ -148,6 +149,27 @@ def test_manager_dashboard_iso_as_of_date_ok(client):
                       params={"manager_net_uid": MGR_UID, "as_of_date": "2026-06-15"})
     assert resp.status_code == 200
     assert resp.json()["as_of"] == "2026-06-15"
+
+
+def test_debt_dashboard_cache_never_reuses_another_as_of(monkeypatch):
+    from app.api import main
+
+    cached = {1: {"value_at_risk_eur": 10.0, "debt_aging": []}}
+    expected = {1: {"value_at_risk_eur": 20.0, "debt_aging": []}}
+    monkeypatch.setattr(main, "_debt_dash_state", {
+        "at": time.monotonic(),
+        "as_of": "2026-06-15",
+        "values": cached,
+    })
+    calls = []
+    monkeypatch.setattr(
+        main.signals_repository,
+        "debt_dashboards_for_all_managers",
+        lambda as_of: calls.append(as_of) or expected,
+    )
+
+    assert main._debt_dashboards_cached("2026-06-16") == expected
+    assert calls == ["2026-06-16"]
 
 
 # ---------------- head dashboard ----------------
