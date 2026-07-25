@@ -249,6 +249,16 @@ def test_health_is_healthy_with_matching_evaluated_zero_cart(monkeypatch):
     assert result["business_ready"] is True
     assert result["business_reason"] is None
     assert result["canonical_cart_items"] == 0
+    assert result["source_history_start"] == "2025-01-01"
+    assert result["source_history_contract_ready"] is True
+    assert (
+        result["source_readiness"]["source_history_start"]
+        == result["source_history_start"]
+    )
+
+    response = client.get("/ready", headers=_HEADERS)
+    assert response.status_code == 200
+    assert response.json()["status"] == "ready"
 
 
 def test_current_cart_returns_503_before_build_when_source_is_not_ready(monkeypatch):

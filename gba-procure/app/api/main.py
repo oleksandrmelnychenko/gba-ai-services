@@ -24,6 +24,7 @@ from app.services.replenishment import policy, worker
 
 log = get_logger("api")
 settings = get_settings()
+_EXPECTED_SOURCE_HISTORY_START = "2025-01-01"
 
 # Routes reachable without the internal key (operational endpoints).
 _OPEN_PATHS = {"/health"}
@@ -196,6 +197,19 @@ def health() -> dict:
         ) = (
             _canonical_cart_readiness(_today())
         )
+    source_history_start = settings.source_history_start_date.isoformat()
+    source_history_contract_ready = (
+        source_history_start == _EXPECTED_SOURCE_HISTORY_START
+    )
+    source_readiness = {
+        **(source_readiness or {}),
+        "source_history_start": source_history_start,
+    }
+    if not source_history_contract_ready:
+        source_readiness["ready"] = False
+        source_readiness["reason"] = "source_history_start_mismatch"
+        business_ready = False
+        business_reason = "source_history_start_mismatch"
     return {
         "status": "healthy" if db_ok and redis_ok and business_ready else "degraded",
         "db_connected": db_ok,
@@ -204,9 +218,21 @@ def health() -> dict:
         "business_reason": business_reason or None,
         "canonical_cart_items": canonical_cart_items,
         "source_readiness": source_readiness,
+        "source_history_start": source_history_start,
+        "source_history_contract_ready": source_history_contract_ready,
         "version": "0.1.0",
         "model_version": "procure-hist120-v1",
     }
+
+
+@app.get("/ready")
+def ready() -> JSONResponse:
+    snapshot = health()
+    is_ready = snapshot["status"] == "healthy"
+    return JSONResponse(
+        status_code=200 if is_ready else 503,
+        content={**snapshot, "status": "ready" if is_ready else "not_ready"},
+    )
 
 
 @app.get("/metrics")

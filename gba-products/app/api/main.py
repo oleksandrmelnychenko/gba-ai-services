@@ -30,6 +30,7 @@ from app.services import margin_returns, portfolio, product_analytics, stock_hea
 
 log = get_logger("api")
 settings = get_settings()
+_EXPECTED_SOURCE_HISTORY_START = "2025-01-01"
 
 _OPEN_PATHS = {"/health"}
 
@@ -115,6 +116,19 @@ def _service_health() -> dict:
         except Exception as exc:  # noqa: BLE001
             business_reason = "stock_readiness_unavailable"
             log.warning("stock_readiness_failed", error=str(exc))
+    source_history_start = settings.source_history_start_date.isoformat()
+    source_history_contract_ready = (
+        source_history_start == _EXPECTED_SOURCE_HISTORY_START
+    )
+    source_readiness = {
+        **(source_readiness or {}),
+        "source_history_start": source_history_start,
+    }
+    if not source_history_contract_ready:
+        source_readiness["ready"] = False
+        source_readiness["reason"] = "source_history_start_mismatch"
+        business_ready = False
+        business_reason = "source_history_start_mismatch"
     is_healthy = db_ok and cache_ok and business_ready
     return {
         "status": "healthy" if is_healthy else "degraded",
@@ -123,6 +137,8 @@ def _service_health() -> dict:
         "business_ready": business_ready,
         "business_reason": business_reason,
         "stock_source_readiness": source_readiness,
+        "source_history_start": source_history_start,
+        "source_history_contract_ready": source_history_contract_ready,
         "version": "0.1.0",
         "model_version": settings.model_version,
     }

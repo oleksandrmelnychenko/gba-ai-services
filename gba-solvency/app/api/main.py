@@ -31,6 +31,7 @@ from app.domain.models import (
 
 settings = get_settings()
 log = get_logger("api")
+_EXPECTED_SOURCE_HISTORY_START = "2025-01-01"
 
 # Routes reachable without the internal key (operational endpoints).
 _OPEN_PATHS = {"/health", "/ready"}
@@ -184,6 +185,17 @@ def _health_snapshot() -> dict:
                 "business_ready": False,
                 "reasons": ["source_query_failed"],
             }
+    source_history_start = settings.source_history_start_date.isoformat()
+    source_history_contract_ready = (
+        source_history_start == _EXPECTED_SOURCE_HISTORY_START
+    )
+    source = {**source, "source_history_start": source_history_start}
+    if not source_history_contract_ready:
+        source["business_ready"] = False
+        source["reasons"] = [
+            *list(source.get("reasons") or []),
+            "source_history_start_mismatch",
+        ]
     business_ready = source.get("business_ready") is True
     healthy = (
         db_ok
@@ -199,6 +211,8 @@ def _health_snapshot() -> dict:
         "redis_connected": redis_ok,
         "synthetic_drift_ok": synthetic_drift_ok,
         "source": source,
+        "source_history_start": source_history_start,
+        "source_history_contract_ready": source_history_contract_ready,
         "model_drift": drift,
         "version": "0.1.0",
         "model_version": settings.model_version,

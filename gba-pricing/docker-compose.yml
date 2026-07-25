@@ -20,6 +20,7 @@ services:
     environment:
       REDIS_HOST: redis
       REDIS_DB: 3
+      SOURCE_HISTORY_START_DATE: "${SOURCE_HISTORY_START_DATE:-2025-01-01}"
     ports: ["8004:8004"]
     depends_on:
       redis:

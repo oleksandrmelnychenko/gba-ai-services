@@ -1,6 +1,7 @@
 """Settings — env-only, no secrets in code."""
 from __future__ import annotations
 
+from datetime import date
 from functools import lru_cache
 
 from pydantic import Field
@@ -9,6 +10,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    # Shared AI-fleet source contract. All business history is tracked from this date.
+    source_history_start_date: date = date(2025, 1, 1)
 
     # MongoDB (task state)
     mongo_uri: str = Field(default="mongodb://127.0.0.1:27017", description="Set in .env")

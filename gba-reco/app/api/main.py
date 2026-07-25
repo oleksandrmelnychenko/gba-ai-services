@@ -24,6 +24,7 @@ from app.services.recommendations import copurchase, service
 
 settings = get_settings()
 log = get_logger("api")
+_EXPECTED_SOURCE_HISTORY_START = "2025-01-01"
 
 _COPURCHASE_TTL = 24 * 3600
 
@@ -144,12 +145,24 @@ def health() -> dict:
         except Exception as exc:  # noqa: BLE001
             log.error("source_readiness_failed", error=str(exc))
             source["reasons"] = ["source_readiness_failed"]
+    source_history_start = settings.source_history_start_date.isoformat()
+    source_history_contract_ready = (
+        source_history_start == _EXPECTED_SOURCE_HISTORY_START
+    )
+    source = {**source, "source_history_start": source_history_start}
+    if not source_history_contract_ready:
+        source["business_ready"] = False
+        source["reasons"] = [
+            *list(source.get("reasons") or []),
+            "source_history_start_mismatch",
+        ]
     healthy = db_ok and redis_ok and bool(source["business_ready"])
     return {
         "status": "healthy" if healthy else "degraded",
         "db_connected": db_ok,
         "redis_connected": redis_ok,
         **source,
+        "source_history_contract_ready": source_history_contract_ready,
         "version": "0.1.0",
         "model_version": cache._MODEL_VERSION,
     }

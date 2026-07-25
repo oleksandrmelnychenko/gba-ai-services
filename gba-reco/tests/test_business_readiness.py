@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import date
+
 from fastapi.testclient import TestClient
 
 from app.api import main
@@ -48,6 +50,8 @@ def test_health_is_not_green_without_business_sources(monkeypatch):
     assert response.status_code == 200
     assert response.json()["status"] == "degraded"
     assert response.json()["business_ready"] is False
+    assert response.json()["source_history_start"] == "2025-01-01"
+    assert response.json()["source_history_contract_ready"] is True
 
 
 def test_ready_returns_503_when_cache_is_unavailable(monkeypatch):
@@ -66,6 +70,42 @@ def test_ready_returns_503_when_cache_is_unavailable(monkeypatch):
 
     assert response.status_code == 503
     assert response.json()["status"] == "not_ready"
+
+
+def test_source_history_mismatch_fails_closed(monkeypatch):
+    class _Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def exec_driver_sql(self, sql):
+            return 1
+
+    monkeypatch.setattr(
+        main,
+        "get_engine",
+        lambda: type("_Engine", (), {"connect": lambda self: _Connection()})(),
+    )
+    monkeypatch.setattr(main.cache, "health", lambda: True)
+    monkeypatch.setattr(
+        main.repo,
+        "source_readiness",
+        lambda _max_lag: {"business_ready": True, "reasons": []},
+    )
+    monkeypatch.setattr(
+        main.settings,
+        "source_history_start_date",
+        date(2025, 2, 1),
+    )
+
+    payload = main.health()
+
+    assert payload["status"] == "degraded"
+    assert payload["business_ready"] is False
+    assert payload["source_history_contract_ready"] is False
+    assert "source_history_start_mismatch" in payload["reasons"]
 
 
 def test_recommend_returns_404_for_unknown_customer(monkeypatch):

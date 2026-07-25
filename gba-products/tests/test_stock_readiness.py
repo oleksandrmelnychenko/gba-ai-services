@@ -100,3 +100,9 @@ def test_health_is_green_only_with_db_cache_and_business_inventory(monkeypatch):
     assert health["status"] == "healthy"
     assert health["business_ready"] is True
     assert health["business_reason"] is None
+    assert health["source_history_start"] == "2025-01-01"
+    assert health["source_history_contract_ready"] is True
+    assert (
+        health["stock_source_readiness"]["source_history_start"]
+        == health["source_history_start"]
+    )

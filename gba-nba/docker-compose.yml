@@ -19,6 +19,7 @@ services:
     env_file: [.env]
     environment:
       MONGO_URI: mongodb://mongo:27017
+      SOURCE_HISTORY_START_DATE: "${SOURCE_HISTORY_START_DATE:-2025-01-01}"
     ports: ["8002:8002"]
     depends_on:
       mongo:
@@ -33,6 +34,7 @@ services:
     env_file: [.env]
     environment:
       MONGO_URI: mongodb://mongo:27017
+      SOURCE_HISTORY_START_DATE: "${SOURCE_HISTORY_START_DATE:-2025-01-01}"
     command: ["python", "-m", "app.services.scheduler"]
     depends_on:
       mongo:

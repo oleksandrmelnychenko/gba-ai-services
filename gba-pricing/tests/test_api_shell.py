@@ -91,6 +91,9 @@ def test_ready_requires_database_cache_and_business_source(monkeypatch):
     response = TestClient(main.app).get("/ready")
     assert response.status_code == 200
     assert response.json()["status"] == "ready"
+    assert response.json()["source_history_start"] == "2025-01-01"
+    assert response.json()["source_history_contract_ready"] is True
+    assert response.json()["source"]["source_history_start"] == "2025-01-01"
 
 
 class _ConnectionContext:

@@ -26,6 +26,7 @@ from app.services import forecast as fc
 
 log = get_logger("api")
 settings = get_settings()
+_EXPECTED_SOURCE_HISTORY_START = "2025-01-01"
 KYIV = ZoneInfo("Europe/Kyiv")
 
 _OPEN_PATHS = {"/health"}
@@ -108,6 +109,14 @@ def _health_snapshot(now: datetime | None = None) -> dict[str, Any]:
     _, db_ok = _database_health()
     cache_ok = cache.health()
     data = _sales_data_health(now) if db_ok else _empty_sales_data_health("database_unavailable")
+    source_history_start = settings.source_history_start_date.isoformat()
+    source_history_contract_ready = (
+        source_history_start == _EXPECTED_SOURCE_HISTORY_START
+    )
+    data = {**data, "source_history_start": source_history_start}
+    if not source_history_contract_ready:
+        data["source_ready"] = False
+        data["reason"] = "source_history_start_mismatch"
     business_ready = bool(data["source_ready"])
     service_healthy = db_ok and cache_ok and business_ready
     return {
@@ -115,6 +124,8 @@ def _health_snapshot(now: datetime | None = None) -> dict[str, Any]:
         "business_ready": business_ready,
         "db_connected": db_ok,
         "cache_connected": cache_ok,
+        "source_history_start": source_history_start,
+        "source_history_contract_ready": source_history_contract_ready,
         "version": "0.1.0",
         "model_version": settings.model_version,
         "data": data,

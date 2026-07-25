@@ -19,6 +19,7 @@ services:
     env_file: [.env]
     environment:
       REDIS_HOST: redis
+      SOURCE_HISTORY_START_DATE: "${SOURCE_HISTORY_START_DATE:-2025-01-01}"
     ports: ["8000:8000"]
     depends_on:
       redis:
@@ -31,6 +32,7 @@ services:
     env_file: [.env]
     environment:
       REDIS_HOST: redis
+      SOURCE_HISTORY_START_DATE: "${SOURCE_HISTORY_START_DATE:-2025-01-01}"
     depends_on:
       redis:
         condition: service_healthy

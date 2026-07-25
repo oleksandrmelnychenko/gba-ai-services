@@ -52,3 +52,6 @@ def test_ready_is_200_only_for_complete_business_readiness(monkeypatch):
     response = TestClient(main.app).get("/ready")
     assert response.status_code == 200
     assert response.json()["status"] == "ready"
+    assert response.json()["source_history_start"] == "2025-01-01"
+    assert response.json()["source_history_contract_ready"] is True
+    assert response.json()["source"]["source_history_start"] == "2025-01-01"

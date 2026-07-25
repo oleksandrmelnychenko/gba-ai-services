@@ -317,6 +317,9 @@ def test_health_is_green_only_with_fresh_canonical_business_data(monkeypatch):
     assert healthy["business_ready"] is True
     assert healthy["data"]["source_ready"] is True
     assert healthy["data"]["source_fresh"] is True
+    assert healthy["source_history_start"] == "2025-01-01"
+    assert healthy["source_history_contract_ready"] is True
+    assert healthy["data"]["source_history_start"] == "2025-01-01"
 
     source["latest_sale_at"] = now - timedelta(hours=main.settings.source_max_age_hours + 1)
     stale = main._health_snapshot(now)
