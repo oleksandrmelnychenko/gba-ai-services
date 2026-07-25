@@ -137,7 +137,7 @@ def canonical_cart_payload_is_ready(
                 return False
 
             qty = Decimal(str(item.get("suggested_qty")))
-            if not qty.is_finite() or qty < 0:
+            if not qty.is_finite() or qty <= 0:
                 return False
             total_qty += qty
 
@@ -151,25 +151,19 @@ def canonical_cart_payload_is_ready(
             if not unit.is_finite() or unit <= 0 or not line.is_finite() or line < 0:
                 return False
             expected_line = (unit * qty).quantize(_CENT, rounding=ROUND_HALF_UP)
-            if line.quantize(_CENT, rounding=ROUND_HALF_UP) != expected_line:
+            if line != expected_line:
                 return False
             priced_cost += line
 
-        expected_qty = total_qty.quantize(_CENT, rounding=ROUND_HALF_UP)
-        expected_priced = priced_cost.quantize(_CENT, rounding=ROUND_HALF_UP)
-        if Decimal(str(payload.get("total_suggested_qty"))).quantize(
-            _CENT, rounding=ROUND_HALF_UP
-        ) != expected_qty:
+        expected_qty = total_qty
+        expected_priced = priced_cost
+        if Decimal(str(payload.get("total_suggested_qty"))) != expected_qty:
             return False
-        if Decimal(str(payload.get("priced_cost_eur"))).quantize(
-            _CENT, rounding=ROUND_HALF_UP
-        ) != expected_priced:
+        if Decimal(str(payload.get("priced_cost_eur"))) != expected_priced:
             return False
         if payload.get("unpriced_item_count") != unpriced or unpriced:
             return False
-        if Decimal(str(payload.get("total_cost_eur"))).quantize(
-            _CENT, rounding=ROUND_HALF_UP
-        ) != expected_priced:
+        if Decimal(str(payload.get("total_cost_eur"))) != expected_priced:
             return False
     except (InvalidOperation, TypeError, ValueError):
         return False

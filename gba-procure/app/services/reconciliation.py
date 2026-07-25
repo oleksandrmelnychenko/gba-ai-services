@@ -1,8 +1,10 @@
 """Read-only, executable reconciliation for the canonical procurement cart.
 
 The expected side is intentionally calculated from independent SQL instead of calling
-the procurement repositories whose output is being checked.  The module never writes
-to SQL Server or Redis; callers supply a plan factory (or an already loaded JSON plan).
+the procurement repositories whose output is being checked. Buyer-approved unit-cost
+overrides are read independently from Mongo and overlaid with the same precedence as
+the policy. The module never writes to SQL Server, Mongo or Redis; callers supply a
+plan factory (or an already loaded JSON plan).
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from typing import Any
 
 from app.core.config import get_settings
 from app.core.history import history_start_iso, rolling_coverage
+from app.data import masters
 from app.data import supply_repository as repo
 from app.data.db import in_clause, query
 from app.data.synthetic import synthetic_product_id
@@ -30,6 +33,7 @@ _QTY_TOLERANCE = Decimal("0.000001")
 _INVENTORY_CHUNK = 800
 _ON_ORDER_CHUNK = 400
 _COST_HISTORY_DAYS = 540
+_NO_OVERRIDE = object()
 
 
 class ReconciliationExitCode(IntEnum):
@@ -88,6 +92,7 @@ class SourceFacts:
     availability_by_key: dict[tuple[int, int], Decimal]
     consignment_by_key: dict[tuple[int, int], Decimal]
     metrics: dict[str, Any]
+    unit_cost_overrides_by_pair: dict[tuple[int, int], Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -605,6 +610,27 @@ def _collect_cost_rows(
     return dict(costs)
 
 
+def _collect_unit_cost_overrides(
+    selected_pairs: set[tuple[int, int]],
+) -> dict[tuple[int, int], Any]:
+    """Read the exact buyer override fields used by the policy for selected lines."""
+    if not selected_pairs or not get_settings().use_masters:
+        return {}
+
+    product_ids_by_producer: defaultdict[int, list[int]] = defaultdict(list)
+    for producer_id, product_id in sorted(selected_pairs):
+        product_ids_by_producer[producer_id].append(product_id)
+
+    overrides: dict[tuple[int, int], Any] = {}
+    for producer_id, product_ids in product_ids_by_producer.items():
+        terms_by_product = masters.product_terms_for(producer_id, product_ids)
+        for product_id in product_ids:
+            terms = terms_by_product.get(product_id)
+            if isinstance(terms, Mapping) and "unit_cost_override" in terms:
+                overrides[(producer_id, product_id)] = terms["unit_cost_override"]
+    return overrides
+
+
 def collect_source_facts(payload: Mapping[str, Any], as_of: str) -> SourceFacts:
     """Collect exact expected values for only the products returned by the cart."""
     product_ids, selected_pairs = _item_ids(payload)
@@ -612,6 +638,7 @@ def collect_source_facts(payload: Mapping[str, Any], as_of: str) -> SourceFacts:
     consignments = _collect_consignments(product_ids)
     on_order = _collect_on_order(product_ids, as_of)
     cost_rows = _collect_cost_rows(product_ids, as_of)
+    unit_cost_overrides = _collect_unit_cost_overrides(selected_pairs)
 
     inventory: dict[int, InventoryFact] = {}
     for product_id in product_ids:
@@ -633,6 +660,7 @@ def collect_source_facts(payload: Mapping[str, Any], as_of: str) -> SourceFacts:
         "products_with_reservations": sum(1 for fact in inventory.values() if fact.reserved != 0),
         "products_with_on_order": sum(1 for fact in inventory.values() if fact.on_order != 0),
         "priced_selected_pairs": len(selected_cost_rows),
+        "unit_cost_override_rows": len(unit_cost_overrides),
         "availability_storage_keys": len(availability),
         "consignment_storage_keys": len(consignments),
     }
@@ -642,6 +670,7 @@ def collect_source_facts(payload: Mapping[str, Any], as_of: str) -> SourceFacts:
         availability_by_key=availability,
         consignment_by_key=consignments,
         metrics=metrics,
+        unit_cost_overrides_by_pair=unit_cost_overrides,
     )
 
 
@@ -714,6 +743,21 @@ def _exact_median(values: list[Decimal]) -> Decimal:
         _FOUR_DECIMALS,
         rounding=ROUND_HALF_UP,
     )
+
+
+def _valid_unit_cost_override(value: Any) -> Decimal | None:
+    """Return a policy-applicable override, rejecting dirty Mongo values."""
+    if isinstance(value, bool):
+        return None
+    try:
+        # Policy serves the Mongo value as a float; reproduce that public value
+        # before doing exact Decimal multiplication for the independent audit.
+        override = Decimal(str(float(value)))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not override.is_finite() or override <= 0:
+        return None
+    return override
 
 
 def validate_canonical_plan(
@@ -805,6 +849,8 @@ def validate_canonical_plan(
     total_qty = Decimal()
     priced_total = Decimal()
     computed_unpriced = 0
+    applied_unit_cost_overrides = 0
+    invalid_unit_cost_overrides = 0
 
     for index, raw_item in enumerate(items):
         if not isinstance(raw_item, Mapping):
@@ -925,26 +971,48 @@ def validate_canonical_plan(
 
         unit_cost = raw_item.get("unit_cost_eur")
         line_cost = raw_item.get("line_cost_eur")
-        source_costs = facts.cost_rows_by_pair.get((producer_id, product_id), [])
-        if not source_costs:
+        pair = (producer_id, product_id)
+        source_costs = facts.cost_rows_by_pair.get(pair, [])
+        raw_override = facts.unit_cost_overrides_by_pair.get(pair, _NO_OVERRIDE)
+        expected_unit_cost: Decimal | None = None
+        expected_cost_source = "exact Decimal median"
+        if raw_override is not _NO_OVERRIDE:
+            expected_unit_cost = _valid_unit_cost_override(raw_override)
+            if expected_unit_cost is None:
+                invalid_unit_cost_overrides += 1
+                _issue(
+                    issues,
+                    "M008",
+                    "money",
+                    "unit_cost_override must be a finite positive number",
+                    key=key,
+                    expected="finite value > 0",
+                    actual=raw_override,
+                )
+            else:
+                applied_unit_cost_overrides += 1
+                expected_cost_source = "buyer unit_cost_override"
+
+        if expected_unit_cost is None and source_costs:
+            expected_unit_cost = _exact_median(source_costs)
+        if expected_unit_cost is None:
             computed_unpriced += 1
             _issue(
                 issues,
                 "M001",
                 "money",
-                "needed item has no factual supplier cost",
+                "needed item has no valid buyer override or factual supplier cost",
                 key=key,
                 actual={"unit_cost_eur": unit_cost, "line_cost_eur": line_cost},
             )
             continue
 
-        expected_unit_cost = _exact_median(source_costs)
         _compare_decimal(
             issues,
             code="M002",
             category="money",
-            message="unit_cost_eur differs from the exact Decimal median",
-            key=key,
+            message=f"unit_cost_eur differs from the resolved {expected_cost_source}",
+            key={**key, "cost_source": expected_cost_source},
             expected=expected_unit_cost,
             actual=unit_cost,
         )
@@ -1055,6 +1123,8 @@ def validate_canonical_plan(
         "computed_total_suggested_qty": expected_total_qty,
         "computed_priced_cost_eur": priced_total,
         "computed_unpriced_items": computed_unpriced,
+        "applied_unit_cost_overrides": applied_unit_cost_overrides,
+        "invalid_unit_cost_overrides": invalid_unit_cost_overrides,
         "consignment_drift_keys": sum(
             1
             for storage_key in set(facts.availability_by_key) | set(facts.consignment_by_key)

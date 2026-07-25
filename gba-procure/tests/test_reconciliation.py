@@ -5,8 +5,12 @@ from __future__ import annotations
 import copy
 import json
 from decimal import Decimal
+from types import SimpleNamespace
+
+import pytest
 
 from app.domain.models import MODEL_VERSION
+from app.services import reconciliation
 from app.services.reconciliation import (
     InventoryFact,
     ReconciliationExitCode,
@@ -157,6 +161,78 @@ def test_money_gate_rejects_a_single_cent_under_round():
 
     assert any(issue.code == "M003" and issue.key["product_id"] == 101 for issue in issues)
     assert exit_code_for_issues(issues) == ReconciliationExitCode.MONEY_OR_CONTRACT_MISMATCH
+
+
+@pytest.mark.parametrize("has_factual_cost", [True, False])
+def test_valid_buyer_cost_override_supersedes_sql_median(
+    has_factual_cost: bool,
+):
+    payload = _payload()
+    facts = _facts()
+    facts.unit_cost_overrides_by_pair[(501, 101)] = Decimal("4.1255")
+    if not has_factual_cost:
+        facts.cost_rows_by_pair.pop((501, 101))
+    payload["items"][0]["unit_cost_eur"] = 4.1255
+    payload["items"][0]["line_cost_eur"] = 206.28
+    payload["priced_cost_eur"] = 229.71
+    payload["total_cost_eur"] = 229.71
+
+    issues, metrics = validate_canonical_plan(payload, facts, AS_OF)
+
+    assert [issue for issue in issues if issue.severity == "error"] == []
+    assert metrics["applied_unit_cost_overrides"] == 1
+    assert metrics["invalid_unit_cost_overrides"] == 0
+    assert metrics["computed_priced_cost_eur"] == Decimal("229.71")
+
+
+@pytest.mark.parametrize(
+    "override",
+    [0, -1, True, float("nan"), float("inf"), "not-a-number"],
+)
+def test_invalid_buyer_cost_override_fails_closed(override):
+    facts = _facts()
+    facts.unit_cost_overrides_by_pair[(501, 101)] = override
+
+    issues, metrics = validate_canonical_plan(_payload(), facts, AS_OF)
+
+    assert any(
+        issue.code == "M008" and issue.key["product_id"] == 101
+        for issue in issues
+    )
+    assert metrics["applied_unit_cost_overrides"] == 0
+    assert metrics["invalid_unit_cost_overrides"] == 1
+    assert exit_code_for_issues(issues) == ReconciliationExitCode.MONEY_OR_CONTRACT_MISMATCH
+
+
+def test_override_loader_preserves_selected_valid_and_dirty_values(monkeypatch):
+    calls: list[tuple[int, list[int]]] = []
+    terms = {
+        501: {
+            101: {"unit_cost_override": 4.1255},
+            102: {"moq": 5},
+        },
+        502: {
+            103: {"unit_cost_override": 0},
+        },
+    }
+    monkeypatch.setattr(
+        reconciliation,
+        "get_settings",
+        lambda: SimpleNamespace(use_masters=True),
+    )
+
+    def load_terms(producer_id: int, product_ids: list[int]) -> dict:
+        calls.append((producer_id, product_ids))
+        return terms[producer_id]
+
+    monkeypatch.setattr(reconciliation.masters, "product_terms_for", load_terms)
+
+    overrides = reconciliation._collect_unit_cost_overrides(
+        {(502, 103), (501, 102), (501, 101)},
+    )
+
+    assert calls == [(501, [101, 102]), (502, [103])]
+    assert overrides == {(501, 101): 4.1255, (502, 103): 0}
 
 
 def test_inventory_gate_reports_product_field_and_storage_drift():

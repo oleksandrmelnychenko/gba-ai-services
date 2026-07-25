@@ -49,6 +49,38 @@ def _canonical_zero_payload(source_fingerprint: str = "source-fp") -> dict:
     }
 
 
+def _canonical_item_payload() -> dict:
+    item = {
+        "product_id": 101,
+        "producer_id": 501,
+        "suggested_qty": 3.0,
+        # Supplier/override rates retain four decimals; booked amounts are exact cents.
+        "unit_cost_eur": 3.8083,
+        "line_cost_eur": 11.42,
+        "forecast": {"product_id": 101},
+        "inventory": {"product_id": 101},
+    }
+    return {
+        "as_of_date": "2026-06-15",
+        "source_history_start": "2025-01-01",
+        "effective_start": "2026-02-15",
+        "effective_history_days": 120,
+        "history_complete": True,
+        "history_not_applicable": ["inventory", "reservations"],
+        "model_version": MODEL_VERSION,
+        "item_count": 1,
+        "total_item_count": 1,
+        "is_truncated": False,
+        "duplicate_supplier_options_removed": 0,
+        "total_suggested_qty": 3.0,
+        "total_cost_eur": 11.42,
+        "priced_cost_eur": 11.42,
+        "unpriced_item_count": 0,
+        "items": [item],
+        "_source_fingerprint": "source-fp",
+    }
+
+
 def test_warm_cart_persists_an_evaluated_zero_item_plan_when_inputs_are_ready(
     monkeypatch,
 ):
@@ -202,34 +234,8 @@ def test_canonical_payload_from_an_old_source_epoch_is_rejected():
 
 
 def test_canonical_payload_rejects_duplicate_unpriced_or_cent_drift():
-    item = {
-        "product_id": 101,
-        "producer_id": 501,
-        "suggested_qty": 3.0,
-        "unit_cost_eur": 3.8083,
-        "line_cost_eur": 11.42,
-        "forecast": {"product_id": 101},
-        "inventory": {"product_id": 101},
-    }
-    valid = {
-        "as_of_date": "2026-06-15",
-        "source_history_start": "2025-01-01",
-        "effective_start": "2026-02-15",
-        "effective_history_days": 120,
-        "history_complete": True,
-        "history_not_applicable": ["inventory", "reservations"],
-        "model_version": MODEL_VERSION,
-        "item_count": 1,
-        "total_item_count": 1,
-        "is_truncated": False,
-        "duplicate_supplier_options_removed": 0,
-        "total_suggested_qty": 3.0,
-        "total_cost_eur": 11.42,
-        "priced_cost_eur": 11.42,
-        "unpriced_item_count": 0,
-        "items": [item],
-        "_source_fingerprint": "source-fp",
-    }
+    valid = _canonical_item_payload()
+    item = valid["items"][0]
     assert worker.canonical_cart_payload_is_ready(valid, source_fingerprint="source-fp")
 
     duplicate = {
@@ -254,6 +260,38 @@ def test_canonical_payload_rejects_duplicate_unpriced_or_cent_drift():
 
     cents_drift = {**valid, "items": [{**item, "line_cost_eur": 11.41}]}
     assert not worker.canonical_cart_payload_is_ready(cents_drift)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("line_cost_eur", 11.424),
+        ("priced_cost_eur", 11.424),
+        ("total_cost_eur", 11.424),
+    ],
+)
+def test_canonical_payload_rejects_subcent_booked_money(
+    field: str,
+    value: float,
+):
+    payload = _canonical_item_payload()
+    if field == "line_cost_eur":
+        payload["items"][0][field] = value
+    else:
+        payload[field] = value
+
+    assert not worker.canonical_cart_payload_is_ready(payload)
+
+
+def test_canonical_payload_rejects_zero_suggested_quantity():
+    payload = _canonical_item_payload()
+    payload["items"][0]["suggested_qty"] = 0.0
+    payload["items"][0]["line_cost_eur"] = 0.0
+    payload["total_suggested_qty"] = 0.0
+    payload["priced_cost_eur"] = 0.0
+    payload["total_cost_eur"] = 0.0
+
+    assert not worker.canonical_cart_payload_is_ready(payload)
 
 
 def test_warm_charts_accepts_evaluated_zero_cart_from_same_source_epoch(monkeypatch):
