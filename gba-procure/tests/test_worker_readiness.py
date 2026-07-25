@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.domain.models import CartReplenishmentPlan, PlanCharts
+from app.domain.models import MODEL_VERSION, CartReplenishmentPlan, PlanCharts
 from app.services.replenishment import worker
 
 
@@ -29,6 +29,13 @@ def _plan(item_count: int):
 
 def _canonical_zero_payload(source_fingerprint: str = "source-fp") -> dict:
     return {
+        "as_of_date": "2026-06-15",
+        "source_history_start": "2025-01-01",
+        "effective_start": "2026-02-15",
+        "effective_history_days": 120,
+        "history_complete": True,
+        "history_not_applicable": ["inventory", "reservations"],
+        "model_version": MODEL_VERSION,
         "item_count": 0,
         "total_item_count": 0,
         "is_truncated": False,
@@ -205,6 +212,13 @@ def test_canonical_payload_rejects_duplicate_unpriced_or_cent_drift():
         "inventory": {"product_id": 101},
     }
     valid = {
+        "as_of_date": "2026-06-15",
+        "source_history_start": "2025-01-01",
+        "effective_start": "2026-02-15",
+        "effective_history_days": 120,
+        "history_complete": True,
+        "history_not_applicable": ["inventory", "reservations"],
+        "model_version": MODEL_VERSION,
         "item_count": 1,
         "total_item_count": 1,
         "is_truncated": False,

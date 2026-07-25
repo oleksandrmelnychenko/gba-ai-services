@@ -1,6 +1,7 @@
 """Cached global ABC classification (daily) + per-product XYZ helper."""
 from __future__ import annotations
 
+from app.core.history import rolling_coverage
 from app.core.logging import get_logger
 from app.data import cache
 from app.data import supply_repository as repo
@@ -11,7 +12,12 @@ log = get_logger("classify")
 
 def get_abc_map(as_of: str, history_days: int) -> dict[int, str]:
     """Global product -> ABC class by trailing revenue, cached daily (Redis)."""
-    key = cache.make_key("abc", history_days, as_of)
+    coverage = rolling_coverage(as_of, history_days)
+    key = cache.make_key(
+        "abc",
+        f"{history_days}:effective:{coverage.effective_history_days}",
+        as_of,
+    )
     cached = cache.get(key)
     if cached is not None:
         return {int(k): v for k, v in cached.items()}

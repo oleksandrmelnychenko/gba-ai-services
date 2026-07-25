@@ -16,6 +16,7 @@ from pathlib import Path
 from sklearn.metrics import roc_auc_score
 
 from app.risk.dataset import FEATURE_COLUMNS, build_dataset
+from app.risk.lineage import CURRENT_DATASET_ROLE, write_dataset_manifest
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 PARQUET_PATH = DATA_DIR / "risk_dataset_v3.parquet"
@@ -51,17 +52,36 @@ def main() -> int:
     print(f"FEATURE_DATE = {args.feature_date}   LABEL_DATE = {args.label_date}   "
           f"window_months = {args.window_months}")
     df = build_dataset(args.feature_date, args.label_date, args.window_months)
+    # Persist the as-of dates inside the parquet itself.  The sidecar manifest hashes these
+    # bytes, so training cannot accept a detached date claim for an otherwise anonymous table.
+    df["feature_date"] = args.feature_date
+    df["label_date"] = args.label_date
 
     df.to_parquet(PARQUET_PATH, index=False)
+    manifest = write_dataset_manifest(
+        PARQUET_PATH,
+        df,
+        dataset_role=CURRENT_DATASET_ROLE,
+        target_column="label_sev180",
+        feature_dates=[args.feature_date],
+        label_dates=[args.label_date],
+        window_months=args.window_months,
+        builder="scripts/build_risk_dataset.py",
+    )
     df.head(20).to_csv(CSV_PREVIEW_PATH, index=False)
     print(f"saved parquet  -> {PARQUET_PATH}")
+    print(f"saved lineage  -> {PARQUET_PATH.with_suffix('.lineage.json')}")
+    print(f"parquet sha256 -> {manifest['parquet_sha256']}")
     print(f"saved preview  -> {CSV_PREVIEW_PATH}")
 
     # -------------------------------------------------------------- dataset shape
     _hr("DATASET SHAPE")
     print(f"rows (buyers)   : {len(df)}")
     print(f"feature columns : {len(FEATURE_COLUMNS)}")
-    print(f"total columns   : {df.shape[1]} (client_id + {len(FEATURE_COLUMNS)} feat + 2 label)")
+    print(
+        f"total columns   : {df.shape[1]} "
+        f"(client_id + {len(FEATURE_COLUMNS)} feat + 2 label + 2 as-of dates)"
+    )
 
     # -------------------------------------------------------------- label balance
     _hr("LABEL BALANCE")

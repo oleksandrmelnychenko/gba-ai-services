@@ -11,6 +11,7 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from math import isfinite
 
 from app.core.config import Settings
+from app.core.history import requested_history_start, resolve_history_window
 from app.services.forecasting import demand, selection
 
 # month (1-12) -> Ukrainian short month label, per the spec mapping.
@@ -25,17 +26,29 @@ def month_name_uk(year: int, month: int) -> str:
     return f"{MONTHS_UK[month - 1]} {year}"
 
 
-def history_labels(as_of: date, months: int) -> list[str]:
-    """Trailing `months` calendar labels (yyyy-MM), oldest first, ending at as_of's month."""
+def history_labels(
+    as_of: date,
+    months: int,
+    source_history_start: date | None = None,
+) -> list[str]:
+    """Trailing calendar labels, clamped to a factual source boundary when supplied."""
+    if source_history_start is None:
+        start = requested_history_start(as_of, months)
+    else:
+        start = resolve_history_window(as_of, months, source_history_start).effective_start
+
     labels: list[str] = []
-    y, m = as_of.year, as_of.month
-    for _ in range(months):
+    y, m = start.year, start.month
+    end_index = as_of.year * 12 + as_of.month - 1
+    current_index = y * 12 + m - 1
+    while current_index <= end_index:
         labels.append(f"{y:04d}-{m:02d}")
-        m -= 1
-        if m == 0:
-            y -= 1
-            m = 12
-    return list(reversed(labels))
+        m += 1
+        if m == 13:
+            y += 1
+            m = 1
+        current_index += 1
+    return labels
 
 
 def series_from(history: dict[str, float], labels: list[str]) -> list[float]:
@@ -98,7 +111,7 @@ def forecast_points(
     if horizon <= 0:
         return []
 
-    labels = history_labels(as_of, cfg.history_months)
+    labels = history_labels(as_of, cfg.history_months, cfg.source_history_start_date)
     series = series_from(history, labels)
     if _non_zero_months(series) < cfg.min_history_months:
         return []

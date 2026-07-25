@@ -74,6 +74,23 @@ def test_new_client_activation_is_unwired_from_generation(mongo_db, monkeypatch)
     assert "new_client_activation" not in stats["by_type"]
 
 
+def test_generation_persists_history_contract_on_every_task(mongo_db, monkeypatch):
+    _patch_generators(monkeypatch, {TaskType.REORDER_DUE: 1})
+    from app.services import orchestrator
+
+    stats = orchestrator.generate_for_manager(1, "2025-06-07")
+    task = mongo_db["tasks"].find_one({"manager_id": 1})
+
+    expected = {
+        "source_history_start": "2025-01-01",
+        "effective_start": "2025-01-01",
+        "history_complete": False,
+    }
+    assert {key: stats[key] for key in expected} == expected
+    assert task["signals"]["as_of"] == "2025-06-07"
+    assert {key: task["signals"][key] for key in expected} == expected
+
+
 def test_caps_keep_higher_ev_over_higher_probability_same_type(mongo_db, monkeypatch):
     from app.services import orchestrator
     from app.services.generators import churn_winback, cross_sell, debt_followup, reorder_due

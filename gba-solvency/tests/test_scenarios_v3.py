@@ -16,9 +16,9 @@ Scenarios:
   CONTRACT        -- v3 shape complete: all keys, types, sub_factors null, rating in A..D,
                      0<=score<=100, pd in [0,1], contributions nonempty for an applicable buyer,
                      model_version == creditscore-v3.
-  EDGE            -- zero-debt buyer -> applicable, high score, forward low; brand-new buyer
-                     (no sales) -> no crash, sane defaults; nonexistent client -> 404 live /
-                     LookupError in-process; malformed body -> 422.
+  EDGE            -- zero-debt buyer -> applicable, high score, no out-of-population forward
+                     signal; brand-new buyer -> explicitly insufficient, no fabricated risk;
+                     nonexistent client -> 404 live / LookupError in-process; malformed body -> 422.
 """
 from __future__ import annotations
 
@@ -236,41 +236,34 @@ def nonbuyer_ids() -> list[int]:
 
 @pytest.fixture(scope="module")
 def forward_at_risk_cohort() -> list[dict]:
-    """One current, material-debt buyer from every available behavioral forward band.
+    """Current material-debt buyers in the forward population.
 
-    The selection is drawn only from the artifact's declared serving population:
-    ``total_debt_eur > 0`` and not already SEV180. Expected values come from the standalone
-    scorecard and are compared exactly to the service integration path.
+    The post-floor cohort is intentionally too thin to publish a forward model, so these buyers
+    prove that current-state scoring stays available while forward PD fails closed.
     """
     from app.risk import dataset
-    from app.risk.score_forward import score_forward
 
     clients = dataset.buyer_ids()
     labels = dataset.label_sev180(_AS_OF, clients)
     aging = dataset.feat_debt_aging(_AS_OF)
-    candidates = [
-        int(row.client_id)
-        for row in aging.itertuples()
-        if float(row.total_debt_eur) >= 1.0 and labels[int(row.client_id)] == 0
-    ]
-    if not candidates:
+    candidates = sorted(
+        [
+            (int(row.client_id), float(row.total_debt_eur))
+            for row in aging.itertuples()
+            if float(row.total_debt_eur) >= 1.0 and labels[int(row.client_id)] == 0
+        ],
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    selected_ids = [client_id for client_id, _ in candidates[:5]]
+    if not selected_ids:
         pytest.skip("no current material-debt, not-yet-SEV180 buyers")
-    features = dataset.features_many(candidates, _AS_OF, 12)
-    by_band: dict[str, dict] = {}
-    for client_id in candidates:
-        expected = score_forward(features[client_id])
-        band = str(expected["band"])
-        current = by_band.get(band)
-        if current is None or expected["pd_behavioral"] > current["expected"]["pd_behavioral"]:
-            by_band[band] = {
-                "client_id": client_id,
-                "features": features[client_id],
-                "expected": expected,
-            }
-    selected = [by_band[band] for band in ("low", "medium", "high", "very_high") if band in by_band]
-    if len(selected) < 2:
-        pytest.skip(f"only forward bands {sorted(by_band)} represented in the current source")
-    return selected
+    features = dataset.features_many(selected_ids, _AS_OF, 12)
+    return [
+        {"client_id": client_id, "features": features[client_id]}
+        for client_id in selected_ids
+        if client_id in features
+    ]
 
 
 @pytest.fixture(scope="module")
@@ -315,28 +308,25 @@ def test_cohort_overdue_buyers_all_band_c_or_d(service, overdue_cohort):
 
 
 @skip_no_db
-def test_forward_at_risk_cohort_matches_behavioral_scorecard(
+def test_forward_at_risk_cohort_fails_closed_but_retains_current_score(
     service, forward_at_risk_cohort
 ):
-    """The service must preserve the standalone scorecard exactly on its valid population.
+    from app.risk.score_forward import forward_model_readiness
 
-    Already-SEV180 clients are deliberately absent: the artifact was trained only on debt-positive
-    buyers who had not defaulted at feature time. Comparing today's already-defaulted cohort to a
-    future-default model was the old test's category error.
-    """
-    bands = set()
+    readiness = forward_model_readiness()
+    assert readiness["ready"] is False
+    assert readiness["observed_unique_positive_clients"] == 3
+    assert readiness["minimum_unique_positive_clients"] == 30
     for row in forward_at_risk_cohort:
         assert row["features"]["total_debt_eur"] > 0
         assert row["features"]["overdue_eur_180plus"] < SEV180_MIN_EUR
-        expected = row["expected"]
         result = _score(service, row["client_id"])
-        assert result.forward_risk is not None
-        assert result.forward_risk.band == expected["band"]
-        assert result.forward_risk.pd == pytest.approx(
-            expected["pd_behavioral"], rel=0, abs=1e-12
-        )
-        bands.add(result.forward_risk.band.value)
-    assert len(bands) >= 2, f"forward fixture did not exercise multiple bands: {bands}"
+        assert result.score is not None
+        assert result.pd is not None
+        assert result.current_model_run_id
+        assert result.forward_risk is None
+        assert result.forward_risk_status == "model_unavailable"
+        assert "3 < 30" in result.forward_risk_reason
 
 
 @skip_no_db
@@ -458,9 +448,10 @@ def test_contract_inprocess_shape_for_applicable_buyer(service, forward_at_risk_
     for c in res.contributions:
         assert isinstance(c.feature, str) and c.feature
         assert isinstance(c.points, float)
-    assert res.forward_risk is not None
-    assert res.forward_risk.band in {"low", "medium", "high", "very_high"}
-    assert isinstance(res.forward_risk.pd, float) and 0.0 <= res.forward_risk.pd <= 1.0
+    assert res.forward_risk is None
+    assert res.forward_risk_status == "model_unavailable"
+    assert "3 < 30" in res.forward_risk_reason
+    assert res.current_model_run_id
     assert res.sub_factors is None  # deprecated, always null in v3
     assert res.model_version == "creditscore-v3"
 
@@ -481,7 +472,8 @@ def test_contract_live_response_shape_applicable(forward_at_risk_cohort):
     body = r.json()
     required = {
         "client_id", "applicable", "score", "rating", "pd", "contributions",
-        "forward_risk", "sub_factors", "model_version",
+        "forward_risk", "forward_risk_status", "forward_risk_reason",
+        "current_model_run_id", "sub_factors", "model_version",
     }
     assert required.issubset(body.keys()), f"missing keys: {required - set(body.keys())}"
     assert body["client_id"] == client_id
@@ -492,7 +484,10 @@ def test_contract_live_response_shape_applicable(forward_at_risk_cohort):
     assert body["rating"] in {"A", "B", "C", "D"}
     assert 0.0 <= body["pd"] <= 1.0
     assert isinstance(body["contributions"], list) and len(body["contributions"]) > 0
-    assert body["forward_risk"]["band"] in {"low", "medium", "high", "very_high"}
+    assert body["forward_risk"] is None
+    assert body["forward_risk_status"] == "model_unavailable"
+    assert "3 < 30" in body["forward_risk_reason"]
+    assert body["current_model_run_id"]
 
 
 @skip_no_db
@@ -523,21 +518,25 @@ def test_contract_live_batch_scores_cohort(
 # EDGE
 # --------------------------------------------------------------------------------------------
 @skip_no_db
-def test_edge_zero_debt_buyer_high_score_forward_low(service, clean_cohort):
+def test_edge_zero_debt_buyer_high_score_without_forward_risk(service, clean_cohort):
     res = _score(service, clean_cohort[0])
     assert res.applicable is True
     assert res.score is not None and res.score >= 90, f"clean buyer scored low: {res.score}"
     assert res.rating in {"A", "B"}
-    assert res.forward_risk is not None and res.forward_risk.band == "low"
+    assert res.forward_risk is None
 
 
 @skip_no_db
 def test_edge_brand_new_buyer_no_crash_sane_defaults(service, brand_new_buyer):
     res = _score(service, brand_new_buyer)
     assert res.applicable is True
-    assert res.score is not None and 0 <= res.score <= 100
-    assert res.rating in {"A", "B", "C", "D"}
-    assert res.forward_risk is not None
+    assert res.score is None
+    assert res.rating is None
+    assert res.pd is None
+    assert res.contributions is None
+    assert res.data_sufficiency == "insufficient"
+    assert res.data_sufficiency_reason
+    assert res.forward_risk is None
     assert res.model_version == "creditscore-v3"
 
 

@@ -3,7 +3,8 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
+from app.core.history import HistoryWindow, history_metadata, trailing_month_history_window
 from app.core.logging import get_logger
 from app.data import cache
 from app.data import pricing_repository as repo
@@ -24,12 +25,21 @@ def _as_of(as_of_date: str | None) -> str:
     return as_of_date or datetime.now().strftime("%Y-%m-%d")
 
 
+def _history_fields(window: HistoryWindow, settings: Settings) -> dict:
+    return history_metadata(
+        window,
+        model_version=settings.model_version,
+        trailing_window_months=settings.trailing_window_months,
+    )
+
+
 def _hydrate(
     data: dict,
     *,
     expected_product_id: int,
     expected_product_net_uid: str,
     expected_agreement_net_uid: str,
+    expected_history: dict,
 ) -> PriceRecommendation | None:
     """Validate cached identity before hydrating.
 
@@ -42,6 +52,7 @@ def _hydrate(
         != expected_product_net_uid.lower()
         or str(data.get("client_agreement_netuid") or "").lower()
         != expected_agreement_net_uid.lower()
+        or any(data.get(field) != value for field, value in expected_history.items())
     ):
         return None
     band = data.get("discount_band")
@@ -65,6 +76,12 @@ def _hydrate(
         elasticity=data.get("elasticity"),
         elasticity_source=data.get("elasticity_source"),
         elastic_optimal_price=data.get("elastic_optimal_price"),
+        source_history_start=data.get("source_history_start"),
+        requested_start=data.get("requested_start"),
+        effective_start=data.get("effective_start"),
+        history_complete=data.get("history_complete"),
+        history_fingerprint=data.get("history_fingerprint"),
+        model_fingerprint=data.get("model_fingerprint"),
         as_of_date=data.get("as_of_date"),
         model_version=data.get("model_version", get_settings().model_version),
     )
@@ -100,6 +117,12 @@ def recommend_price(
     if margin_value < ZERO or margin_value > HUNDRED:
         raise ValueError("target_margin_pct must be between 0 and 100")
     window = settings.trailing_window_months
+    history_window = trailing_month_history_window(
+        as_of,
+        window,
+        settings.source_history_start_date,
+    )
+    coverage = _history_fields(history_window, settings)
     fx_date = settings.resolve_fx_date(as_of_date)
 
     product = repo.resolve_product(product_id, product_net_uid)
@@ -124,6 +147,7 @@ def recommend_price(
                 expected_product_id=pid,
                 expected_product_net_uid=p_net_uid,
                 expected_agreement_net_uid=ca_net_uid,
+                expected_history=coverage,
             )
             if hydrated is not None:
                 return hydrated
@@ -145,7 +169,9 @@ def recommend_price(
                 n_lines=fallback["n"],
             )
     if baseline is None or baseline <= 0:
-        result = _no_baseline_recommendation(pid, p_net_uid, ca_net_uid, as_of)
+        result = _no_baseline_recommendation(pid, p_net_uid, ca_net_uid, as_of).model_copy(
+            update=coverage
+        )
         if use_cache:
             cache.set(key, result.model_dump(mode="json"))
         latency = (datetime.now() - started).total_seconds() * 1000
@@ -200,7 +226,7 @@ def recommend_price(
         elasticity_estimate=elasticity_estimate,
         baseline_source=baseline_source,
     )
-    result = result.model_copy(update={"product_net_uid": p_net_uid})
+    result = result.model_copy(update={"product_net_uid": p_net_uid, **coverage})
 
     if use_cache:
         cache.set(key, result.model_dump(mode="json"))

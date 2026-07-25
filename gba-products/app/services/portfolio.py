@@ -13,12 +13,14 @@ from app.core import exact_numbers as exact
 from app.core.config import get_settings
 from app.data import signals_repository as sig
 from app.services import classification as cl
-from app.services import health_score
+from app.services import health_score, history_policy
 from app.services.stock_health import classify_band
 
 
 def build_portfolio(as_of: str) -> dict:
     cfg = get_settings()
+    windows = history_policy.portfolio_windows(as_of, cfg)
+    velocity_days = windows["velocity"].effective_days
 
     stock = _index_by_product(sig.on_hand_stock(), "on_hand_stock")
     vel = _index_by_product(
@@ -38,7 +40,11 @@ def build_portfolio(as_of: str) -> dict:
         "returns_for_products",
     )
 
-    labels = cl.month_labels(as_of, cfg.classify_months)
+    labels = cl.month_labels(
+        as_of,
+        cfg.classify_months,
+        cfg.source_history_start_date,
+    )
     monthly: dict[int, dict[str, Decimal]] = {}
     for r in sig.monthly_units(as_of, cfg.classify_months):
         pid = exact.positive_int(r.get("product_id"), "monthly_units.product_id")
@@ -85,7 +91,13 @@ def build_portfolio(as_of: str) -> dict:
             "sold_qty",
             non_negative=True,
         )
-        daily_rate = sold_recent_qty / Decimal(cfg.velocity_window_days)
+        if velocity_days == 0 and sold_recent_qty > 0:
+            raise ValueError("sales velocity has demand outside the effective history window")
+        daily_rate = (
+            sold_recent_qty / Decimal(velocity_days)
+            if velocity_days > 0
+            else Decimal("0")
+        )
         band = classify_band(float(qty), float(daily_rate), pid in sold_recently, cfg)
         cover = (qty / daily_rate) if daily_rate > 0 else None
 
@@ -212,6 +224,7 @@ def build_portfolio(as_of: str) -> dict:
     result = {
         "as_of": as_of,
         "model_version": cfg.model_version,
+        **history_policy.portfolio_metadata(as_of, cfg),
         "count": len(rows),
         "overview": _overview(rows),
         "rows": rows,

@@ -83,6 +83,10 @@ def _synthetic_not_in() -> tuple[str, dict[str, Any]]:
     return placeholder, params
 
 
+def _history_start() -> str:
+    return get_settings().source_history_start_date.isoformat()
+
+
 # --------------------------------------------------------------------------------------------
 # Buyer universe
 # --------------------------------------------------------------------------------------------
@@ -247,10 +251,11 @@ def feat_debt_trajectory(feature_date: str) -> pd.DataFrame:
         CROSS APPLY (SELECT dbo.GetExchangedToEuroValue(d.Total, a.CurrencyID, :fd) AS e) x
         WHERE cid.Deleted = 0
               AND d.Deleted = 0
+              AND d.Created >= :history_start
               AND d.Created <= :fd
         GROUP BY cid.ClientID
         """,
-        {"fd": feature_date},
+        {"fd": feature_date, "history_start": _history_start()},
     )
     df = pd.DataFrame(rows)
     if df.empty:
@@ -341,7 +346,7 @@ def feat_rfm(feature_date: str, window_months: int = 12) -> pd.DataFrame:
     up to FD; turnover/order_count use the (FD-window, FD] window.
     """
     ph, syn = _synthetic_not_in()
-    s = get_settings()
+    history_start = _history_start()
     # turnover + order_count windowed by Sale.Created
     rows_win = query(
         f"""
@@ -354,12 +359,17 @@ def feat_rfm(feature_date: str, window_months: int = 12) -> pd.DataFrame:
         JOIN dbo.ClientAgreement ca ON ca.ID = s.ClientAgreementID
         WHERE oi.IsValidForCurrentSale = 1
               AND oi.ProductID NOT IN {ph}
-              AND s.Created > '2000-01-01'
+              AND s.Created >= :history_start
               AND s.Created <= :fd
               AND s.Created >= DATEADD(month, :neg_months, :fd)
         GROUP BY ca.ClientID
         """,
-        {"fd": feature_date, "neg_months": -window_months, **syn},
+        {
+            "fd": feature_date,
+            "neg_months": -window_months,
+            "history_start": history_start,
+            **syn,
+        },
     )
     # recency + tenure over ALL history up to FD, REAL sales only. The synthetic 1С debt line is
     # written as ~21.7k standalone single-line Sales, so a bare Sale-existence signal lets those
@@ -369,11 +379,10 @@ def feat_rfm(feature_date: str, window_months: int = 12) -> pd.DataFrame:
         f"""
         SELECT ca.ClientID AS client_id,
                DATEDIFF(day, MAX(s.Created), :fd) AS recency_days,
-               DATEDIFF(month, MIN(CASE WHEN s.Created > :sentinel THEN s.Created END), :fd)
-                   AS tenure_months
+               DATEDIFF(month, MIN(s.Created), :fd) AS tenure_months
         FROM dbo.Sale s
         JOIN dbo.ClientAgreement ca ON ca.ID = s.ClientAgreementID
-        WHERE s.Created > '2000-01-01'
+        WHERE s.Created >= :history_start
               AND s.Created <= :fd
               AND EXISTS (
                   SELECT 1 FROM dbo.OrderItem oi
@@ -383,7 +392,7 @@ def feat_rfm(feature_date: str, window_months: int = 12) -> pd.DataFrame:
               )
         GROUP BY ca.ClientID
         """,
-        {"fd": feature_date, "sentinel": s.tenure_sentinel_date, **syn},
+        {"fd": feature_date, "history_start": history_start, **syn},
     )
     win = pd.DataFrame(rows_win)
     hist = pd.DataFrame(rows_hist)
@@ -415,6 +424,7 @@ def feat_returns(feature_date: str, window_months: int = 12) -> pd.DataFrame:
     Sold qty: valid OrderItem.Qty (synthetic excluded) by buyer, windowed by Sale.Created<=FD.
     """
     ph, syn = _synthetic_not_in()
+    history_start = _history_start()
     sold = query(
         f"""
         SELECT ca.ClientID AS client_id, ISNULL(SUM(oi.Qty), 0) AS sold_qty
@@ -424,12 +434,17 @@ def feat_returns(feature_date: str, window_months: int = 12) -> pd.DataFrame:
         JOIN dbo.ClientAgreement ca ON ca.ID = s.ClientAgreementID
         WHERE oi.IsValidForCurrentSale = 1
               AND oi.ProductID NOT IN {ph}
-              AND s.Created > '2000-01-01'
+              AND s.Created >= :history_start
               AND s.Created <= :fd
               AND s.Created >= DATEADD(month, :neg_months, :fd)
         GROUP BY ca.ClientID
         """,
-        {"fd": feature_date, "neg_months": -window_months, **syn},
+        {
+            "fd": feature_date,
+            "neg_months": -window_months,
+            "history_start": history_start,
+            **syn,
+        },
     )
     ret = query(
         f"""
@@ -445,11 +460,17 @@ def feat_returns(feature_date: str, window_months: int = 12) -> pd.DataFrame:
                   AND oi.ProductID NOT IN {ph}
                   AND sr.FromDate <= :fd
                   AND sr.FromDate >= DATEADD(month, :neg_months, :fd)
+                  AND sr.FromDate >= :history_start
             GROUP BY sr.ClientID, sri.SaleReturnID, sri.OrderItemID
         ) line
         GROUP BY client_id
         """,
-        {"fd": feature_date, "neg_months": -window_months, **syn},
+        {
+            "fd": feature_date,
+            "neg_months": -window_months,
+            "history_start": history_start,
+            **syn,
+        },
     )
     sold_df = pd.DataFrame(sold) if sold else pd.DataFrame(columns=["client_id", "sold_qty"])
     ret_df = pd.DataFrame(ret) if ret else pd.DataFrame(columns=["client_id", "return_qty"])
@@ -541,7 +562,7 @@ def features_one(client_id: int, feature_date: str, window_months: int = 12) -> 
     result feeds score_current (uses the 20 primary features) and score_forward (uses up to 22).
     """
     ph, syn = _synthetic_not_in()
-    s = get_settings()
+    history_start = _history_start()
     feats: dict[str, float] = {c: 0.0 for c in FEATURE_COLUMNS}
 
     # The 6 feature-group queries are mutually independent (each hits a different table set and
@@ -596,10 +617,11 @@ def features_one(client_id: int, feature_date: str, window_months: int = 12) -> 
             WHERE cid.Deleted = 0
                   AND d.Deleted = 0
                   AND cid.ClientID = :cid
+                  AND d.Created >= :history_start
                   AND d.Created <= :fd
         ) t
         """,
-        {"fd": feature_date, "cid": client_id},
+        {"fd": feature_date, "cid": client_id, "history_start": history_start},
     )
 
     # GROUP 3 — credit terms / utilization (mirrors feat_credit_terms, one client)
@@ -636,21 +658,26 @@ def features_one(client_id: int, feature_date: str, window_months: int = 12) -> 
         WHERE ca.ClientID = :cid
               AND oi.IsValidForCurrentSale = 1
               AND oi.ProductID NOT IN {ph}
-              AND s.Created > '2000-01-01'
+              AND s.Created >= :history_start
               AND s.Created <= :fd
               AND s.Created >= DATEADD(month, :neg_months, :fd)
         """,
-        {"fd": feature_date, "cid": client_id, "neg_months": -window_months, **syn},
+        {
+            "fd": feature_date,
+            "cid": client_id,
+            "neg_months": -window_months,
+            "history_start": history_start,
+            **syn,
+        },
     )
     _sql_rfm_hist = (
         f"""
         SELECT DATEDIFF(day, MAX(s.Created), :fd) AS recency_days,
-               DATEDIFF(month, MIN(CASE WHEN s.Created > :sentinel THEN s.Created END), :fd)
-                   AS tenure_months
+               DATEDIFF(month, MIN(s.Created), :fd) AS tenure_months
         FROM dbo.Sale s
         JOIN dbo.ClientAgreement ca ON ca.ID = s.ClientAgreementID
         WHERE ca.ClientID = :cid
-              AND s.Created > '2000-01-01'
+              AND s.Created >= :history_start
               AND s.Created <= :fd
               AND EXISTS (
                   SELECT 1 FROM dbo.OrderItem oi
@@ -659,7 +686,12 @@ def features_one(client_id: int, feature_date: str, window_months: int = 12) -> 
                         AND oi.IsValidForCurrentSale = 1
               )
         """,
-        {"fd": feature_date, "cid": client_id, "sentinel": s.tenure_sentinel_date, **syn},
+        {
+            "fd": feature_date,
+            "cid": client_id,
+            "history_start": history_start,
+            **syn,
+        },
     )
 
     # GROUP 5 — returns (mirrors feat_returns, one client). Canonical returned qty is the SUM of
@@ -680,6 +712,7 @@ def features_one(client_id: int, feature_date: str, window_months: int = 12) -> 
                       AND sr.ClientID = :cid
                       AND sr.FromDate <= :fd
                       AND sr.FromDate >= DATEADD(month, :neg_months, :fd)
+                      AND sr.FromDate >= :history_start
                 GROUP BY sri.SaleReturnID, sri.OrderItemID
              ) line) AS return_qty,
             (SELECT ISNULL(SUM(oi.Qty), 0)
@@ -690,11 +723,17 @@ def features_one(client_id: int, feature_date: str, window_months: int = 12) -> 
              WHERE ca.ClientID = :cid
                    AND oi.IsValidForCurrentSale = 1
                    AND oi.ProductID NOT IN {ph}
-                   AND s.Created > '2000-01-01'
+                   AND s.Created >= :history_start
                    AND s.Created <= :fd
                    AND s.Created >= DATEADD(month, :neg_months, :fd)) AS sold_qty
         """,
-        {"fd": feature_date, "cid": client_id, "neg_months": -window_months, **syn},
+        {
+            "fd": feature_date,
+            "cid": client_id,
+            "neg_months": -window_months,
+            "history_start": history_start,
+            **syn,
+        },
     )
 
     # Fan out the 6 independent group queries over a thread pool (each on its own pooled
@@ -782,7 +821,7 @@ def features_many(
     ids with no debt/sales).
     """
     ph_syn, syn = _synthetic_not_in()
-    s = get_settings()
+    history_start = _history_start()
     ids = list(dict.fromkeys(int(c) for c in client_ids))  # de-dupe, preserve order
     out: dict[int, dict[str, float]] = {
         cid: {c: 0.0 for c in FEATURE_COLUMNS} for cid in ids
@@ -851,10 +890,11 @@ def features_many(
         WHERE cid.Deleted = 0
               AND d.Deleted = 0
               AND cid.ClientID IN {ph_cid}
+              AND d.Created >= :history_start
               AND d.Created <= :fd
         GROUP BY cid.ClientID
         """,
-        {"fd": feature_date, **cid_params},
+        {"fd": feature_date, "history_start": history_start, **cid_params},
     )
     for r in traj:
         feats = out[int(r["client_id"])]
@@ -912,12 +952,18 @@ def features_many(
         WHERE ca.ClientID IN {ph_cid}
               AND oi.IsValidForCurrentSale = 1
               AND oi.ProductID NOT IN {ph_syn}
-              AND s.Created > '2000-01-01'
+              AND s.Created >= :history_start
               AND s.Created <= :fd
               AND s.Created >= DATEADD(month, :neg_months, :fd)
         GROUP BY ca.ClientID
         """,
-        {"fd": feature_date, "neg_months": -window_months, **cid_params, **syn},
+        {
+            "fd": feature_date,
+            "neg_months": -window_months,
+            "history_start": history_start,
+            **cid_params,
+            **syn,
+        },
     )
     for r in rfm_win:
         feats = out[int(r["client_id"])]
@@ -931,12 +977,11 @@ def features_many(
         f"""
         SELECT ca.ClientID AS client_id,
                DATEDIFF(day, MAX(s.Created), :fd) AS recency_days,
-               DATEDIFF(month, MIN(CASE WHEN s.Created > :sentinel THEN s.Created END), :fd)
-                   AS tenure_months
+               DATEDIFF(month, MIN(s.Created), :fd) AS tenure_months
         FROM dbo.Sale s
         JOIN dbo.ClientAgreement ca ON ca.ID = s.ClientAgreementID
         WHERE ca.ClientID IN {ph_cid}
-              AND s.Created > '2000-01-01'
+              AND s.Created >= :history_start
               AND s.Created <= :fd
               AND EXISTS (
                   SELECT 1 FROM dbo.OrderItem oi
@@ -946,7 +991,12 @@ def features_many(
               )
         GROUP BY ca.ClientID
         """,
-        {"fd": feature_date, "sentinel": s.tenure_sentinel_date, **cid_params, **syn},
+        {
+            "fd": feature_date,
+            "history_start": history_start,
+            **cid_params,
+            **syn,
+        },
     )
     hist_by_cid = {int(r["client_id"]): r for r in rfm_hist}
     for cid in ids:
@@ -970,12 +1020,18 @@ def features_many(
         WHERE ca.ClientID IN {ph_cid}
               AND oi.IsValidForCurrentSale = 1
               AND oi.ProductID NOT IN {ph_syn}
-              AND s.Created > '2000-01-01'
+              AND s.Created >= :history_start
               AND s.Created <= :fd
               AND s.Created >= DATEADD(month, :neg_months, :fd)
         GROUP BY ca.ClientID
         """,
-        {"fd": feature_date, "neg_months": -window_months, **cid_params, **syn},
+        {
+            "fd": feature_date,
+            "neg_months": -window_months,
+            "history_start": history_start,
+            **cid_params,
+            **syn,
+        },
     )
     ret = query(
         f"""
@@ -992,11 +1048,18 @@ def features_many(
                   AND oi.ProductID NOT IN {ph_syn}
                   AND sr.FromDate <= :fd
                   AND sr.FromDate >= DATEADD(month, :neg_months, :fd)
+                  AND sr.FromDate >= :history_start
             GROUP BY sr.ClientID, sri.SaleReturnID, sri.OrderItemID
         ) line
         GROUP BY client_id
         """,
-        {"fd": feature_date, "neg_months": -window_months, **cid_params, **syn},
+        {
+            "fd": feature_date,
+            "neg_months": -window_months,
+            "history_start": history_start,
+            **cid_params,
+            **syn,
+        },
     )
     sold_by_cid = {int(r["client_id"]): float(r.get("sold_qty") or 0.0) for r in sold}
     ret_by_cid = {int(r["client_id"]): float(r.get("return_qty") or 0.0) for r in ret}

@@ -142,10 +142,17 @@ def main() -> int:
     parser.add_argument("--regression-tolerance", type=float, default=0.02)
     args = parser.parse_args()
 
+    from app.core.config import get_settings
     from app.services import portfolio
     from app.services.health_backtest import evaluate_health_snapshot
 
     as_of = _parse_day(args.as_of)
+    source_history_start = get_settings().source_history_start_date
+    if as_of < source_history_start:
+        parser.error(
+            f"--as-of must be on or after SOURCE_HISTORY_START_DATE "
+            f"({source_history_start.isoformat()})"
+        )
     build = portfolio.build_portfolio(as_of.isoformat())
     rows = build["rows"]
     outcomes = _future_outcomes(as_of, args.horizon_days, rows)
@@ -155,6 +162,12 @@ def main() -> int:
         "outcome_end": (as_of + timedelta(days=args.horizon_days)).isoformat(),
         "horizon_days": args.horizon_days,
         "model_version": build["model_version"],
+        "source_history_start": build["source_history_start"],
+        "requested_start": build["requested_start"],
+        "effective_start": build["effective_start"],
+        "history_complete": build["history_complete"],
+        "history_fingerprint": build["history_fingerprint"],
+        "history_windows": build["history_windows"],
         "summary": summary,
     }
 

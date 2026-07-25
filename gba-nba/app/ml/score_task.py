@@ -22,6 +22,8 @@ import joblib
 import numpy as np
 import pandas as pd
 
+from app.core import history
+
 ART = Path(__file__).resolve().parent / "artifacts"
 
 SHARED = ["monetary", "recency_days", "order_count"]
@@ -35,10 +37,21 @@ ONEHOT = ["is_reorder_due", "is_debt_followup", "is_churn_winback", "is_cross_se
 FEATURES = SHARED + SIGNALS + ONEHOT
 
 TASK_TYPES = ["reorder_due", "debt_followup", "churn_winback", "cross_sell"]
+TRAINING_WINDOW_DAYS = 365
+
+
+class IncompatibleModelArtifactError(RuntimeError):
+    """The serving artifact was trained under a different source-history contract."""
 
 
 @lru_cache(maxsize=1)
 def _model():
+    compatibility = model_compatibility()
+    if not compatibility["model_compatible"]:
+        raise IncompatibleModelArtifactError(
+            "incompatible NBA model artifact: "
+            + ", ".join(compatibility["model_reasons"])
+        )
     return joblib.load(ART / "propensity_model.joblib")
 
 
@@ -46,6 +59,49 @@ def _model():
 def _meta() -> dict:
     p = ART / "model_meta.json"
     return json.loads(p.read_text()) if p.exists() else {}
+
+
+def model_compatibility() -> dict[str, Any]:
+    """Readiness contract for the model artifact; legacy/partial-history models fail closed."""
+    try:
+        meta = _meta()
+    except (OSError, TypeError, ValueError):
+        meta = {}
+        unreadable = True
+    else:
+        unreadable = False
+    expected_source_start = history.source_history_start().isoformat()
+    reasons: list[str] = []
+    if unreadable:
+        reasons.append("model_metadata_unreadable")
+    if not (ART / "propensity_model.joblib").is_file():
+        reasons.append("model_artifact_missing")
+    if meta.get("source_history_start") != expected_source_start:
+        reasons.append("model_source_history_mismatch")
+    if meta.get("training_window_days") != TRAINING_WINDOW_DAYS:
+        reasons.append("model_training_window_mismatch")
+
+    vintages = meta.get("training_vintages")
+    if not isinstance(vintages, list) or not vintages:
+        reasons.append("model_training_vintages_missing")
+    else:
+        try:
+            canonical_vintages = [
+                history.training_window(vintage, TRAINING_WINDOW_DAYS).as_of.isoformat()
+                for vintage in vintages
+            ]
+            if canonical_vintages != sorted(set(canonical_vintages)):
+                reasons.append("model_training_vintages_invalid")
+        except (TypeError, ValueError):
+            reasons.append("model_training_vintage_incomplete")
+
+    return {
+        "model_compatible": not reasons,
+        "model_reasons": reasons,
+        "model_source_history_start": meta.get("source_history_start"),
+        "model_training_window_days": meta.get("training_window_days"),
+        "model_training_vintages": vintages if isinstance(vintages, list) else [],
+    }
 
 
 def _vectorize(task: dict[str, Any]) -> np.ndarray:

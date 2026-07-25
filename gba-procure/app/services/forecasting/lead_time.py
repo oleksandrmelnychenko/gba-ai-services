@@ -24,7 +24,7 @@ def producer_lead_time(producer_id: int, as_of: str) -> tuple[float, float, str]
         producer_id, as_of, s.lead_time_min_days, s.lead_time_max_days
     )
     if len(samples) < s.lead_time_min_samples:
-        ccy = repo.producer_agreement_currency(producer_id)
+        ccy = repo.producer_agreement_currency(producer_id, as_of)
         geo = _LEAD_DAYS_BY_CURRENCY.get(ccy)
         if geo is not None:
             return geo, geo * s.lead_time_cv, "geo"

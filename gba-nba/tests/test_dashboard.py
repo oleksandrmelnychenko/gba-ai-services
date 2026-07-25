@@ -93,8 +93,19 @@ def test_manager_dashboard_shape_and_mix(client):
     body = resp.json()
     assert body["manager_id"] == 1
     assert body["manager_net_uid"] == MGR_UID.lower()
-    assert set(body) == {"manager_id", "manager_net_uid", "as_of", "task_type_mix", "urgency_mix",
-                         "value_at_risk_eur", "debt_aging", "completed_vs_open"}
+    assert set(body) == {
+        "manager_id",
+        "manager_net_uid",
+        "as_of",
+        "task_type_mix",
+        "urgency_mix",
+        "value_at_risk_eur",
+        "debt_aging",
+        "completed_vs_open",
+        "source_history_start",
+        "effective_start",
+        "history_complete",
+    }
 
     type_mix = {r["type"]: r["count"] for r in body["task_type_mix"]}
     assert type_mix == {"debt_followup": 2, "reorder_due": 1}
@@ -216,8 +227,17 @@ def test_head_dashboard_shape(client):
     body = resp.json()
     assert body["is_head"] is True
     assert body["requested_manager_net_uid"] == HEAD_UID.lower()
-    assert set(body) == {"is_head", "requested_manager_net_uid", "as_of", "teams",
-                         "escalated_count", "total_value_at_risk_eur"}
+    assert set(body) == {
+        "is_head",
+        "requested_manager_net_uid",
+        "as_of",
+        "teams",
+        "escalated_count",
+        "total_value_at_risk_eur",
+        "source_history_start",
+        "effective_start",
+        "history_complete",
+    }
     teams = {t["manager_id"]: t for t in body["teams"]}
     assert set(teams[1]) == {"manager_id", "open_tasks", "critical", "value_at_risk_eur"}
     assert teams[1]["open_tasks"] == 2

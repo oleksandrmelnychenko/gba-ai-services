@@ -2,8 +2,48 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+from app.core.config import get_settings
+from app.core.history import rolling_coverage
+
+_MODEL_SETTINGS = get_settings()
+MODEL_VERSION = (
+    f"procure-hist{_MODEL_SETTINGS.history_days}-"
+    f"floor{_MODEL_SETTINGS.source_history_start_date:%Y%m%d}-v2"
+)
+
+
+class HistoryContractModel(BaseModel):
+    as_of_date: str | None = None
+    source_history_start: str = Field(
+        default_factory=lambda: get_settings().source_history_start_date.isoformat()
+    )
+    effective_start: str | None = None
+    effective_history_days: int = 0
+    history_complete: bool = False
+    history_not_applicable: list[str] = Field(
+        default_factory=lambda: ["inventory", "reservations"]
+    )
+    model_version: str = MODEL_VERSION
+
+    @model_validator(mode="before")
+    @classmethod
+    def populate_history_contract(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or not value.get("as_of_date"):
+            return value
+        result = dict(value)
+        coverage = rolling_coverage(
+            result["as_of_date"],
+            get_settings().history_days,
+        )
+        for key, item in coverage.as_metadata().items():
+            result.setdefault(key, item)
+        result.setdefault("history_not_applicable", ["inventory", "reservations"])
+        result.setdefault("model_version", MODEL_VERSION)
+        return result
 
 
 class Urgency(StrEnum):
@@ -74,7 +114,7 @@ class ReorderSuggestion(BaseModel):
     cheaper_alt: CheaperAlt | None = None
 
 
-class ProducerPurchasePlan(BaseModel):
+class ProducerPurchasePlan(HistoryContractModel):
     producer_id: int
     producer_name: str | None = None
     lead_time_days: float
@@ -82,8 +122,6 @@ class ProducerPurchasePlan(BaseModel):
     lead_time_source: str = "default"
     items: list[ReorderSuggestion]
     item_count: int
-    as_of_date: str | None = None
-    model_version: str = "procure-hist120-v1"
 
 
 class CartPlanRequest(BaseModel):
@@ -93,7 +131,7 @@ class CartPlanRequest(BaseModel):
     budget_eur: float | None = None
 
 
-class CartReplenishmentPlan(BaseModel):
+class CartReplenishmentPlan(HistoryContractModel):
     items: list[ReorderSuggestion]
     item_count: int
     total_item_count: int = 0
@@ -103,14 +141,12 @@ class CartReplenishmentPlan(BaseModel):
     total_cost_eur: float | None = 0.0
     priced_cost_eur: float = 0.0
     unpriced_item_count: int = 0
-    as_of_date: str | None = None
     budget_eur: float | None = None
     budget_used_eur: float | None = None
     value_captured_eur: float | None = None
     selected_count: int | None = None
     deferred_count: int | None = None
     method_used: str | None = None
-    model_version: str = "procure-hist120-v1"
 
 
 # --- dashboard chart data (derived from build_plan; no policy/forecast math change) ---
@@ -156,12 +192,10 @@ class DemandSeries(BaseModel):
     points: list[DemandPoint]
 
 
-class PlanCharts(BaseModel):
+class PlanCharts(HistoryContractModel):
     producer_id: int | None = None
-    as_of_date: str | None = None
     top_n: int = 15
     urgency_mix: list[UrgencyMixBucket]
     days_of_cover_hist: list[DaysOfCoverBucket]
     top_items: list[TopItem]
     demand_series: list[DemandSeries]
-    model_version: str = "procure-hist120-v1"

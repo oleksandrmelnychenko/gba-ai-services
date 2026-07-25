@@ -6,6 +6,7 @@ import copy
 import json
 from decimal import Decimal
 
+from app.domain.models import MODEL_VERSION
 from app.services.reconciliation import (
     InventoryFact,
     ReconciliationExitCode,
@@ -68,7 +69,12 @@ def _payload() -> dict:
         "total_cost_eur": 213.85,
         "unpriced_item_count": 0,
         "as_of_date": AS_OF,
-        "model_version": "test",
+        "source_history_start": "2025-01-01",
+        "effective_start": "2026-03-27",
+        "effective_history_days": 120,
+        "history_complete": True,
+        "history_not_applicable": ["inventory", "reservations"],
+        "model_version": MODEL_VERSION,
     }
 
 

@@ -11,10 +11,12 @@ Baselines:
 """
 from __future__ import annotations
 
+from app.core.history import require_supported_as_of, source_history_start_iso
 from app.data.db import query
 
 
 def most_frequent_for_client(customer_id: int, as_of: str, top_n: int) -> list[int]:
+    require_supported_as_of(as_of)
     rows = query(
         """
         SELECT TOP (:k) oi.ProductID AS pid, COUNT(*) AS c
@@ -22,11 +24,17 @@ def most_frequent_for_client(customer_id: int, as_of: str, top_n: int) -> list[i
         JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
         JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
         WHERE ca.ClientID = :cid AND oi.IsValidForCurrentSale = 1
-              AND o.Created < :asof AND oi.ProductID IS NOT NULL
+              AND o.Created < :asof AND o.Created >= :history_start
+              AND oi.ProductID IS NOT NULL
         GROUP BY oi.ProductID
         ORDER BY c DESC, oi.ProductID ASC
         """,
-        {"cid": customer_id, "asof": as_of, "k": top_n},
+        {
+            "cid": customer_id,
+            "asof": as_of,
+            "k": top_n,
+            "history_start": source_history_start_iso(),
+        },
     )
     return [int(r["pid"]) for r in rows]
 
@@ -34,16 +42,23 @@ def most_frequent_for_client(customer_id: int, as_of: str, top_n: int) -> list[i
 def global_popular(as_of: str, top_n: int, exclude: frozenset[int] | None = None) -> list[int]:
     """Globally most-ordered valid products before `as_of`. `exclude` drops ubiquitous/synthetic
     lines; over-fetch so the post-filter still returns up to `top_n`."""
+    require_supported_as_of(as_of)
     excl = exclude or frozenset()
     rows = query(
         """
         SELECT TOP (:k) oi.ProductID AS pid, COUNT(*) AS c
         FROM dbo.[Order] o
         JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-        WHERE oi.IsValidForCurrentSale = 1 AND o.Created < :asof AND oi.ProductID IS NOT NULL
+        WHERE oi.IsValidForCurrentSale = 1
+              AND o.Created < :asof AND o.Created >= :history_start
+              AND oi.ProductID IS NOT NULL
         GROUP BY oi.ProductID
         ORDER BY c DESC, oi.ProductID ASC
         """,
-        {"asof": as_of, "k": top_n + len(excl)},
+        {
+            "asof": as_of,
+            "k": top_n + len(excl),
+            "history_start": source_history_start_iso(),
+        },
     )
     return [int(r["pid"]) for r in rows if int(r["pid"]) not in excl][:top_n]

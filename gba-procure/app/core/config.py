@@ -11,9 +11,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    # Shared AI-fleet source contract. All business history is tracked from this date.
-    source_history_start_date: date = date(2025, 1, 1)
-
     db_host: str = "127.0.0.1"
     db_port: int = 1433
     db_name: str = "ConcordDb_V5"
@@ -56,6 +53,8 @@ class Settings(BaseSettings):
     synthetic_product_id: int | None = None
 
     # Replenishment policy
+    # 1C history before this date is outside the supported source contract.
+    source_history_start_date: date = date(2025, 1, 1)
     service_level: float = 0.99
     forecast_horizon_days: int = 30
     history_days: int = 120

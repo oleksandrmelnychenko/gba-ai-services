@@ -142,4 +142,7 @@ def test_health_cannot_be_green_without_generation_proof(monkeypatch):
     assert response.json()["status"] == "degraded"
     assert response.json()["business_ready"] is False
     assert response.json()["source_history_start"] == "2025-01-01"
+    assert response.json()["effective_start"] == "2025-01-01"
+    assert response.json()["history_complete"] is True
+    assert "model_compatible" in response.json()
     assert response.json()["source_history_contract_ready"] is True

@@ -18,6 +18,9 @@ discovery data traps (/tmp/pricing-discovery.json):
   (g) UoM piece-vs-box outliers -> peer percentiles reject lines by a per-product median/MAD
       modified-z filter (k=3.5), which adapts to the contaminated fraction (a fixed decile trim
       leaked when >10% of lines were the wrong UoM).
+  (h) Every behavioral Sale.Created window is additionally clamped to
+      SOURCE_HISTORY_START_DATE. Live engine prices, active price-book/discount rows, identity
+      lookups and on-hand costs are current-state snapshots and intentionally remain unclamped.
 
 The baseline price is computed by the live engine itself
 (dbo.GetCalculatedProductPriceWithSharesAndVat), never re-derived here.
@@ -26,11 +29,16 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
 from app.core.config import get_settings
+from app.core.history import (
+    HistoryWindow,
+    history_metadata,
+    trailing_month_history_window,
+)
 from app.core.logging import get_logger
 from app.data.db import query
 from app.domain.money import optional_decimal
@@ -42,7 +50,26 @@ _synthetic_id: int | None = None
 _synthetic_expires_at = 0.0
 _READINESS_TTL_S = 60.0
 _readiness_lock = threading.Lock()
-_readiness_state: dict[int, tuple[float, dict[str, Any]]] = {}
+_readiness_state: dict[tuple[int, str, int, str], tuple[float, dict[str, Any]]] = {}
+
+
+def behavioral_history_window(as_of_date: str, window_months: int) -> HistoryWindow:
+    """Resolve one behavioral-sales window against the configured factual-source floor."""
+    return trailing_month_history_window(
+        as_of_date,
+        window_months,
+        get_settings().source_history_start_date,
+    )
+
+
+def _behavioral_history_params(as_of_date: str, window_months: int) -> dict[str, Any]:
+    """Parameters shared by every historical Sale.Created predicate."""
+    window = behavioral_history_window(as_of_date, window_months)
+    return {
+        "asof": window.as_of.isoformat(),
+        "neg_months": -window_months,
+        "source_history_start": window.source_history_start.isoformat(),
+    }
 
 
 def synthetic_product_id() -> int:
@@ -81,9 +108,25 @@ def source_readiness(max_lag_days: int) -> dict[str, Any]:
     current, live products and agreements must exist, and the synthetic 1C debt line must be
     resolved from the current catalog (a configured fallback is not sufficient evidence).
     """
+    settings = get_settings()
+    window = behavioral_history_window(
+        date.today().isoformat(),
+        settings.trailing_window_months,
+    )
+    coverage = history_metadata(
+        window,
+        model_version=settings.model_version,
+        trailing_window_months=settings.trailing_window_months,
+    )
+    readiness_key = (
+        max_lag_days,
+        window.source_history_start.isoformat(),
+        settings.trailing_window_months,
+        settings.model_version,
+    )
     now_mono = time.monotonic()
     with _readiness_lock:
-        cached = _readiness_state.get(max_lag_days)
+        cached = _readiness_state.get(readiness_key)
         if cached is not None and now_mono - cached[0] < _READINESS_TTL_S:
             return dict(cached[1])
 
@@ -100,6 +143,7 @@ def source_readiness(max_lag_days: int) -> dict[str, Any]:
                       AND oi.ProductID <> :synthetic
                       AND oi.Qty > 0
                       AND oi.PricePerItem > 0
+                      AND o.Created >= :source_history_start
                 ORDER BY o.Created DESC, o.ID DESC
             ) AS latest_sale_at,
             (
@@ -124,7 +168,10 @@ def source_readiness(max_lag_days: int) -> dict[str, Any]:
                       AND p.Name = N'Ввід боргів'
             ) AS synthetic_product_count
         """,
-        {"synthetic": synthetic},
+        {
+            "synthetic": synthetic,
+            "source_history_start": window.source_history_start.isoformat(),
+        },
     )
     row = rows[0] if rows else {}
     latest = row.get("latest_sale_at")
@@ -147,6 +194,7 @@ def source_readiness(max_lag_days: int) -> dict[str, Any]:
         reasons.append("synthetic_product_unresolved")
 
     result = {
+        **coverage,
         "business_ready": not reasons,
         "reasons": reasons,
         "latest_sale_at": latest.isoformat() if isinstance(latest, datetime) else None,
@@ -157,7 +205,7 @@ def source_readiness(max_lag_days: int) -> dict[str, Any]:
         "synthetic_product_id": synthetic if synthetic_count == 1 else None,
     }
     with _readiness_lock:
-        _readiness_state[max_lag_days] = (time.monotonic(), dict(result))
+        _readiness_state[readiness_key] = (time.monotonic(), dict(result))
     return result
 
 
@@ -316,6 +364,7 @@ def client_world_fallback_baseline(
     cannot be determined -> None (the caller keeps the no-baseline result). Line filters mirror
     peer_band (traps a,b): IsValidForCurrentSale=1, ProductID<>synthetic, PricePerItem>0.
     """
+    history_params = _behavioral_history_params(as_of_date, window_months)
     rows = query(
         """
         WITH req AS (
@@ -346,6 +395,7 @@ def client_world_fallback_baseline(
                   AND org2.PriceSourceIsAmg = req.world
                   AND s.Created <= :asof
                   AND s.Created >= DATEADD(month, :neg_months, :asof)
+                  AND s.Created >= :source_history_start
         )
         SELECT DISTINCT
             CAST(
@@ -357,7 +407,7 @@ def client_world_fallback_baseline(
         """,
         {
             "pid": product_id, "caid": client_agreement_id,
-            "asof": as_of_date, "neg_months": -window_months,
+            **history_params,
             "synthetic": synthetic_product_id(),
         },
     )
@@ -629,6 +679,7 @@ def peer_band(product_id: int, as_of_date: str, window_months: int,
     """
     s = get_settings()
     _ = fx_date
+    history_params = _behavioral_history_params(as_of_date, window_months)
     rows = query(
         """
         WITH priced AS (
@@ -644,6 +695,7 @@ def peer_band(product_id: int, as_of_date: str, window_months: int,
                   AND oi.PricePerItem > 0
                   AND s.Created <= :asof
                   AND s.Created >= DATEADD(month, :neg_months, :asof)
+                  AND s.Created >= :source_history_start
         ),
         stats AS (
             SELECT
@@ -686,7 +738,8 @@ def peer_band(product_id: int, as_of_date: str, window_months: int,
         FROM trimmed
         """,
         {
-            "pid": product_id, "asof": as_of_date, "neg_months": -window_months,
+            "pid": product_id,
+            **history_params,
             "synthetic": synthetic_product_id(),
             "mad_k": s.peer_band_mad_k,
             "min_rows": s.peer_band_mad_min_rows,
@@ -759,6 +812,7 @@ def product_line_count(product_id: int, as_of_date: str, window_months: int) -> 
     """Number of VALID sale lines for a product in the trailing window — the estimability band
     discriminant (bands A/B >=100 lines support a per-SKU elasticity; below it pools/falls back).
     Same valid-row + synthetic-exclude filters as the panel."""
+    history_params = _behavioral_history_params(as_of_date, window_months)
     rows = query(
         """
         SELECT COUNT(*) AS n
@@ -772,9 +826,13 @@ def product_line_count(product_id: int, as_of_date: str, window_months: int) -> 
               AND oi.Qty > 0
               AND s.Created <= :asof
               AND s.Created >= DATEADD(month, :neg_months, :asof)
+              AND s.Created >= :source_history_start
         """,
-        {"pid": product_id, "asof": as_of_date, "neg_months": -window_months,
-         "synthetic": synthetic_product_id()},
+        {
+            "pid": product_id,
+            **history_params,
+            "synthetic": synthetic_product_id(),
+        },
     )
     return int(rows[0]["n"] or 0) if rows else 0
 
@@ -792,6 +850,7 @@ def product_panel(product_id: int, as_of_date: str, window_months: int) -> list[
     Sale/Order/OrderItem), ProductID<>synthetic 1С line, PricePerItem>0, Qty>0, trailing window by
     Sale.Created. The per-product UoM/price outlier reject and the regression run in Python.
     """
+    history_params = _behavioral_history_params(as_of_date, window_months)
     return query(
         """
         SELECT
@@ -809,10 +868,12 @@ def product_panel(product_id: int, as_of_date: str, window_months: int) -> list[
               AND oi.Qty > 0
               AND s.Created <= :asof
               AND s.Created >= DATEADD(month, :neg_months, :asof)
+              AND s.Created >= :source_history_start
         GROUP BY o.ClientAgreementID, FORMAT(s.Created, 'yyyy-MM')
         """,
         {
-            "pid": product_id, "asof": as_of_date, "neg_months": -window_months,
+            "pid": product_id,
+            **history_params,
             "synthetic": synthetic_product_id(),
         },
     )
@@ -827,6 +888,7 @@ def group_panel(product_group_id_value: int, as_of_date: str, window_months: int
     Capped at max_products of the highest-volume SKUs in the group (by valid line count) so a giant
     group cannot blow up the design matrix; the cap is generous relative to the bands A/B universe.
     """
+    history_params = _behavioral_history_params(as_of_date, window_months)
     return query(
         """
         WITH grp AS (
@@ -838,10 +900,15 @@ def group_panel(product_group_id_value: int, as_of_date: str, window_months: int
             SELECT TOP (:max_products) oi2.ProductID AS pid, COUNT(*) AS n_lines
             FROM dbo.OrderItem oi2
             JOIN grp ON grp.ProductID = oi2.ProductID
+            JOIN dbo.[Order] o2 ON o2.ID = oi2.OrderID
+            JOIN dbo.Sale s2 ON s2.OrderID = o2.ID
             WHERE oi2.IsValidForCurrentSale = 1
                   AND oi2.ProductID <> :synthetic
                   AND oi2.PricePerItem > 0
                   AND oi2.Qty > 0
+                  AND s2.Created <= :asof
+                  AND s2.Created >= DATEADD(month, :neg_months, :asof)
+                  AND s2.Created >= :source_history_start
             GROUP BY oi2.ProductID
             ORDER BY COUNT(*) DESC
         )
@@ -861,10 +928,13 @@ def group_panel(product_group_id_value: int, as_of_date: str, window_months: int
               AND oi.Qty > 0
               AND s.Created <= :asof
               AND s.Created >= DATEADD(month, :neg_months, :asof)
+              AND s.Created >= :source_history_start
         GROUP BY oi.ProductID, o.ClientAgreementID, FORMAT(s.Created, 'yyyy-MM')
         """,
         {
-            "pgid": product_group_id_value, "asof": as_of_date, "neg_months": -window_months,
-            "synthetic": synthetic_product_id(), "max_products": max_products,
+            "pgid": product_group_id_value,
+            **history_params,
+            "synthetic": synthetic_product_id(),
+            "max_products": max_products,
         },
     )

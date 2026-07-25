@@ -1,6 +1,6 @@
 """Redis cache — one key scheme, graceful degradation. Products namespace.
 
-Key scheme: products:{model_version}:{kind}:{id}:{as_of}  (kind = product|assortment)
+Key scheme: products:{model_version}:{history_fingerprint}:{kind}:{id}:{as_of}
 If Redis is down, every call is a no-op miss — service keeps working.
 """
 from __future__ import annotations
@@ -11,6 +11,7 @@ from typing import Any
 import redis
 
 from app.core.config import get_settings
+from app.core.history import history_contract_fingerprint
 from app.core.logging import get_logger
 from app.core.metrics import METRICS
 
@@ -41,7 +42,12 @@ def _get_client() -> redis.Redis | None:
 
 
 def make_key(kind: str, entity_id: int | str, as_of: str) -> str:
-    return f"products:{get_settings().model_version}:{kind}:{entity_id}:{as_of}"
+    settings = get_settings()
+    history_fingerprint = history_contract_fingerprint(settings.source_history_start_date)
+    return (
+        f"products:{settings.model_version}:{history_fingerprint}:"
+        f"{kind}:{entity_id}:{as_of}"
+    )
 
 
 def get(key: str) -> dict[str, Any] | None:

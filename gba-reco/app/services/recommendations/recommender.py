@@ -10,10 +10,17 @@ import math
 from datetime import datetime
 
 from app.core.config import get_settings
+from app.core.history import full_history_coverage
 from app.core.logging import get_logger
 from app.data import cache
 from app.data import sales_repository as repo
-from app.domain.models import ProductRec, RecommendationResult, RecSource, Segment
+from app.domain.models import (
+    ProductRec,
+    RecommendationResult,
+    RecSource,
+    RecSourceDetail,
+    Segment,
+)
 from app.services.recommendations import live_remap
 
 log = get_logger("recommender")
@@ -107,6 +114,7 @@ def _backfill(
     top_n: int,
     segment: Segment,
     excl: frozenset[int],
+    owned_live: frozenset[int],
 ) -> list[ProductRec]:
     """Fill the gap to top_n when V3.2 discovery under-delivers (HEAVY/LIGHT clients with weak
     Jaccard neighbourhoods). Source order: co-purchase item-CF discovery, then ubiquity-filtered
@@ -114,7 +122,10 @@ def _backfill(
     client's negative-feedback set) and the ids already in `combined`, so synthetic/ubiquitous
     lines, negatived products and dupes never leak in. Zero-stock
     candidates are dropped: copurchase filters its discovery output internally; the popularity
-    pool is checked here with one in_stock_product_ids set-membership query.
+    pool is checked here with one in_stock_product_ids set-membership query. Candidates are
+    also compared to the client's complete purchase history after both sides are resolved onto
+    live catalog identities, so a re-minted generation of an owned product cannot be mislabeled
+    as discovery.
 
     Backfilled items are appended below the existing ranking with monotonically decreasing scores,
     preserving the primary V3.2 ordering."""
@@ -126,15 +137,16 @@ def _backfill(
     blocked = set(excl) | {r.product_id for r in combined}
     base_score = min((r.score for r in combined), default=1.0)
     step = 1e-4
-    rank_offset = 1
+    emitted_count = 0
 
-    def _emit(pid: int) -> ProductRec:
-        nonlocal rank_offset
+    def _emit(pid: int, source_detail: RecSourceDetail) -> ProductRec:
+        nonlocal emitted_count
+        emitted_count += 1
         rec = ProductRec(
-            product_id=pid, score=round(max(base_score - step * rank_offset, 0.0), 6),
-            rank=len(combined) + rank_offset, segment=segment.value, source=RecSource.DISCOVERY,
+            product_id=pid, score=round(max(base_score - step * emitted_count, 0.0), 6),
+            rank=len(combined) + 1, segment=segment.value, source=RecSource.DISCOVERY,
+            source_detail=source_detail,
         )
-        rank_offset += 1
         return rec
 
     try:
@@ -142,24 +154,31 @@ def _backfill(
         for r in cop.recommendations:
             if len(combined) >= top_n:
                 break
-            if r.product_id in blocked:
+            if r.product_id in blocked or r.product_id in owned_live:
                 continue
             blocked.add(r.product_id)
-            combined.append(_emit(r.product_id))
+            combined.append(_emit(r.product_id, RecSourceDetail.COPURCHASE))
     except Exception:  # noqa: BLE001
         pass
 
     if len(combined) < top_n:
-        need = top_n - len(combined)
-        popular = baselines.global_popular(as_of, need + len(blocked), exclude=excl)
+        pool_size = min(_STOCK_POOL_CAP, max(top_n * 5, top_n + len(blocked)))
+        popular = baselines.global_popular(as_of, pool_size, exclude=excl)
+        popular_live = live_remap.live_product_map(popular)
         stocked = repo.in_stock_product_ids(popular)
         for pid in popular:
             if len(combined) >= top_n:
                 break
-            if pid in blocked or pid not in stocked:
+            live_id = popular_live.get(pid)
+            if (
+                pid in blocked
+                or pid not in stocked
+                or live_id is None
+                or live_id in owned_live
+            ):
                 continue
             blocked.add(pid)
-            combined.append(_emit(pid))
+            combined.append(_emit(pid, RecSourceDetail.GLOBAL_POPULAR))
 
     return combined
 
@@ -174,6 +193,7 @@ def recommend(
     s = get_settings()
     started = datetime.now()
     as_of = as_of_date or datetime.now().strftime("%Y-%m-%d")
+    history = full_history_coverage(as_of)
     top_n = top_n or s.default_top_n
     repurchase_n = min(s.repurchase_count, top_n)
     discovery_n = max(top_n - repurchase_n, 0) if include_discovery else 0
@@ -187,6 +207,11 @@ def recommend(
     region_id = repo.client_region_id(customer_id) if region_scope else None
 
     excl = repo.ubiquitous_product_ids(s.ubiquity_exclude_pct) | cache.get_negatives(customer_id)
+    owned_live = (
+        frozenset(repo.owned_live_product_ids(customer_id, as_of))
+        if include_discovery
+        else frozenset()
+    )
     freq = _normalize({pid: float(c) for pid, c in repo.product_frequency(customer_id, as_of).items()
                        if pid not in excl})
     rec = _normalize({pid: v for pid, v in _recency_scores(customer_id, as_of).items()
@@ -205,7 +230,8 @@ def recommend(
     ]
     repurchase = [
         ProductRec(product_id=pid, score=float(sc), rank=i + 1, segment=segment.value,
-                   source=RecSource.REPURCHASE)
+                   source=RecSource.REPURCHASE,
+                   source_detail=RecSourceDetail.REPURCHASE_HISTORY)
         for i, (pid, sc) in enumerate(repurchase_pool[: repurchase_n + 10])
     ]
     repurchase = _diversity_filter(repurchase, s.max_per_group)[:repurchase_n]
@@ -219,11 +245,18 @@ def recommend(
             d_ranked = sorted(
                 collab.items(), key=lambda item: (-item[1], item[0])
             )[:_STOCK_POOL_CAP]
+            candidate_live = live_remap.live_product_map([pid for pid, _ in d_ranked])
+            d_ranked = [
+                (pid, score)
+                for pid, score in d_ranked
+                if candidate_live.get(pid) not in owned_live
+            ]
             stocked = repo.in_stock_product_ids([pid for pid, _ in d_ranked])
             d_ranked = [(pid, sc) for pid, sc in d_ranked if pid in stocked]
             discovery = [
                 ProductRec(product_id=pid, score=float(sc), rank=i + 1, segment=segment.value,
-                           source=RecSource.DISCOVERY)
+                           source=RecSource.DISCOVERY,
+                           source_detail=RecSourceDetail.SIMILAR_CLIENTS)
                 for i, (pid, sc) in enumerate(d_ranked[: discovery_n + 5])
             ]
             discovery = _diversity_filter(discovery, s.max_per_group)[:discovery_n]
@@ -233,10 +266,34 @@ def recommend(
 
     combined = repurchase + discovery
     if include_discovery and len(combined) < top_n:
-        combined = _backfill(combined, customer_id, as_of, top_n, segment, excl)
+        combined = _backfill(
+            combined,
+            customer_id,
+            as_of,
+            top_n,
+            segment,
+            excl,
+            owned_live,
+        )
     # History carries product ids of soft-deleted catalog generations (re-syncs mint new
     # rows); translate onto live rows so the gba-server hydration doesn't drop the list.
     combined = live_remap.remap_recs_to_live(combined)
+    mislabeled_owned = [
+        item.product_id
+        for item in combined
+        if item.source == RecSource.DISCOVERY and item.product_id in owned_live
+    ]
+    if mislabeled_owned:
+        log.error(
+            "owned_products_blocked_from_discovery",
+            customer_id=customer_id,
+            product_ids=mislabeled_owned,
+        )
+        combined = [
+            item
+            for item in combined
+            if item.source != RecSource.DISCOVERY or item.product_id not in owned_live
+        ]
     # Defense in depth: the exact live ids returned to the caller must still be in operational
     # resale stock. The repository uses the same remap rule, so this should remove nothing.
     final_stock = repo.in_stock_product_ids([item.product_id for item in combined])
@@ -255,4 +312,7 @@ def recommend(
         latency_ms=round(latency_ms, 2),
         cached=False,
         as_of_date=as_of,
+        source_history_start=history.source_history_start.isoformat(),
+        effective_start=history.effective_start.isoformat(),
+        history_complete=history.history_complete,
     )

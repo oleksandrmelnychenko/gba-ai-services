@@ -22,12 +22,168 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from app.core.config import get_settings
+from app.core.history import coverage
+from app.risk.lineage import (
+    CURRENT_STATE_EXCEPTIONS,
+    FORWARD_ARTIFACT_ROLE,
+    FORWARD_DATASET_ROLE,
+    FORWARD_MIN_UNIQUE_POSITIVE_CLIENTS,
+    LINEAGE_SCHEMA_VERSION,
+    TRANSACTIONAL_HISTORY_POLICY,
+    LineageError,
+    model_payload_sha256,
+    validate_production_artifact,
+)
+
 _ART = Path(__file__).resolve().parent / "artifacts" / "forward_scorecard_coeffs.json"
+_STATUS = Path(__file__).resolve().parent / "artifacts" / "forward_model_status.json"
+
+
+class ForwardModelUnavailableError(RuntimeError):
+    """The forward model is deliberately unavailable; current-state scoring remains usable."""
+
+
+@lru_cache(maxsize=1)
+def _load_status() -> dict[str, Any]:
+    try:
+        status = json.loads(_STATUS.read_text())
+    except FileNotFoundError as exc:
+        raise ForwardModelUnavailableError("forward model status artifact is missing") from exc
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ForwardModelUnavailableError("forward model status artifact is unreadable") from exc
+
+    expected = get_settings().source_history_start_date.isoformat()
+    if (
+        status.get("lineage_schema_version") != LINEAGE_SCHEMA_VERSION
+        or status.get("artifact_role") != FORWARD_ARTIFACT_ROLE
+        or status.get("source_history_start") != expected
+    ):
+        raise ForwardModelUnavailableError("forward model status lineage rejected")
+    state = status.get("status")
+    if state not in {"available", "unavailable"}:
+        raise ForwardModelUnavailableError("forward model status is invalid")
+    if state == "unavailable" and (
+        status.get("reason") != "insufficient_unique_positive_clients"
+        or status.get("minimum_unique_positive_clients")
+        != FORWARD_MIN_UNIQUE_POSITIVE_CLIENTS
+        or not isinstance(status.get("observed_unique_positive_clients"), int)
+        or status["observed_unique_positive_clients"]
+        >= FORWARD_MIN_UNIQUE_POSITIVE_CLIENTS
+    ):
+        raise ForwardModelUnavailableError("forward unavailable status evidence is invalid")
+    if state == "unavailable":
+        dataset = status.get("dataset_lineage")
+        if (
+            not isinstance(dataset, dict)
+            or dataset.get("lineage_schema_version") != LINEAGE_SCHEMA_VERSION
+            or dataset.get("dataset_role") != FORWARD_DATASET_ROLE
+            or dataset.get("source_history_start") != expected
+            or dataset.get("transactional_history_policy")
+            != TRANSACTIONAL_HISTORY_POLICY
+            or dataset.get("current_state_exceptions") != CURRENT_STATE_EXCEPTIONS
+            or dataset.get("parquet_sha256") != status.get("dataset_sha256")
+            or dataset.get("positives") != status.get("observed_positive_rows")
+            or dataset.get("unique_positive_clients")
+            != status.get("observed_unique_positive_clients")
+            or not isinstance(status.get("observed_atrisk_rows"), int)
+            or status["observed_atrisk_rows"] < status["observed_positive_rows"]
+            or not isinstance(status.get("evaluated_at"), str)
+        ):
+            raise ForwardModelUnavailableError(
+                "forward unavailable dataset lineage is invalid"
+            )
+        date_coverage = dataset.get("date_coverage")
+        if not isinstance(date_coverage, list) or not date_coverage:
+            raise ForwardModelUnavailableError(
+                "forward unavailable date lineage is missing"
+            )
+        for item in date_coverage:
+            try:
+                history = coverage(item["feature_date"], 12)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ForwardModelUnavailableError(
+                    "forward unavailable date lineage is invalid"
+                ) from exc
+            if (
+                item.get("requested_start") != history.requested_start.isoformat()
+                or item.get("effective_start") != history.effective_start.isoformat()
+                or item.get("history_complete") is not history.history_complete
+                or item.get("label_date", "") < item["feature_date"]
+            ):
+                raise ForwardModelUnavailableError(
+                    "forward unavailable date lineage is invalid"
+                )
+    return status
 
 
 @lru_cache(maxsize=1)
 def _load() -> dict[str, Any]:
-    return json.loads(_ART.read_text())
+    status = _load_status()
+    if status["status"] != "available":
+        raise ForwardModelUnavailableError(
+            f"forward model unavailable: {status['reason']} "
+            f"({status['observed_unique_positive_clients']} < "
+            f"{status['minimum_unique_positive_clients']} unique positive clients)"
+        )
+    try:
+        artifact = json.loads(_ART.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ForwardModelUnavailableError(
+            "forward scorecard artifact is missing or unreadable"
+        ) from exc
+    try:
+        lineage = validate_production_artifact(
+            artifact,
+            artifact_role=FORWARD_ARTIFACT_ROLE,
+        )
+    except LineageError as exc:
+        raise ForwardModelUnavailableError(
+            f"forward scorecard lineage rejected: {exc}"
+        ) from exc
+    if (
+        status.get("training_run_id") != lineage["training_run_id"]
+        or status.get("model_payload_sha256") != model_payload_sha256(artifact)
+    ):
+        raise ForwardModelUnavailableError("forward status/model artifact mismatch")
+    return artifact
+
+
+def forward_model_readiness() -> dict[str, Any]:
+    """Return explicit degraded metadata instead of probing the legacy scorecard directly."""
+    try:
+        status = _load_status()
+    except ForwardModelUnavailableError as exc:
+        return {"ready": False, "status": "unavailable", "reason": str(exc)}
+    if status["status"] != "available":
+        return {
+            "ready": False,
+            "status": "unavailable",
+            "reason": status["reason"],
+            "source_history_start": status["source_history_start"],
+            "observed_unique_positive_clients": status[
+                "observed_unique_positive_clients"
+            ],
+            "minimum_unique_positive_clients": status[
+                "minimum_unique_positive_clients"
+            ],
+            "observed_positive_rows": status["observed_positive_rows"],
+            "dataset_sha256": status["dataset_sha256"],
+            "evaluated_at": status["evaluated_at"],
+        }
+    try:
+        artifact = _load()
+    except (OSError, json.JSONDecodeError, ForwardModelUnavailableError) as exc:
+        return {"ready": False, "status": "unavailable", "reason": str(exc)}
+    lineage = artifact["training_lineage"]
+    return {
+        "ready": True,
+        "status": "available",
+        "reason": None,
+        "training_run_id": lineage["training_run_id"],
+        "trained_at": lineage["trained_at"],
+        "dataset_sha256": lineage["dataset"]["parquet_sha256"],
+    }
 
 
 def _apply_woe(value: float, bins: list[dict]) -> float:

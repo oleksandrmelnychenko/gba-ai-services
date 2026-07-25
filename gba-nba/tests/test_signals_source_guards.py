@@ -139,11 +139,11 @@ def test_synthetic_exclusion_holds_when_ubiquity_does_not_fire(monkeypatch):
     guard must STILL exclude the synthetic id from the effective exclusion set."""
     dynamic_id = 42_424_242
     monkeypatch.setattr(sig, "synthetic_product_ids", lambda: frozenset({dynamic_id}))
-    monkeypatch.setattr(sig, "ubiquitous_product_ids", lambda pct: frozenset())
-    assert dynamic_id in sig._excluded(), (
+    monkeypatch.setattr(sig, "ubiquitous_product_ids", lambda pct, as_of: frozenset())
+    assert dynamic_id in sig._excluded("2026-07-25"), (
         "with ubiquity not firing, the synthetic id must still be excluded via the hard guard"
     )
-    assert dynamic_id in ds._excluded_pids(), (
+    assert dynamic_id in ds._excluded_pids("2026-07-25"), (
         "dataset path must also hard-exclude the synthetic id when ubiquity does not fire"
     )
 

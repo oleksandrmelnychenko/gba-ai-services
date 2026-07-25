@@ -22,7 +22,7 @@ def generate(manager_id: int, as_of: str, window_tag: str) -> list[Task]:
     rows = sig.reorder_candidates_for_manager(
         manager_id, as_of, min_cycle_days=s.reorder_min_cycle_days,
         max_overdue_mult=s.reorder_max_overdue_mult)
-    excl = sig.ubiquitous_product_ids(s.ubiquity_exclude_pct)
+    excl = sig.ubiquitous_product_ids(s.ubiquity_exclude_pct, as_of)
     if excl:
         rows = [r for r in rows if int(r["product_id"]) not in excl]
     if not rows:

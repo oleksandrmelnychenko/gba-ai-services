@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 
 import pytest
@@ -86,6 +86,31 @@ def test_sales_source_status_normalizes_exact_integer_counts(monkeypatch):
     assert result["invalid_value_row_count"] == 0
 
 
+def test_sales_source_status_uses_same_floor_and_effective_window_params(monkeypatch):
+    captured: list[dict] = []
+
+    def fake_query(sql: str, params=None):
+        if sql == sig._SALES_SOURCE_SCHEMA_SQL:
+            return [{"source_schema_present": 1}]
+        captured.append(params)
+        return []
+
+    as_of = datetime(2026, 7, 25, 12, 30)
+    monkeypatch.setattr(sig, "query", fake_query)
+    monkeypatch.setattr(sig, "synthetic_product_id", lambda: 999)
+
+    sig.sales_source_status(as_of, 24)
+
+    assert captured == [
+        {
+            "asof": as_of,
+            "source_history_start": "2025-01-01",
+            "history_start": "2025-01-01",
+            "synth": 999,
+        }
+    ]
+
+
 def test_history_summary_keeps_decimal_precision_until_money_boundary():
     summary = sig.history_summary(
         [
@@ -122,10 +147,45 @@ def test_history_summary_rejects_rows_beyond_calendar_window():
         )
 
 
-def test_calendar_window_is_anchored_to_first_day_and_not_mid_month():
-    assert "DATEFROMPARTS(YEAR(:asof), MONTH(:asof), 1)" in sig._WINDOW
-    assert "1 - :months" in sig._WINDOW
-    assert "DATEADD(month, -:months, :asof)" not in sig._WINDOW
+def test_calendar_window_enforces_source_and_effective_parameter_boundaries():
+    assert "o.Created >= :source_history_start" in sig._WINDOW
+    assert "o.Created >= :history_start" in sig._WINDOW
+    assert "o.Created < :asof" in sig._WINDOW
+    assert "DATEADD" not in sig._WINDOW
+
+
+def test_monthly_query_clamps_sql_params_to_source_floor(monkeypatch):
+    captured: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        sig,
+        "query",
+        lambda sql, params=None: captured.append((sql, params)) or [],
+    )
+    monkeypatch.setattr(sig, "synthetic_product_id", lambda: 999)
+
+    sig.monthly_sales_by_client(11, "2026-07-25", 24)
+
+    assert captured[0][1] == {
+        "asof": "2026-07-25",
+        "source_history_start": "2025-01-01",
+        "history_start": "2025-01-01",
+        "cid": 11,
+        "synth": 999,
+    }
+
+
+def test_monthly_query_uses_requested_start_once_full_window_is_available(monkeypatch):
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        sig,
+        "query",
+        lambda sql, params=None: captured.append(params) or [],
+    )
+
+    sig.monthly_sales_by_product(22, "2027-07-25", 24)
+
+    assert captured[0]["source_history_start"] == "2025-01-01"
+    assert captured[0]["history_start"] == "2025-08-01"
 
 
 def test_forecast_source_fingerprint_is_scoped_and_money_sensitive(monkeypatch):
@@ -159,7 +219,8 @@ def test_forecast_source_fingerprint_is_scoped_and_money_sensitive(monkeypatch):
     assert "ca.ClientID = :cid OR oi.ProductID = :pid" in captured[0][0]
     assert captured[0][1] == {
         "asof": "2026-07-25",
-        "months": 24,
+        "source_history_start": "2025-01-01",
+        "history_start": "2025-01-01",
         "synth": 999,
         "cid": 11,
         "pid": 22,
@@ -173,7 +234,12 @@ def test_forecast_source_fingerprint_no_scope_never_reads_db(monkeypatch):
         lambda *args: (_ for _ in ()).throw(AssertionError("no scope has no factual rows")),
     )
 
-    assert sig.forecast_source_fingerprint(None, None, "2026-07-25", 24) == "no-scope"
+    first = sig.forecast_source_fingerprint(None, None, "2026-07-25", 24)
+    monkeypatch.setattr(sig.get_settings(), "source_history_start_date", date(2025, 2, 1))
+    second = sig.forecast_source_fingerprint(None, None, "2026-07-25", 24)
+
+    assert len(first) == len(second) == 24
+    assert first != second
 
 
 @pytest.mark.parametrize("value", [Decimal("-0.01"), Decimal("NaN"), Decimal("Infinity")])

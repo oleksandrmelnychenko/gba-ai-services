@@ -38,7 +38,7 @@ def main():
     as_of = sys.argv[1] if len(sys.argv) > 1 else "2026-06-08"
     print(f"=== NBA real-data census @ {as_of} ===\n")
 
-    excl = R.ubiquitous_product_ids(0.20)
+    excl = R.ubiquitous_product_ids(0.20, as_of)
     suffix = "..." if len(excl) > 10 else ""
     print(f"Ubiquity-excluded SKUs (>20% of clients): {len(excl)} -> {sorted(excl)[:10]}{suffix}")
     if excl:

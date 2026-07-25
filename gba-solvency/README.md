@@ -5,44 +5,32 @@ Per-client solvency / платоспроможність scoring for GBA. Servic
 the console. Mirrors the hardened infra of gba-reco: read-only SQL login, parameterized SQL,
 env-only secrets, structured JSON logging, thread-safe metrics, graceful Redis degradation.
 
-## Algorithm — CreditScore-100 (`creditscore100-v2`)
+## Production model — `creditscore-v3`
 
-Per client, aggregated over the client's agreements, trailing `window_months` (default 12) by
-`Sale.Created`:
+The serving model is an explainable WOE + logistic current-state SEV180 scorecard. It returns
+score `0..100` (higher is safer), calibrated current-state PD, A/B/C/D rating and signed
+per-feature contributions. The old five-factor `creditscore100-v2` output is retained only as
+nullable response fields for compatibility and is not the production score.
 
-```
-Score = 100 * (0.35*PaymentDiscipline + 0.25*DebtLoad + 0.20*Activity
-               + 0.10*Tenure + 0.10*ReturnQuality)
-```
+All transactional features are clamped to `SOURCE_HISTORY_START_DATE=2025-01-01`. Two
+point-in-time state inputs are intentionally exempt from that historical cutoff:
 
-Each sub-factor is normalized to 0..1 (1 = best / lowest risk):
+- open debt balances that still exist as of the feature date;
+- current agreement credit terms as of the feature date.
 
-1. **PaymentDiscipline** = `(paid + overpaid + 0.5*partial) / (paid + overpaid + partial + notpaid)`
-   over the client's sales. Status comes from `BaseSalePaymentStatus.SalePaymentStatusType`
-   (`NotPaid=0, Paid=1, Overpaid=2, PartialPaid=3, Refund=4`). Paid+Overpaid = good,
-   PartialPaid = 0.5, NotPaid = bad, **Refund=4 excluded** from the ratio. Retail sales use a
-   DIFFERENT enum `RetailPaymentStatusType` (`PartialPaid=3, Paid=4`) — handled by a separate
-   mapping layer, never conflated.
-2. **DebtLoad** — *sync-aware*. If the `Debt` table is quiesced (rows with `Deleted=0` and sane
-   `Created`): `clamp(1 - overdue_eur / turnover_eur, 0, 1)`, where `overdue` = `SUM(Debt.Total->EUR)`
-   for debts older than the agreement grace (`Agreement.NumberDaysDebt`). Otherwise (Debt
-   sync-blocked, all `Deleted=1`): live proxy `clamp(1 - open_unpaid_count / total_sales, 0, 1)`.
-   The service detects which source is live (`debt_sync_is_live()`) and records it in
-   `debt_load_source`.
-3. **Activity** = `0.5*recency + 0.5*frequency`; `recency = clamp(1 - recency_days/90, 0, 1)`,
-   `frequency = clamp(order_count/24, 0, 1)`.
-4. **Tenure** = `clamp(tenure_months/24, 0, 1)`.
-5. **ReturnQuality** = `clamp(1 - return_qty_rate*2, 0, 1)`.
+A date string in a JSON model is not accepted as lineage. Dataset builders persist the feature
+and label dates inside parquet, write a SHA-256 sidecar with counts and effective history windows,
+and trainers embed that verified manifest plus the validation gate and a model-payload hash.
+Serving rejects artifacts that lack or contradict any part of that chain.
 
-**Caps** (credit policy, applied AFTER the weighted sum): controlled agreements
-(`Agreement.IsControlAmountDebt=1, AmountDebt>0`) — if `limit_utilization = CurrentAmount/AmountDebt > 1.0`
-hard-cap Score at **40**; if `> 0.9` cap at **60**. If `Client.IsBlocked=1` multiply Score by **0.5**.
-Then round to int 0..100.
+The six-month forward model is currently unavailable because the post-floor cohort contains only
+3 unique positive clients versus the production minimum of 30. `/score` therefore preserves the
+validated current score but returns `forward_risk=null`,
+`forward_risk_status="model_unavailable"` and a reason. `/health` is degraded, while `/ready`
+remains ready when infrastructure, source data and the current model are valid.
 
-**Rating bands**: A = 80-100, B = 65-79, C = 45-64, D = 0-44.
-
-**Explainability**: every sub-factor returns its raw 0..1 value AND its weighted points
-contribution, plus which caps fired — so the UI renders contribution bars + the reason.
+See [the exact model card](app/risk/artifacts/MODEL_CARD.md) and
+[lineage/retrain contract](docs/model-lineage.md).
 
 ## Critical data traps (honored in `solvency_repository.py`)
 
@@ -70,7 +58,7 @@ cp .env.example .env   # fill DB_PASSWORD with the read-only login
 - `POST /score/batch` — `{client_ids[], as_of_date?}` → list of `SolvencyScore` (errors isolated).
 - `GET /charts/{client_id}?as_of_date=&months=12` → `SolvencyCharts` (live-buildable charts only;
   aging-over-time heatmap = `pending` until Debt sync settles).
-- `GET /health`, `GET /metrics`.
+- `GET /health`, `GET /ready`, `GET /metrics`.
 
 ## Security
 
@@ -79,6 +67,6 @@ cp .env.example .env   # fill DB_PASSWORD with the read-only login
 
 ## Status
 
-Implemented: config (port 8003, Redis db 2, `creditscore100-v2`), pooled read-only DB layer,
-parameterized solvency repository, scoring engine, caps, ratings, explainability, charts,
-domain models, FastAPI shell, tests.
+Implemented: config (port 8003, Redis db 2, `creditscore-v3`), pooled read-only DB layer,
+parameterized solvency repository, lineage-gated current-state scoring, fail-closed forward
+status, explainability, charts, domain models, FastAPI shell and tests.

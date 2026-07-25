@@ -20,6 +20,7 @@ import math
 from datetime import date
 
 from app.core.config import get_settings
+from app.core.history import rolling_coverage
 from app.data import supply_repository as repo
 from app.domain.models import DemandForecast
 
@@ -119,7 +120,13 @@ def _demand_events(rows: list[dict]) -> list[tuple[date, float]]:
     return events
 
 
-def _croston_rate(rows: list[dict], history_days: int, alpha: float, sba: bool) -> float:
+def _croston_rate(
+    rows: list[dict],
+    history_days: int,
+    alpha: float,
+    sba: bool,
+    effective_start: str | date | None = None,
+) -> float:
     """Per-day demand rate via Croston's method (SBA-corrected when sba=True).
 
     Smooths demand SIZE z on demand-occurrence periods and the INTER-DEMAND INTERVAL p
@@ -137,7 +144,14 @@ def _croston_rate(rows: list[dict], history_days: int, alpha: float, sba: bool) 
     days = [e[0] for e in events]
     sizes = [e[1] for e in events]
 
-    window_start = days[0] - _timedelta_days(_window_lookback(days, history_days))
+    if effective_start is None:
+        window_start = days[0] - _timedelta_days(
+            _window_lookback(days, history_days)
+        )
+    elif isinstance(effective_start, str):
+        window_start = date.fromisoformat(effective_start[:10])
+    else:
+        window_start = effective_start
     intervals: list[float] = []
     prev = window_start
     for d in days:
@@ -179,6 +193,8 @@ def _window_lookback(days: list[date], history_days: int) -> int:
 def forecast_from_rows(
     product_id: int, rows: list[dict], horizon_days: int | None = None,
     method: str | None = None,
+    effective_history_days: int | None = None,
+    effective_start: str | date | None = None,
 ) -> DemandForecast:
     """Forecast from an already-fetched daily-demand series (no DB I/O).
 
@@ -190,6 +206,11 @@ def forecast_from_rows(
     s = get_settings()
     horizon = horizon_days or s.forecast_horizon_days
     method = (method or s.forecast_method or "moving_avg").lower()
+    window_days = (
+        s.history_days
+        if effective_history_days is None
+        else max(int(effective_history_days), 0)
+    )
 
     if not rows:
         method_id = {
@@ -199,19 +220,31 @@ def forecast_from_rows(
                               method=method_id, horizon_days=horizon, forecast_units=0.0)
 
     if method == "croston":
-        mean_daily = _croston_rate(rows, s.history_days, s.croston_alpha, sba=False)
+        mean_daily = _croston_rate(
+            rows,
+            window_days,
+            s.croston_alpha,
+            sba=False,
+            effective_start=effective_start,
+        )
         method_id = _METHOD_CROSTON
     elif method == "sba":
-        mean_daily = _croston_rate(rows, s.history_days, s.croston_alpha, sba=True)
+        mean_daily = _croston_rate(
+            rows,
+            window_days,
+            s.croston_alpha,
+            sba=True,
+            effective_start=effective_start,
+        )
         method_id = _METHOD_SBA
     elif method == "ewma":
         mean_daily = _ewma_monthly_rate(rows, s.ewma_alpha)
         method_id = _METHOD_EWMA
     else:
-        mean_daily = _moving_avg_rate(rows, s.history_days)
+        mean_daily = _moving_avg_rate(rows, window_days)
         method_id = _METHOD_MOVING_AVG
 
-    std_daily = _empirical_std_daily(rows, s.history_days)
+    std_daily = _empirical_std_daily(rows, window_days)
 
     return DemandForecast(
         product_id=product_id,
@@ -225,5 +258,12 @@ def forecast_from_rows(
 
 def forecast_product(product_id: int, as_of: str, horizon_days: int | None = None) -> DemandForecast:
     s = get_settings()
+    coverage = rolling_coverage(as_of, s.history_days)
     rows = repo.product_daily_demand(product_id, as_of, s.history_days)
-    return forecast_from_rows(product_id, rows, horizon_days)
+    return forecast_from_rows(
+        product_id,
+        rows,
+        horizon_days,
+        effective_history_days=coverage.effective_history_days,
+        effective_start=coverage.effective_start,
+    )

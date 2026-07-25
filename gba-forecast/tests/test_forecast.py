@@ -36,6 +36,34 @@ def test_series_from_fills_zeros():
     assert fc.series_from({"2026-06": 100.0}, labels) == [0.0, 0.0, 100.0]
 
 
+def test_history_labels_and_dense_series_never_invent_pre_source_months():
+    labels = fc.history_labels(
+        date(2026, 7, 25),
+        24,
+        date(2025, 1, 1),
+    )
+    series = fc.series_from(
+        {
+            "2024-12": 999.0,
+            "2025-01": 100.0,
+            "2026-07": 200.0,
+        },
+        labels,
+    )
+
+    assert labels[0] == "2025-01"
+    assert labels[-1] == "2026-07"
+    assert len(labels) == len(series) == 19
+    assert not any(label.startswith("2024-") for label in labels)
+    assert series[0] == 100.0
+    assert 999.0 not in series
+
+
+def test_history_labels_reject_as_of_before_source_floor():
+    with pytest.raises(ValueError, match="as_of_date_before_source_history_start"):
+        fc.history_labels(date(2024, 12, 31), 24, date(2025, 1, 1))
+
+
 def test_future_months_after_as_of_with_year_rollover():
     assert fc.future_months(date(2026, 11, 10), 3) == [(2026, 12), (2027, 1), (2027, 2)]
 

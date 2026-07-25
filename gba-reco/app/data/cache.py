@@ -1,8 +1,9 @@
 """Redis cache — ONE documented key scheme (fixes the prototype's 3-scheme mess).
 
 Key scheme (single source of truth):
-    reco:v1:{customer_id}:{as_of}:{top_n}:{discovery}
-The model version is embedded so a model bump auto-invalidates old entries.
+    reco:{model_version}:{customer_id}:{as_of}:{top_n}:{discovery}
+The model version embeds the source-history floor, so either model or boundary changes
+auto-invalidate old entries.
 
 Graceful degradation: if Redis is down, every call is a no-op miss — the service
 still works (just uncached). Never let cache failure break recommendations.
@@ -21,9 +22,9 @@ from app.core.metrics import METRICS
 
 log = get_logger("cache")
 
-# v36: every recommendation (including repurchase) is scoped to operational resale stock;
-# strict cached-response invariants reject partial/duplicate/stale payloads.
-_MODEL_VERSION = "v36-operational-stock-202607"
+# v38: v37 source truth plus a hard 2025-01-01 transactional-history floor. Embedding the
+# boundary prevents pre-floor cached results from surviving the contract change.
+_MODEL_VERSION = "v38-history-floor-20250101-source-detail-202607"
 _RETRY_COOLDOWN_S = 30.0
 _client: redis.Redis | None = None
 _unavailable_until = 0.0

@@ -12,9 +12,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    # Shared AI-fleet source contract. All business history is tracked from this date.
-    source_history_start_date: date = date(2025, 1, 1)
-
     db_host: str = "127.0.0.1"
     db_port: int = 1433
     db_name: str = "ConcordDb_V5"
@@ -58,6 +55,9 @@ class Settings(BaseSettings):
     forecast_horizon_months: int = 6  # default # of months to project forward
     max_forecast_horizon_months: int = 24  # hard API cap to prevent accidental heavy calls
     history_months: int = 24  # trailing window of monthly history fed to the model
+    # Earliest factually available source date. Every live query, dense series, cache epoch,
+    # readiness snapshot, and offline backtest is clamped to this boundary.
+    source_history_start_date: date = date(2025, 1, 1)
     # Health is business-ready only while the newest canonical (non-synthetic) sale consumed by
     # the model is no older than this. Seven days tolerates weekends without masking a stopped
     # 1С/source synchronization for weeks.

@@ -1,8 +1,9 @@
 """Redis cache — ONE documented key scheme.
 
 Key scheme (single source of truth):
-    solv:{model_version}:{client_id}:{as_of}:{months}
-The model version is embedded so a model bump auto-invalidates old entries.
+    solv:{response_contract}:{history_version}:{model_version}:{client_id}:{as_of}:{months}
+The model, history boundary and response-contract versions are embedded so any semantic change
+automatically invalidates old entries.
 
 Graceful degradation: if Redis is down, every call is a no-op miss — the service
 still works (just uncached). Never let cache failure break scoring.
@@ -22,12 +23,17 @@ from app.core.metrics import METRICS
 log = get_logger("cache")
 
 _RETRY_COOLDOWN_S = 30.0
+_RESPONSE_CONTRACT = "response-v4"
 _client: redis.Redis | None = None
 _unavailable_until = 0.0
 
 
 def _model_version() -> str:
     return get_settings().model_version
+
+
+def _history_version() -> str:
+    return f"history-{get_settings().source_history_start_date:%Y%m%d}"
 
 
 def _get_client() -> redis.Redis | None:
@@ -54,11 +60,17 @@ def _get_client() -> redis.Redis | None:
 
 
 def make_key(client_id: int, as_of: str, months: int) -> str:
-    return f"solv:{_model_version()}:{client_id}:{as_of}:{months}"
+    return (
+        f"solv:{_RESPONSE_CONTRACT}:{_history_version()}:{_model_version()}:"
+        f"{client_id}:{as_of}:{months}"
+    )
 
 
 def make_charts_key(client_id: int, as_of: str, months: int) -> str:
-    return f"solvchart:{_model_version()}:{client_id}:{as_of}:{months}"
+    return (
+        f"solvchart:{_RESPONSE_CONTRACT}:{_history_version()}:{_model_version()}:"
+        f"{client_id}:{as_of}:{months}"
+    )
 
 
 def get(key: str) -> dict[str, Any] | None:
@@ -98,7 +110,10 @@ def invalidate_client(client_id: int) -> int:
         return 0
     deleted = 0
     for prefix in ("solv", "solvchart"):
-        pattern = f"{prefix}:{_model_version()}:{client_id}:*"
+        pattern = (
+            f"{prefix}:{_RESPONSE_CONTRACT}:{_history_version()}:"
+            f"{_model_version()}:{client_id}:*"
+        )
         keys = list(client.scan_iter(match=pattern, count=200))
         if keys:
             deleted += client.delete(*keys)

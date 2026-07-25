@@ -27,6 +27,18 @@ def _wire_operational_dependencies(monkeypatch, *, business_ready: bool) -> None
     monkeypatch.setattr(main.cache, "health", lambda: True)
     monkeypatch.setattr(main, "_synthetic_drift_ok_cached", lambda: True)
     monkeypatch.setattr(main, "_drift_summary_cached", lambda: None)
+    monkeypatch.setattr(
+        main,
+        "_model_readiness",
+        lambda: {
+            "current_state": {"ready": True, "training_run_id": "current-test"},
+            "forward_6m": {
+                "ready": False,
+                "status": "unavailable",
+                "reason": "insufficient_unique_positive_clients",
+            },
+        },
+    )
     from app.data import solvency_repository as repo
 
     monkeypatch.setattr(
@@ -49,6 +61,11 @@ def test_health_fails_closed_on_stale_business_source(monkeypatch):
 
 def test_ready_is_200_only_for_complete_business_readiness(monkeypatch):
     _wire_operational_dependencies(monkeypatch, business_ready=True)
+    health = TestClient(main.app).get("/health")
+    assert health.json()["status"] == "degraded"
+    assert health.json()["serving_ready"] is True
+    assert health.json()["model_readiness"]["forward_6m"]["ready"] is False
+
     response = TestClient(main.app).get("/ready")
     assert response.status_code == 200
     assert response.json()["status"] == "ready"

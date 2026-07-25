@@ -35,6 +35,7 @@ import pandas as pd
 from dateutil.relativedelta import relativedelta
 
 from app.risk.dataset import FEATURE_COLUMNS, build_dataset
+from app.risk.lineage import FORWARD_DATASET_ROLE, write_dataset_manifest
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 POOLED_PATH = DATA_DIR / "risk_vintages_6mo.parquet"
@@ -127,6 +128,16 @@ def main() -> int:
 
     pooled = pd.concat(frames, ignore_index=True)
     pooled.to_parquet(POOLED_PATH, index=False)
+    manifest = write_dataset_manifest(
+        POOLED_PATH,
+        pooled,
+        dataset_role=FORWARD_DATASET_ROLE,
+        target_column="forward_default",
+        feature_dates=[fd for fd, _ in vintages],
+        label_dates=[ld for _, ld in vintages],
+        window_months=WINDOW_MONTHS,
+        builder="scripts/build_vintages.py",
+    )
 
     # -------------------------------------------------------------- per-vintage report
     _hr("PER-VINTAGE SUMMARY")
@@ -155,6 +166,8 @@ def main() -> int:
     print(f"unique pos clients     : {atrisk[atrisk['forward_default'] == 1]['client_id'].nunique()}")
     print(f"feature columns        : {len(FEATURE_COLUMNS)}")
     print(f"saved parquet          -> {POOLED_PATH}")
+    print(f"saved lineage          -> {POOLED_PATH.with_suffix('.lineage.json')}")
+    print(f"parquet sha256         : {manifest['parquet_sha256']}")
 
     # -------------------------------------------------------------- proposed temporal split
     _hr("PROPOSED TEMPORAL SPLIT (train=earliest half of vintages, test=latest half)")

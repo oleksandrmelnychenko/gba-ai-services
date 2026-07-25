@@ -50,6 +50,7 @@ def test_config_solvency_defaults():
     assert s.redis_db == 2
     assert s.model_version == "creditscore-v3"
     assert s.window_months == 12
+    assert s.source_history_start_date.isoformat() == "2025-01-01"
     assert s.synthetic_line_product_ids == {29555414}
     assert s.synthetic_line_product_id == 29555414  # back-compat single-value accessor
 
@@ -114,11 +115,11 @@ def test_cache_key_stable_and_versioned():
     k1 = make_key(123, "2026-06-01", 12)
     k2 = make_key(123, "2026-06-01", 12)
     assert k1 == k2
-    assert k1.startswith("solv:")
+    assert k1.startswith("solv:response-v4:history-20250101:")
     assert ":123:" in k1
     assert "creditscore-v3" in k1
     ck = make_charts_key(123, "2026-06-01", 12)
-    assert ck.startswith("solvchart:")
+    assert ck.startswith("solvchart:response-v4:history-20250101:")
 
 
 def test_api_money_uses_half_up_and_rounds_only_after_aggregate():

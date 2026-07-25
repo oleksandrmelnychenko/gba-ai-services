@@ -9,12 +9,14 @@ import hmac
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import date
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.core.config import get_settings
+from app.core.history import history_metadata, trailing_month_history_window
 from app.core.logging import get_logger
 from app.core.metrics import METRICS
 from app.data import cache
@@ -50,6 +52,24 @@ def _service():
         return mod
     from app.services.pricing import service
     return service
+
+
+def _validate_as_of_date(as_of_date: date | None) -> None:
+    if as_of_date is not None and as_of_date < settings.source_history_start_date:
+        raise HTTPException(status_code=422, detail="as_of_date_before_source_history_start")
+
+
+def _current_history_metadata() -> dict:
+    window = trailing_month_history_window(
+        date.today(),
+        settings.trailing_window_months,
+        settings.source_history_start_date,
+    )
+    return history_metadata(
+        window,
+        model_version=settings.model_version,
+        trailing_window_months=settings.trailing_window_months,
+    )
 
 
 @asynccontextmanager
@@ -99,6 +119,7 @@ def health() -> dict:
 
 
 def _health_snapshot() -> dict:
+    coverage = _current_history_metadata()
     db_ok = True
     try:
         with get_engine().connect() as c:
@@ -107,15 +128,20 @@ def _health_snapshot() -> dict:
         db_ok = False
     redis_ok = cache.health()
     source = {
+        **coverage,
         "business_ready": False,
         "reasons": ["database_unavailable"],
     }
     if db_ok:
         try:
-            source = repo.source_readiness(settings.max_source_lag_days)
+            source = {
+                **coverage,
+                **repo.source_readiness(settings.max_source_lag_days),
+            }
         except Exception as exc:  # noqa: BLE001
             log.warning("source_readiness_failed", error=str(exc))
             source = {
+                **coverage,
                 "business_ready": False,
                 "reasons": ["source_query_failed"],
             }
@@ -133,6 +159,7 @@ def _health_snapshot() -> dict:
     business_ready = source.get("business_ready") is True
     healthy = db_ok and redis_ok and business_ready
     return {
+        **coverage,
         "status": "healthy" if healthy else "degraded",
         "business_ready": business_ready,
         "db_connected": db_ok,
@@ -168,6 +195,7 @@ def price(req: PriceRequest) -> PriceRecommendation:
         raise HTTPException(status_code=422, detail="malformed client_agreement_net_uid")
     if not _is_valid_uid(req.product_net_uid):
         raise HTTPException(status_code=422, detail="malformed product_net_uid")
+    _validate_as_of_date(req.as_of_date)
     try:
         return _service().recommend_price(
             product_id=req.product_id,
@@ -191,6 +219,7 @@ def price(req: PriceRequest) -> PriceRecommendation:
 @app.post("/price/batch")
 def price_batch(req: BatchPriceRequest) -> dict:
     """Per-item errors are isolated so one bad pair doesn't fail the batch."""
+    _validate_as_of_date(req.as_of_date)
     svc = _service()
     as_of = req.as_of_date.isoformat() if req.as_of_date else None
     results, errors = [], []

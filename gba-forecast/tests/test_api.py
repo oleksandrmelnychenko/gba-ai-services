@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -45,6 +45,7 @@ def _cached_client_payload(client_net_id: str, as_of: str, horizon: int) -> dict
             "currency": "EUR",
             "model_version": main.settings.model_version,
             "source_fingerprint": "source-epoch",
+            **main._history_metadata(as_of),
             "requested": {
                 "client_net_id": client_net_id.lower(),
                 "product_net_id": None,
@@ -115,8 +116,11 @@ def test_forecast_rejects_historical_as_of_and_echoes_explicit_current_date(monk
     monkeypatch.setattr(main, "_today", lambda: "2026-07-25")
     client = TestClient(main.app)
 
+    before_source = client.get("/forecast/sales", params={"as_of_date": "2024-12-31"})
     historical = client.get("/forecast/sales", params={"as_of_date": "2026-07-24"})
 
+    assert before_source.status_code == 422
+    assert before_source.json()["detail"] == "as_of_date_before_source_history_start"
     assert historical.status_code == 422
     assert historical.json()["detail"] == "historical_as_of_not_supported"
 
@@ -129,6 +133,9 @@ def test_forecast_rejects_historical_as_of_and_echoes_explicit_current_date(monk
     assert current.status_code == 200
     assert current.json()["meta"]["requested_as_of"] == "2026-07-25"
     assert current.json()["meta"]["as_of"] == "2026-07-25"
+    assert current.json()["meta"]["source_history_start"] == "2025-01-01"
+    assert current.json()["meta"]["effective_start"] == "2025-01-01"
+    assert current.json()["meta"]["history_complete"] is False
 
 
 def test_forecast_cache_hit_revalidates_identity_without_history_read(monkeypatch):
@@ -160,6 +167,26 @@ def test_forecast_cache_hit_revalidates_identity_without_history_read(monkeypatc
     assert response.status_code == 200
     assert len(response.json()["ByClient"]) == horizon
     assert response.json()["meta"]["resolved"]["client_id"] == 123
+
+
+def test_sales_cache_key_changes_with_source_history_floor(monkeypatch):
+    common = (
+        None,
+        None,
+        None,
+        None,
+        999,
+        "source-epoch",
+        6,
+        "2026-07-25",
+        None,
+    )
+    first = main._sales_cache_key(*common)
+
+    monkeypatch.setattr(main.settings, "source_history_start_date", date(2025, 2, 1))
+    second = main._sales_cache_key(*common)
+
+    assert first != second
 
 
 def test_use_cache_false_bypasses_read_and_write(monkeypatch):
@@ -317,9 +344,11 @@ def test_health_is_green_only_with_fresh_canonical_business_data(monkeypatch):
     assert healthy["business_ready"] is True
     assert healthy["data"]["source_ready"] is True
     assert healthy["data"]["source_fresh"] is True
+    assert healthy["data"]["source_history_start"] == "2025-01-01"
+    assert healthy["data"]["effective_start"] == "2025-01-01"
+    assert healthy["data"]["history_complete"] is False
     assert healthy["source_history_start"] == "2025-01-01"
     assert healthy["source_history_contract_ready"] is True
-    assert healthy["data"]["source_history_start"] == "2025-01-01"
 
     source["latest_sale_at"] = now - timedelta(hours=main.settings.source_max_age_hours + 1)
     stale = main._health_snapshot(now)

@@ -118,7 +118,7 @@ def test_target_mtd_matches_independent_sql_to_the_cent(manager_id):
         datetime.fromisoformat(AS_OF).date()
         + __import__("datetime").timedelta(days=1)
     ).isoformat()
-    synthetic = sorted(sig._excluded())
+    synthetic = sorted(sig._excluded(AS_OF))
     from app.data.db import in_clause
 
     excluded_sql, excluded_params = in_clause("excluded", synthetic)
@@ -162,3 +162,19 @@ def test_target_mtd_matches_independent_sql_to_the_cent(manager_id):
 
     assert result["shipped"]["mtd"] == cents(shipped)
     assert result["paid"]["mtd"] == cents(paid)
+
+
+def test_monthly_history_clamp_matches_explicit_source_floor(manager_id):
+    """A pre-floor caller cannot make either accounting series read unavailable source history."""
+    pre_floor = "2024-01-01"
+    source_floor = get_settings().source_history_start_date.isoformat()
+
+    def to_cents(series):
+        return {month: cents(amount) for month, amount in series.items()}
+
+    assert to_cents(sig.monthly_shipped(manager_id, pre_floor, AS_OF)) == to_cents(
+        sig.monthly_shipped(manager_id, source_floor, AS_OF)
+    )
+    assert to_cents(sig.monthly_paid(manager_id, pre_floor, AS_OF)) == to_cents(
+        sig.monthly_paid(manager_id, source_floor, AS_OF)
+    )

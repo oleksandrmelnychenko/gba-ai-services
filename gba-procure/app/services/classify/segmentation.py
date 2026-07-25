@@ -43,9 +43,9 @@ def _as_date(value) -> date:
     return date.fromisoformat(str(value)[:10])
 
 
-def _window_months(as_of, history_days: int) -> list[str]:
+def _window_months(as_of, effective_history_days: int) -> list[str]:
     end = _as_date(as_of)
-    start = end - timedelta(days=history_days)
+    start = end - timedelta(days=effective_history_days)
     months: list[str] = []
     y, m = start.year, start.month
     while (y, m) <= (end.year, end.month):
@@ -56,8 +56,14 @@ def _window_months(as_of, history_days: int) -> list[str]:
     return months
 
 
-def _monthly_units_filled(daily_rows: list[dict], as_of, history_days: int) -> list[float]:
-    monthly: dict[str, float] = {k: 0.0 for k in _window_months(as_of, history_days)}
+def _monthly_units_filled(
+    daily_rows: list[dict],
+    as_of,
+    effective_history_days: int,
+) -> list[float]:
+    monthly: dict[str, float] = {
+        k: 0.0 for k in _window_months(as_of, effective_history_days)
+    }
     for r in daily_rows:
         d = _as_date(r["d"])
         key = f"{d.year:04d}-{d.month:02d}"
@@ -66,13 +72,17 @@ def _monthly_units_filled(daily_rows: list[dict], as_of, history_days: int) -> l
 
 
 def xyz_from_daily(
-    daily_rows: list[dict], as_of, history_days: int
+    daily_rows: list[dict], as_of, effective_history_days: int
 ) -> tuple[str, float, float]:
     """Return (xyz_class, cv, adi). cv = std/mean of zero-filled monthly demand."""
     demand_days = sum(1 for r in daily_rows if float(r["units"] or 0) > 0)
-    adi = (history_days / demand_days) if demand_days > 0 else float("inf")
+    adi = (
+        effective_history_days / demand_days
+        if demand_days > 0
+        else float("inf")
+    )
 
-    series = _monthly_units_filled(daily_rows, as_of, history_days)
+    series = _monthly_units_filled(daily_rows, as_of, effective_history_days)
     if len(series) < 2 or mean(series) <= 0:
         return "Z", float("inf"), adi
     cv = pstdev(series) / mean(series)

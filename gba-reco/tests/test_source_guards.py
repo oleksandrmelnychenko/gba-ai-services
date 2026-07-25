@@ -21,7 +21,7 @@ import re
 from app.core import config
 from app.data import sales_repository
 from app.services.eval import baselines, harness
-from app.services.recommendations import als, copurchase, worker
+from app.services.recommendations import als, copurchase, reranker, worker
 
 VALIDITY_MODULES = {
     "copurchase": copurchase,
@@ -29,6 +29,7 @@ VALIDITY_MODULES = {
     "baselines": baselines,
     "worker": worker,
     "harness": harness,
+    "reranker": reranker,
     "sales_repository": sales_repository,
 }
 
@@ -47,7 +48,7 @@ def test_no_order_deleted_predicate_anywhere():
 
 
 def test_is_valid_for_current_sale_present_in_each_validity_query():
-    for name in ("copurchase", "als", "baselines", "worker", "harness"):
+    for name in ("copurchase", "als", "baselines", "worker", "harness", "reranker"):
         src = inspect.getsource(VALIDITY_MODULES[name])
         assert _VALIDITY_PATTERN.search(src), (
             f"{name}: lost the `oi.IsValidForCurrentSale = 1` validity filter"
@@ -69,6 +70,7 @@ def test_every_live_recommendation_history_query_uses_item_validity():
         sales_repository.repurchase_rate,
         sales_repository.product_frequency,
         sales_repository.product_last_purchase,
+        sales_repository.owned_live_product_ids,
         sales_repository.customer_products,
         sales_repository.candidate_similar_customers,
         sales_repository.customer_products_bulk,
@@ -80,6 +82,80 @@ def test_every_live_recommendation_history_query_uses_item_validity():
             f"{function.__name__}: recommendation history query lost "
             "oi.IsValidForCurrentSale = 1"
         )
+
+
+def test_owned_history_is_compared_on_live_catalog_identity():
+    src = inspect.getsource(sales_repository.owned_live_product_ids)
+    assert "historical.Deleted = 0" in src
+    assert "current_product.VendorCode = historical.VendorCode" in src
+    assert "ORDER BY current_product.ID DESC" in src
+
+
+def test_every_fixed_history_query_has_shared_lower_boundary():
+    functions = (
+        sales_repository.source_readiness,
+        sales_repository.count_orders_before,
+        sales_repository.repurchase_rate,
+        sales_repository.product_frequency,
+        sales_repository.product_last_purchase,
+        sales_repository.owned_live_product_ids,
+        sales_repository.customer_products,
+        sales_repository.candidate_similar_customers,
+        sales_repository.customer_products_bulk,
+        sales_repository.collaborative_products,
+        copurchase._client_products_with_freq,
+        copurchase._cooccurring_products,
+        copurchase._product_degrees,
+        als._load_interactions,
+        baselines.most_frequent_for_client,
+        baselines.global_popular,
+        harness.build_cases,
+        reranker.build_train_cases,
+        reranker._case_features,
+    )
+    for function in functions:
+        src = inspect.getsource(function)
+        assert "o.Created >= :history_start" in src, (
+            f"{function.__module__}.{function.__name__}: lost SOURCE_HISTORY_START_DATE floor"
+        )
+        assert "history_start" in src, (
+            f"{function.__module__}.{function.__name__}: floor parameter is not bound"
+        )
+
+
+def test_multi_population_queries_floor_every_history_branch():
+    assert inspect.getsource(
+        sales_repository.collaborative_products
+    ).count("o.Created >= :history_start") == 2
+    assert inspect.getsource(
+        copurchase._cooccurring_products
+    ).count("o.Created >= :history_start") == 2
+    assert inspect.getsource(reranker._case_features).count(
+        "o.Created >= :history_start"
+    ) == 4
+
+
+def test_rolling_windows_are_clamped_to_source_history_floor():
+    ubiquity = inspect.getsource(sales_repository._query_ubiquitous)
+    active_clients = inspect.getsource(worker.active_clients)
+    reranker_features = inspect.getsource(reranker._case_features)
+
+    assert "DATEADD(month, -12, GETDATE())" in ubiquity
+    assert "o.Created >= :history_start" in ubiquity
+    assert "DATEADD(day, -:days, :asof)" in active_clients
+    assert "o.Created >= :history_start" in active_clients
+    assert "DATEADD(day, -90, :asof)" in reranker_features
+    assert "o.Created >= :history_start" in reranker_features
+
+
+def test_model_and_cache_namespaces_include_history_floor():
+    from app.data import cache
+    from app.domain.models import RecommendationResult
+
+    assert "20250101" in cache._MODEL_VERSION
+    assert "20250101" in RecommendationResult.model_fields["model_version"].default
+    assert "source_history_start_iso()" in inspect.getsource(als.get_model)
+    assert "history_floor" in reranker._ARTIFACT.name
 
 
 def test_stock_filter_is_scoped_to_operational_resale_storages():

@@ -1,6 +1,6 @@
 """Build the vintaged NBA propensity training set and emit the calibration report.
 
-Replays the 4 generators' as-of signal SQL across monthly snapshots T in 2025-08..2026-04
+Replays the 4 generators' as-of signal SQL across complete-history monthly snapshots
 (manager filter dropped), joins H=60d leak-safe outcome labels, pools to one-row-per-instance
 with a vintage column, writes data/nba_dataset.parquet, and prints:
   * total + per-type rows and per-type H60 base rates;
@@ -23,8 +23,7 @@ from app.ml.dataset import build_dataset
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 SNAPSHOTS = [
-    "2025-08-01", "2025-09-01", "2025-10-01", "2025-11-01", "2025-12-01",
-    "2026-01-01", "2026-02-01", "2026-03-01", "2026-04-01",
+    "2026-01-01", "2026-02-01", "2026-03-01", "2026-04-01", "2026-05-01",
 ]
 OUT = Path(__file__).resolve().parents[1] / "data" / "nba_dataset.parquet"
 

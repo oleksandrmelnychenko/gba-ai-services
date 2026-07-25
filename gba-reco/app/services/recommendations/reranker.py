@@ -27,6 +27,7 @@ from pathlib import Path
 
 import numpy as np
 
+from app.core.history import require_supported_as_of, source_history_start_iso
 from app.core.logging import get_logger
 from app.data.db import in_clause, query
 from app.services.recommendations import recommender
@@ -34,7 +35,7 @@ from app.services.recommendations import recommender
 log = get_logger("reranker")
 
 CANDIDATE_M = 50
-_ARTIFACT = Path(__file__).resolve().parent / "artifacts" / "reranker_v1.json"
+_ARTIFACT = Path(__file__).resolve().parent / "artifacts" / "reranker_v2_history_floor.json"
 
 FEATURES = [
     "v32_score_norm",
@@ -59,7 +60,8 @@ def build_train_cases(min_orders: int = 3, limit: int | None = None) -> list[dic
                    ROW_NUMBER() OVER (PARTITION BY ca.ClientID ORDER BY o.Created DESC, o.ID DESC) AS rn
             FROM dbo.[Order] o
             JOIN dbo.ClientAgreement ca ON ca.ID = o.ClientAgreementID
-            WHERE EXISTS (
+            WHERE o.Created >= :history_start
+              AND EXISTS (
                 SELECT 1 FROM dbo.OrderItem oi
                 WHERE oi.OrderID = o.ID AND oi.IsValidForCurrentSale = 1
             )
@@ -73,7 +75,10 @@ def build_train_cases(min_orders: int = 3, limit: int | None = None) -> list[dic
         WHERE co.rn = 2 AND c.norders >= :minord
         ORDER BY co.cid
         """,
-        {"minord": min_orders},
+        {
+            "minord": min_orders,
+            "history_start": source_history_start_iso(),
+        },
     )
     cases = []
     for row in rows:
@@ -98,6 +103,8 @@ def build_train_cases(min_orders: int = 3, limit: int | None = None) -> list[dic
 
 def _case_features(customer_id: int, as_of: str, candidates: list) -> np.ndarray:
     """Feature matrix (len(candidates) × len(FEATURES)), all history strictly < as_of."""
+    require_supported_as_of(as_of)
+    history_start = source_history_start_iso()
     pids = [rec.product_id for rec in candidates]
     ph, pparams = in_clause("p", pids)
 
@@ -109,10 +116,18 @@ def _case_features(customer_id: int, as_of: str, candidates: list) -> np.ndarray
             FROM dbo.ClientAgreement ca
             JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
             JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
-            WHERE ca.ClientID = :cid AND o.Created < :asof AND oi.ProductID IN {ph}
+            WHERE ca.ClientID = :cid
+                  AND oi.IsValidForCurrentSale = 1
+                  AND o.Created < :asof AND o.Created >= :history_start
+                  AND oi.ProductID IN {ph}
             GROUP BY oi.ProductID
             """,
-            {"cid": customer_id, "asof": as_of, **pparams},
+            {
+                "cid": customer_id,
+                "asof": as_of,
+                "history_start": history_start,
+                **pparams,
+            },
         )
     }
 
@@ -125,9 +140,10 @@ def _case_features(customer_id: int, as_of: str, candidates: list) -> np.ndarray
             JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
             WHERE oi.IsValidForCurrentSale = 1 AND oi.ProductID IN {ph}
                   AND o.Created < :asof AND o.Created >= DATEADD(day, -90, :asof)
+                  AND o.Created >= :history_start
             GROUP BY oi.ProductID
             """,
-            {"asof": as_of, **pparams},
+            {"asof": as_of, "history_start": history_start, **pparams},
         )
     }
 
@@ -136,10 +152,13 @@ def _case_features(customer_id: int, as_of: str, candidates: list) -> np.ndarray
         SELECT oi.ProductID AS pid, AVG(oi.PricePerItem) AS avg_price
         FROM dbo.OrderItem oi
         JOIN dbo.[Order] o ON o.ID = oi.OrderID
-        WHERE oi.ProductID IN {ph} AND o.Created < :asof AND oi.PricePerItem > 0
+        WHERE oi.IsValidForCurrentSale = 1
+              AND oi.ProductID IN {ph}
+              AND o.Created < :asof AND o.Created >= :history_start
+              AND oi.PricePerItem > 0
         GROUP BY oi.ProductID
         """,
-        {"asof": as_of, **pparams},
+        {"asof": as_of, "history_start": history_start, **pparams},
     )
     prices = {int(r["pid"]): float(r["avg_price"] or 0) for r in price_rows}
 
@@ -149,9 +168,12 @@ def _case_features(customer_id: int, as_of: str, candidates: list) -> np.ndarray
         FROM dbo.ClientAgreement ca
         JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
         JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
-        WHERE ca.ClientID = :cid AND o.Created < :asof AND oi.PricePerItem > 0
+        WHERE ca.ClientID = :cid
+              AND oi.IsValidForCurrentSale = 1
+              AND o.Created < :asof AND o.Created >= :history_start
+              AND oi.PricePerItem > 0
         """,
-        {"cid": customer_id, "asof": as_of},
+        {"cid": customer_id, "asof": as_of, "history_start": history_start},
     )
     client_price = float(med_rows[0]["med"] or 0) if med_rows else 0.0
 
@@ -211,7 +233,16 @@ def _predict(model: dict, x: np.ndarray) -> np.ndarray:
 def load_model() -> dict | None:
     if not _ARTIFACT.exists():
         return None
-    return json.loads(_ARTIFACT.read_text())
+    model = json.loads(_ARTIFACT.read_text())
+    if model.get("source_history_start") != source_history_start_iso():
+        log.warning(
+            "reranker_history_floor_mismatch",
+            artifact=str(_ARTIFACT),
+            artifact_floor=model.get("source_history_start"),
+            expected_floor=source_history_start_iso(),
+        )
+        return None
+    return model
 
 
 def rerank(customer_id: int, as_of: str, k: int, model: dict) -> list[int]:
@@ -248,6 +279,7 @@ def train(min_orders: int = 3, limit: int | None = None) -> dict:
     model = _fit_logreg(x, y)
     model["features"] = FEATURES
     model["trained_at"] = datetime.now().isoformat()
+    model["source_history_start"] = source_history_start_iso()
     model["rows"] = len(y)
     model["positives"] = int(y.sum())
     _ARTIFACT.parent.mkdir(parents=True, exist_ok=True)

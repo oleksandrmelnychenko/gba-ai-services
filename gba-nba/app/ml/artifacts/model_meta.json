@@ -38,5 +38,14 @@
     ]
   },
   "value_head": "see expected_value_row in train.py / score_task.py",
-  "priority_formula": "priority = 100 * p_outcome_normalized; rank by p_outcome * expected_value"
+  "priority_formula": "priority = 100 * p_outcome_normalized; rank by p_outcome * expected_value",
+  "source_history_start": "2025-01-01",
+  "training_window_days": 365,
+  "training_vintages": [
+    "2026-01-01",
+    "2026-02-01",
+    "2026-03-01",
+    "2026-04-01",
+    "2026-05-01"
+  ]
 }

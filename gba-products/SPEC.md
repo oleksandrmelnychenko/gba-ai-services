@@ -64,6 +64,10 @@ WITH OnHand AS (
 Use **`Order.Created`** for all sales/time windows. **`OrderItem.Created` is truncated** (spans only
 ~3 days) and must never be used for velocity/recency/trend. (The other services already use Order.Created.)
 
+Historical source truth begins at `SOURCE_HISTORY_START_DATE=2025-01-01`. Every rolling window uses
+`max(requested_start, source_history_start)`; dense grids never fill pre-source months with zero,
+and rate denominators use only the effective factual days.
+
 ### 3.3 Per-lens sources
 | Lens | Sources |
 |---|---|
@@ -152,7 +156,7 @@ app/services/{classification,stock_health,margin_returns,substitution,health_sco
 app/clients/{reco_client,procure_client}.py        # optional consume, graceful-degrade
 tests/  scripts/  .env.example
 ```
-- Stateless + cache (key `products:{ver}:{kind}:{id}:{as_of}`); MODEL_VERSION env
+- Stateless + cache (key `products:{ver}:{history_fingerprint}:{kind}:{id}:{as_of}`); MODEL_VERSION env
   (`products-v2-abc`), bump on scoring change.
 - Optional scheduler: nightly precompute of `/assortment/*` rankings (warm cache over ~4.6k stocked + classify ~13k active).
 - Reuse the siblings' EUR-correct discipline; share the read-only `gba_reco_ro` login.

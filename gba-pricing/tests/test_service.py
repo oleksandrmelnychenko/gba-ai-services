@@ -3,6 +3,7 @@ LookupError->404 contract, cache-hit hydration, the no-cost peer-only path, and 
 line exclusion assumption baked into the repository SQL."""
 from __future__ import annotations
 
+from datetime import date
 from decimal import Decimal
 
 import pytest
@@ -33,6 +34,10 @@ def _wire_repo(monkeypatch, **over):
     monkeypatch.setattr(service.repo, "peer_band", lambda *a, **k: over.get(
         "peer", {"p25": 17.0, "p50": 18.5, "p75": 19.5, "n": 12}))
     monkeypatch.setattr(service.repo, "product_group_id", lambda *a, **k: over.get("pg_id", 106))
+    monkeypatch.setattr(service.repo, "active_group_discount", lambda *a, **k: over.get(
+        "active_discount", 0.0))
+    monkeypatch.setattr(service.repo, "is_promotional", lambda *a, **k: over.get(
+        "promotional", False))
     monkeypatch.setattr(service.repo, "segment_discount_distribution", lambda *a, **k: over.get(
         "segment", {"p75": 12.0, "p90": 18.0, "n": 40}))
 
@@ -52,6 +57,12 @@ def test_recommend_resolves_and_assembles(monkeypatch):
     assert out.confidence == Confidence.HIGH
     assert out.rationale == "peer-median"
     assert out.model_version == "pricing-ab-v2"
+    assert out.source_history_start == "2025-01-01"
+    assert out.requested_start == "2025-06-15"
+    assert out.effective_start == "2025-06-15"
+    assert out.history_complete is True
+    assert out.history_fingerprint
+    assert out.model_fingerprint
 
 
 def test_recommend_live_baseline_reports_agreement_source(monkeypatch):
@@ -61,6 +72,21 @@ def test_recommend_live_baseline_reports_agreement_source(monkeypatch):
         as_of_date="2026-06-15", use_cache=False,
     )
     assert out.baseline_source == "agreement"
+
+
+def test_recommend_discloses_partial_history_near_source_floor(monkeypatch):
+    _wire_repo(monkeypatch)
+    out = service.recommend_price(
+        product_id=7,
+        product_net_uid=None,
+        client_agreement_net_uid="ca-uid",
+        as_of_date="2025-06-15",
+        use_cache=False,
+    )
+    assert out.source_history_start == "2025-01-01"
+    assert out.requested_start == "2024-06-15"
+    assert out.effective_start == "2025-01-01"
+    assert out.history_complete is False
 
 
 def test_recommend_null_baseline_uses_client_world_fallback(monkeypatch):
@@ -169,6 +195,21 @@ def test_recommend_rejects_out_of_range_business_margin(monkeypatch):
         )
 
 
+def test_recommend_rejects_pre_floor_as_of_before_repository_access(monkeypatch):
+    def unexpected_resolve(*_args, **_kwargs):
+        raise AssertionError("pre-floor requests must fail before repository access")
+
+    monkeypatch.setattr(service.repo, "resolve_product", unexpected_resolve)
+    with pytest.raises(ValueError, match="as_of_date_before_source_history_start"):
+        service.recommend_price(
+            product_id=7,
+            product_net_uid=None,
+            client_agreement_net_uid="ca-uid",
+            as_of_date="2024-12-31",
+            use_cache=False,
+        )
+
+
 def test_marked_up_derivation_stays_decimal(monkeypatch):
     _wire_repo(monkeypatch)
     marked_up = service._marked_up_from_baseline(Decimal("1.005"), Decimal("10"))
@@ -179,6 +220,15 @@ def test_marked_up_derivation_stays_decimal(monkeypatch):
 def test_recommend_cache_hit_hydrates(monkeypatch):
     _wire_repo(monkeypatch)
     from app.domain.models import DiscountBand, PeerBand, PriceRecommendation
+    settings = service.get_settings()
+    coverage = service._history_fields(
+        service.trailing_month_history_window(
+            "2026-06-15",
+            settings.trailing_window_months,
+            settings.source_history_start_date,
+        ),
+        settings,
+    )
     cached_obj = PriceRecommendation(
         product_id=7, client_agreement_netuid="ca-uid", baseline_price=20.0,
         product_net_uid="p-uid",
@@ -188,6 +238,7 @@ def test_recommend_cache_hit_hydrates(monkeypatch):
         peer_band=PeerBand(p25=17.0, p50=18.5, p75=19.5, n=12),
         confidence=Confidence.HIGH, margin_pct_at_recommended=45.95,
         rationale="peer-median", as_of_date="2026-06-15",
+        **coverage,
     ).model_dump(mode="json")
     monkeypatch.setattr(service.cache, "get", lambda *a, **k: cached_obj)
 
@@ -202,6 +253,51 @@ def test_recommend_cache_hit_hydrates(monkeypatch):
     assert out.recommended_price == 18.5
     assert out.confidence == Confidence.HIGH
     assert out.discount_band.max_pct == 44.0
+
+
+@pytest.mark.parametrize(
+    ("lineage_field", "replacement"),
+    [
+        ("source_history_start", None),
+        ("source_history_start", "2024-01-01"),
+        ("history_fingerprint", None),
+        ("history_fingerprint", "wrong-history"),
+    ],
+)
+def test_recommend_rejects_cache_artifact_without_matching_history_lineage(
+    monkeypatch,
+    lineage_field,
+    replacement,
+):
+    _wire_repo(monkeypatch)
+    fresh = service.recommend_price(
+        product_id=7,
+        product_net_uid=None,
+        client_agreement_net_uid="ca-uid",
+        as_of_date="2026-06-15",
+        use_cache=False,
+    ).model_dump(mode="json")
+    if replacement is None:
+        fresh.pop(lineage_field)
+    else:
+        fresh[lineage_field] = replacement
+    monkeypatch.setattr(service.cache, "get", lambda *a, **k: fresh)
+
+    calls = {"baseline": 0}
+
+    def baseline(*_args, **_kwargs):
+        calls["baseline"] += 1
+        return 20.0
+
+    monkeypatch.setattr(service.repo, "baseline_price", baseline)
+    service.recommend_price(
+        product_id=7,
+        product_net_uid=None,
+        client_agreement_net_uid="ca-uid",
+        as_of_date="2026-06-15",
+        use_cache=True,
+    )
+    assert calls["baseline"] == 1
 
 
 def test_recommend_rejects_cache_entry_for_different_product_identity(monkeypatch):
@@ -227,6 +323,43 @@ def test_recommend_rejects_cache_entry_for_different_product_identity(monkeypatc
     )
     assert out.product_net_uid == "p-uid"
     assert out.recommended_price == 18.5
+
+
+def test_source_floor_lineage_does_not_change_current_price_or_cent_rounding(monkeypatch):
+    _wire_repo(monkeypatch)
+    settings = service.get_settings()
+    original_floor = settings.source_history_start_date
+    first = service.recommend_price(
+        product_id=7,
+        product_net_uid=None,
+        client_agreement_net_uid="ca-uid",
+        as_of_date="2026-06-15",
+        use_cache=False,
+    )
+    monkeypatch.setattr(settings, "source_history_start_date", date(2024, 1, 1))
+    second = service.recommend_price(
+        product_id=7,
+        product_net_uid=None,
+        client_agreement_net_uid="ca-uid",
+        as_of_date="2026-06-15",
+        use_cache=False,
+    )
+    assert original_floor == date(2025, 1, 1)
+    assert (
+        first.baseline_price,
+        first.recommended_price,
+        first.price_floor,
+        first.unit_cost_eur,
+        first.suggested_discount_pct,
+    ) == (
+        second.baseline_price,
+        second.recommended_price,
+        second.price_floor,
+        second.unit_cost_eur,
+        second.suggested_discount_pct,
+    )
+    assert first.history_fingerprint != second.history_fingerprint
+    assert first.model_fingerprint != second.model_fingerprint
 
 
 def test_synthetic_line_excluded_in_repository_sql():

@@ -26,9 +26,15 @@ from __future__ import annotations
 import hashlib
 import json
 
+from app.core.history import (
+    history_start_iso,
+    require_supported_as_of,
+    rolling_coverage,
+)
 from app.core.logging import get_logger
 from app.data.db import in_clause, query
 from app.data.synthetic import synthetic_product_id
+from app.domain.models import MODEL_VERSION
 
 log = get_logger("supply_repository")
 
@@ -46,10 +52,17 @@ def product_daily_demand(product_id: int, as_of: str, history_days: int) -> list
               AND oi.ProductID <> :syn
               AND o.Created < :asof
               AND o.Created >= DATEADD(day, -:days, :asof)
+              AND o.Created >= :history_start
         GROUP BY CAST(o.Created AS date)
         ORDER BY d
         """,
-        {"pid": product_id, "asof": as_of, "days": history_days, "syn": synthetic_product_id()},
+        {
+            "pid": product_id,
+            "asof": as_of,
+            "days": history_days,
+            "history_start": history_start_iso(),
+            "syn": synthetic_product_id(),
+        },
     )
 
 
@@ -86,10 +99,17 @@ def product_daily_demand_bulk(
                   AND oi.ProductID <> :syn
                   AND o.Created < :asof
                   AND o.Created >= DATEADD(day, -:days, :asof)
+                  AND o.Created >= :history_start
             GROUP BY oi.ProductID, CAST(o.Created AS date)
             ORDER BY oi.ProductID, CAST(o.Created AS date)
             """,
-            {"asof": as_of, "days": history_days, "syn": syn, **params},
+            {
+                "asof": as_of,
+                "days": history_days,
+                "history_start": history_start_iso(),
+                "syn": syn,
+                **params,
+            },
         )
         for r in rows:
             out.setdefault(int(r["pid"]), []).append({"d": r["d"], "units": r["units"]})
@@ -108,6 +128,7 @@ def producer_lead_times(
     therefore the authority; filtering the parent SupplyOrder by Deleted silently erases
     virtually all useful history.
     """
+    require_supported_as_of(as_of)
     rows = query(
         """
         WITH ReceiptHistory AS (
@@ -162,11 +183,14 @@ def producer_lead_times(
               AND received_at IS NOT NULL
               AND ordered_at < :asof
               AND received_at < :asof
+              AND ordered_at >= :history_start
+              AND received_at >= :history_start
               AND DATEDIFF(day, ordered_at, received_at) BETWEEN :lmin AND :lmax
         """,
         {
             "pid": producer_id,
             "asof": as_of,
+            "history_start": history_start_iso(),
             "lmin": min_days,
             "lmax": max_days,
             "syn": synthetic_product_id(),
@@ -177,8 +201,9 @@ def producer_lead_times(
     return leads
 
 
-def producer_agreement_currency(producer_id: int) -> int | None:
+def producer_agreement_currency(producer_id: int, as_of: str) -> int | None:
     """Modal currency over factual international/UA supply documents (geography proxy)."""
+    require_supported_as_of(as_of)
     rows = query(
         """
         WITH FactualAgreement AS (
@@ -192,6 +217,8 @@ def producer_agreement_currency(producer_id: int) -> int | None:
             WHERE si.Deleted = 0
                   AND so.ClientID IS NOT NULL
                   AND a.CurrencyID IS NOT NULL
+                  AND si.DateFrom >= :history_start
+                  AND si.DateFrom < :asof
                   AND EXISTS (
                       SELECT 1
                       FROM dbo.SupplyInvoiceOrderItem sioi
@@ -217,6 +244,8 @@ def producer_agreement_currency(producer_id: int) -> int | None:
                   AND soui.ProductID IS NOT NULL
                   AND soui.ProductID <> :syn
                   AND a.CurrencyID IS NOT NULL
+                  AND sou.FromDate >= :history_start
+                  AND sou.FromDate < :asof
         )
         SELECT TOP 1 ccy
         FROM FactualAgreement
@@ -224,7 +253,12 @@ def producer_agreement_currency(producer_id: int) -> int | None:
         GROUP BY ccy
         ORDER BY COUNT(*) DESC, ccy
         """,
-        {"pid": producer_id, "syn": synthetic_product_id()},
+        {
+            "pid": producer_id,
+            "asof": as_of,
+            "history_start": history_start_iso(),
+            "syn": synthetic_product_id(),
+        },
     )
     return int(rows[0]["ccy"]) if rows else None
 
@@ -319,21 +353,28 @@ def products_for_producer(producer_id: int, as_of: str, history_days: int) -> li
         FROM FactualSupply
         WHERE producer_id = :pid
               AND source_date >= DATEADD(day, -:days, :asof)
+              AND source_date >= :history_start
               AND source_date < :asof
         """,
-        {"pid": producer_id, "asof": as_of, "days": history_days,
-         "syn": synthetic_product_id()},
+        {
+            "pid": producer_id,
+            "asof": as_of,
+            "days": history_days,
+            "history_start": history_start_iso(),
+            "syn": synthetic_product_id(),
+        },
     )
     return sorted(int(r["pid"]) for r in rows)
 
 
-def derive_moq_terms(min_orders: int = 3) -> list[dict]:
+def derive_moq_terms(as_of: str, min_orders: int = 3) -> list[dict]:
     """Observed MOQ per source document; pack from Product.PackingStandard.
 
     Multiple invoice lines for the same product are one purchase observation, not several
     orders.  Collapse them by document first so duplicate/split lines cannot inflate sample
     counts or understate the observed MOQ.
     """
+    require_supported_as_of(as_of)
     rows = query(
         """
         WITH FactualSupplyLine AS (
@@ -351,6 +392,8 @@ def derive_moq_terms(min_orders: int = 3) -> list[dict]:
                   AND sioi.ProductID IS NOT NULL
                   AND sioi.ProductID <> :syn
                   AND sioi.Qty > 0
+                  AND si.DateFrom >= :history_start
+                  AND si.DateFrom < :asof
 
             UNION ALL
 
@@ -368,6 +411,8 @@ def derive_moq_terms(min_orders: int = 3) -> list[dict]:
                   AND soui.ProductID IS NOT NULL
                   AND soui.ProductID <> :syn
                   AND soui.Qty > 0
+                  AND sou.FromDate >= :history_start
+                  AND sou.FromDate < :asof
         ),
         DocumentProductQty AS (
             SELECT source_kind, document_id, producer_id, product_id, SUM(qty) AS qty
@@ -382,7 +427,12 @@ def derive_moq_terms(min_orders: int = 3) -> list[dict]:
         GROUP BY dpq.producer_id, dpq.product_id
         HAVING COUNT(*) >= :n
         """,
-        {"n": min_orders, "syn": synthetic_product_id()},
+        {
+            "n": min_orders,
+            "asof": as_of,
+            "history_start": history_start_iso(),
+            "syn": synthetic_product_id(),
+        },
     )
     return [
         {"producer_id": int(r["producer_id"]), "product_id": int(r["product_id"]),
@@ -426,9 +476,15 @@ def all_producers(as_of: str, history_days: int) -> list[int]:
         SELECT DISTINCT producer_id AS pid
         FROM FactualSupply
         WHERE source_date >= DATEADD(day, -:days, :asof)
+              AND source_date >= :history_start
               AND source_date < :asof
         """,
-        {"asof": as_of, "days": history_days, "syn": synthetic_product_id()},
+        {
+            "asof": as_of,
+            "days": history_days,
+            "history_start": history_start_iso(),
+            "syn": synthetic_product_id(),
+        },
     )
     return sorted(int(r["pid"]) for r in rows)
 
@@ -497,6 +553,7 @@ def procurement_source_readiness(as_of: str, history_days: int) -> dict:
     semantics as the plan repositories.  It catches a successful-but-empty 1C rebuild
     (or lost operational storage flags) before an empty plan can be cached as healthy.
     """
+    coverage = rolling_coverage(as_of, history_days)
     rows = query(
         f"""
         WITH FactualSupply AS (
@@ -522,6 +579,7 @@ def procurement_source_readiness(as_of: str, history_days: int) -> dict:
                   AND sioi.ProductID IS NOT NULL
                   AND sioi.ProductID <> :syn
                   AND si.DateFrom >= DATEADD(day, -:days, :asof)
+                  AND si.DateFrom >= :history_start
                   AND si.DateFrom < :asof
 
             UNION ALL
@@ -548,6 +606,7 @@ def procurement_source_readiness(as_of: str, history_days: int) -> dict:
                   AND soui.ProductID IS NOT NULL
                   AND soui.ProductID <> :syn
                   AND sou.FromDate >= DATEADD(day, -:days, :asof)
+                  AND sou.FromDate >= :history_start
                   AND sou.FromDate < :asof
         ),
         CandidatePairs AS (
@@ -573,6 +632,7 @@ def procurement_source_readiness(as_of: str, history_days: int) -> dict:
             JOIN CandidateProducts cp ON cp.product_id = oi.ProductID
             WHERE oi.IsValidForCurrentSale = 1
                   AND o.Created >= DATEADD(day, -:days, :asof)
+                  AND o.Created >= :history_start
                   AND o.Created < :asof
             GROUP BY oi.ProductID
         ),
@@ -644,7 +704,9 @@ def procurement_source_readiness(as_of: str, history_days: int) -> dict:
             JOIN dbo.PackingList pl ON pl.ID = plpoi.PackingListID AND pl.Deleted = 0
             JOIN dbo.SupplyInvoice si ON si.ID = pl.SupplyInvoiceID AND si.Deleted = 0
             JOIN CandidateProducts cp ON cp.product_id = sioi.ProductID
-            WHERE plpoi.Deleted = 0 AND si.DateFrom < :asof
+            WHERE plpoi.Deleted = 0
+                  AND si.DateFrom >= :history_start
+                  AND si.DateFrom < :asof
 
             UNION ALL
 
@@ -657,7 +719,9 @@ def procurement_source_readiness(as_of: str, history_days: int) -> dict:
             JOIN dbo.SupplyInvoiceOrderItem sioi
               ON sioi.ID = plpoi.SupplyInvoiceOrderItemID AND sioi.Deleted = 0
             JOIN CandidateProducts cp ON cp.product_id = sioi.ProductID
-            WHERE pii.Deleted = 0 AND pinc.FromDate < :asof
+            WHERE pii.Deleted = 0
+                  AND pinc.FromDate >= :history_start
+                  AND pinc.FromDate < :asof
 
             UNION ALL
 
@@ -668,6 +732,7 @@ def procurement_source_readiness(as_of: str, history_days: int) -> dict:
             JOIN CandidateProducts cp ON cp.product_id = soui.ProductID
             WHERE soui.Deleted = 0
                   AND NOT (sou.IsFromCockpit = 1 AND sou.IsPlaced = 0)
+                  AND sou.FromDate >= :history_start
                   AND sou.FromDate < :asof
 
             UNION ALL
@@ -683,6 +748,7 @@ def procurement_source_readiness(as_of: str, history_days: int) -> dict:
             JOIN CandidateProducts cp ON cp.product_id = soui.ProductID
             WHERE pii.Deleted = 0
                   AND NOT (sou.IsFromCockpit = 1 AND sou.IsPlaced = 0)
+                  AND pinc.FromDate >= :history_start
                   AND pinc.FromDate < :asof
         ),
         CandidateCosts AS (
@@ -771,7 +837,12 @@ def procurement_source_readiness(as_of: str, history_days: int) -> dict:
             (SELECT latest_availability_update FROM GlobalInventory)
                 AS latest_global_availability_update
         """,
-        {"asof": as_of, "days": history_days, "syn": synthetic_product_id()},
+        {
+            "asof": as_of,
+            "days": history_days,
+            "history_start": history_start_iso(),
+            "syn": synthetic_product_id(),
+        },
     )
     row = rows[0] if rows else {}
     integer_fields = (
@@ -828,6 +899,9 @@ def procurement_source_readiness(as_of: str, history_days: int) -> dict:
         snapshot[name] = value.isoformat() if hasattr(value, "isoformat") else (
             str(value) if value is not None else None
         )
+    snapshot.update(coverage.as_metadata())
+    snapshot["history_not_applicable"] = ["inventory", "reservations"]
+    snapshot["model_version"] = MODEL_VERSION
     fingerprint_fields = {
         name: snapshot[name]
         for name in (
@@ -869,6 +943,9 @@ def procurement_source_readiness(as_of: str, history_days: int) -> dict:
             "latest_candidate_availability_update",
         )
     }
+    fingerprint_fields.update(coverage.as_metadata())
+    fingerprint_fields["history_not_applicable"] = snapshot["history_not_applicable"]
+    fingerprint_fields["model_version"] = MODEL_VERSION
     snapshot["source_fingerprint"] = hashlib.sha256(
         json.dumps(fingerprint_fields, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()[:24]
@@ -898,9 +975,15 @@ def all_products_revenue_eur(as_of: str, history_days: int) -> dict[int, float]:
               AND oi.PricePerItem > 0
               AND o.Created < :asof
               AND o.Created >= DATEADD(day, -:days, :asof)
+              AND o.Created >= :history_start
         GROUP BY oi.ProductID
         """,
-        {"asof": as_of, "days": history_days, "syn": synthetic_product_id()},
+        {
+            "asof": as_of,
+            "days": history_days,
+            "history_start": history_start_iso(),
+            "syn": synthetic_product_id(),
+        },
     )
     return {int(r["pid"]): float(r["rev"] or 0) for r in rows}
 
@@ -916,7 +999,8 @@ _SELLABLE_STORAGE = (
 def on_hand(product_ids: list[int]) -> dict[int, float]:
     """Gross physical on-hand in operational sellable storages.
 
-    ``ProductAvailability.Amount`` is already *net/free* stock: gba-server subtracts a
+    This is a current point-in-time snapshot: history-window filtering is not
+    applicable. ``ProductAvailability.Amount`` is already *net/free* stock: gba-server subtracts a
     reservation when it creates ``ProductReservation`` and adds it back on release.
     Reconstruct gross on-hand by adding active reservations once; policy then computes
     ``available = on_hand - reserved`` without the historical double-subtraction bug.
@@ -947,7 +1031,7 @@ def on_hand(product_ids: list[int]) -> dict[int, float]:
 
 
 def reserved(product_ids: list[int]) -> dict[int, float]:
-    """Reserved qty per product (ProductReservation -> ProductAvailability -> ProductID)."""
+    """Current reserved qty; history-window filtering is not applicable."""
     if not product_ids:
         return {}
     ph, params = in_clause("p", product_ids)
@@ -1000,6 +1084,7 @@ def on_order(product_ids: list[int], as_of: str) -> dict[int, float]:
     Trap honored: PricePerItem/EUR not involved here (units only); the synthetic debt product
     excluded; supply-side Deleted=0 on every joined table (verified, not blanket-applied).
     """
+    require_supported_as_of(as_of)
     if not product_ids:
         return {}
     syn = synthetic_product_id()
@@ -1026,6 +1111,7 @@ def _on_order_chunk(product_ids: list[int], as_of: str) -> dict[int, float]:
             WHERE plpoi.Deleted = 0
                   AND sioi.ProductID <> :syn
                   AND sioi.ProductID IN {ph}
+                  AND si.DateFrom >= :history_start
                   AND si.DateFrom < :asof
             GROUP BY sioi.ProductID
             UNION ALL
@@ -1038,6 +1124,7 @@ def _on_order_chunk(product_ids: list[int], as_of: str) -> dict[int, float]:
                   AND NOT (sou.IsFromCockpit = 1 AND sou.IsPlaced = 0)
                   AND soui.ProductID <> :syn
                   AND soui.ProductID IN {ph}
+                  AND sou.FromDate >= :history_start
                   AND sou.FromDate < :asof
             GROUP BY soui.ProductID
         ),
@@ -1054,6 +1141,7 @@ def _on_order_chunk(product_ids: list[int], as_of: str) -> dict[int, float]:
             WHERE pii.Deleted = 0
                   AND sioi.ProductID <> :syn
                   AND sioi.ProductID IN {ph}
+                  AND pinc.FromDate >= :history_start
                   AND pinc.FromDate < :asof
             GROUP BY sioi.ProductID
             UNION ALL
@@ -1067,6 +1155,7 @@ def _on_order_chunk(product_ids: list[int], as_of: str) -> dict[int, float]:
             WHERE pii.Deleted = 0
                   AND soui.ProductID <> :syn
                   AND soui.ProductID IN {ph}
+                  AND pinc.FromDate >= :history_start
                   AND pinc.FromDate < :asof
             GROUP BY soui.ProductID
         ),
@@ -1077,6 +1166,11 @@ def _on_order_chunk(product_ids: list[int], as_of: str) -> dict[int, float]:
         LEFT JOIN rcv_g r ON r.pid = o.pid
         WHERE (o.qty - ISNULL(r.qty, 0)) > 0.001
         """,
-        {"asof": as_of, "syn": synthetic_product_id(), **params},
+        {
+            "asof": as_of,
+            "history_start": history_start_iso(),
+            "syn": synthetic_product_id(),
+            **params,
+        },
     )
     return {int(r["pid"]): float(r["qty"] or 0) for r in rows}

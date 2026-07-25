@@ -156,6 +156,16 @@ def _synthetic_drift_ok_cached() -> bool | None:
     return ok
 
 
+def _model_readiness() -> dict:
+    from app.risk.score_current import current_model_readiness
+    from app.risk.score_forward import forward_model_readiness
+
+    return {
+        "current_state": current_model_readiness(),
+        "forward_6m": forward_model_readiness(),
+    }
+
+
 @app.get("/health")
 def health() -> dict:
     return _health_snapshot()
@@ -197,20 +207,25 @@ def _health_snapshot() -> dict:
             "source_history_start_mismatch",
         ]
     business_ready = source.get("business_ready") is True
-    healthy = (
+    models = _model_readiness()
+    serving_ready = (
         db_ok
         and redis_ok
         and business_ready
         and synthetic_drift_ok is True
+        and models["current_state"]["ready"] is True
     )
+    healthy = serving_ready and models["forward_6m"]["ready"] is True
     drift = _drift_summary_cached()
     return {
         "status": "healthy" if healthy else "degraded",
+        "serving_ready": serving_ready,
         "business_ready": business_ready,
         "db_connected": db_ok,
         "redis_connected": redis_ok,
         "synthetic_drift_ok": synthetic_drift_ok,
         "source": source,
+        "model_readiness": models,
         "source_history_start": source_history_start,
         "source_history_contract_ready": source_history_contract_ready,
         "model_drift": drift,
@@ -222,7 +237,9 @@ def _health_snapshot() -> dict:
 @app.get("/ready")
 def ready() -> JSONResponse:
     snapshot = _health_snapshot()
-    is_ready = snapshot["status"] == "healthy"
+    # A statistically unsupported forward model degrades /health but must not remove the
+    # independently validated current-state score from service.
+    is_ready = snapshot["serving_ready"] is True
     return JSONResponse(
         status_code=200 if is_ready else 503,
         content={**snapshot, "status": "ready" if is_ready else "not_ready"},
@@ -260,6 +277,8 @@ def score(req: ScoreRequest) -> SolvencyScore:
         )
     except ClientIdentityMismatchError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
@@ -284,6 +303,8 @@ def score_batch(req: BatchScoreRequest) -> dict:
             window_months=req.window_months,
             use_cache=req.use_cache,
         )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         err_id = uuid.uuid4().hex
         log.error("score_batch_failed", clients=len(req.client_ids), error_id=err_id, error=str(exc))
@@ -305,6 +326,8 @@ def charts(
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         err_id = uuid.uuid4().hex
         log.error("charts_failed", client_id=client_id, error_id=err_id, error=str(exc))

@@ -39,6 +39,12 @@ def _fake_reco(product_id: int) -> PriceRecommendation:
         confidence=Confidence.HIGH,
         margin_pct_at_recommended=45.95,
         rationale="peer-median",
+        source_history_start="2025-01-01",
+        requested_start="2025-06-15",
+        effective_start="2025-06-15",
+        history_complete=True,
+        history_fingerprint="history-fingerprint",
+        model_fingerprint="model-fingerprint",
     )
 
 
@@ -76,6 +82,9 @@ def test_health_fails_closed_when_business_source_is_not_ready(monkeypatch):
     assert response.status_code == 200
     assert response.json()["status"] == "degraded"
     assert response.json()["business_ready"] is False
+    assert response.json()["source_history_start"] == "2025-01-01"
+    assert response.json()["source"]["effective_start"]
+    assert isinstance(response.json()["history_complete"], bool)
 
 
 def test_ready_requires_database_cache_and_business_source(monkeypatch):
@@ -92,6 +101,8 @@ def test_ready_requires_database_cache_and_business_source(monkeypatch):
     assert response.status_code == 200
     assert response.json()["status"] == "ready"
     assert response.json()["source_history_start"] == "2025-01-01"
+    assert response.json()["history_fingerprint"]
+    assert response.json()["model_fingerprint"]
     assert response.json()["source_history_contract_ready"] is True
     assert response.json()["source"]["source_history_start"] == "2025-01-01"
 
@@ -150,6 +161,18 @@ def test_price_accepts_iso_as_of_date(monkeypatch):
     assert resp.status_code == 200
 
 
+def test_price_rejects_as_of_before_source_history_floor(monkeypatch):
+    _install_fake_service(monkeypatch)
+    client = TestClient(main.app)
+    resp = client.post(
+        "/price",
+        json={"product_id": 7, "client_agreement_net_uid": CA_UID, "as_of_date": "2024-12-31"},
+        headers=_headers(),
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "as_of_date_before_source_history_start"
+
+
 def test_price_with_fake_service(monkeypatch):
     _install_fake_service(monkeypatch)
     client = TestClient(main.app)
@@ -164,6 +187,11 @@ def test_price_with_fake_service(monkeypatch):
     assert body["currency"] == "EUR"
     assert body["confidence"] == "high"
     assert body["model_version"] == "pricing-ab-v2"
+    assert body["source_history_start"] == "2025-01-01"
+    assert body["effective_start"] == "2025-06-15"
+    assert body["history_complete"] is True
+    assert body["history_fingerprint"] == "history-fingerprint"
+    assert body["model_fingerprint"] == "model-fingerprint"
     assert body["discount_band"]["target_pct"] == 7.5
 
 
@@ -233,3 +261,18 @@ def test_price_batch_reports_malformed_uid(monkeypatch):
     assert body["count"] == 1
     assert body["failed"] == 1
     assert body["errors"][0]["error"] == "malformed client_agreement_net_uid"
+
+
+def test_price_batch_rejects_shared_as_of_before_source_history_floor(monkeypatch):
+    _install_fake_service(monkeypatch)
+    client = TestClient(main.app)
+    resp = client.post(
+        "/price/batch",
+        json={
+            "items": [{"product_id": 1, "client_agreement_net_uid": CA_UID}],
+            "as_of_date": "2024-12-31",
+        },
+        headers=_headers(),
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "as_of_date_before_source_history_start"

@@ -82,6 +82,8 @@ def test_health_degrades_when_business_stock_source_is_not_ready(monkeypatch):
     assert health["status"] == "degraded"
     assert health["business_ready"] is False
     assert health["business_reason"] == "sellable_inventory_missing"
+    assert health["source_history_start"] == "2025-01-01"
+    assert health["stock_source_readiness"]["history_fingerprint"]
 
 
 def test_health_is_green_only_with_db_cache_and_business_inventory(monkeypatch):
@@ -106,3 +108,32 @@ def test_health_is_green_only_with_db_cache_and_business_inventory(monkeypatch):
         health["stock_source_readiness"]["source_history_start"]
         == health["source_history_start"]
     )
+    assert health["requested_start"] <= health["effective_start"]
+    assert health["history_complete"] is True
+    assert set(health["history_windows"]) == {
+        "velocity",
+        "dead",
+        "returns",
+        "classification",
+    }
+
+
+def test_readiness_discloses_incomplete_effective_history_near_floor(monkeypatch):
+    from app.api import main
+
+    monkeypatch.setattr(main, "_today", lambda: "2025-01-11")
+    monkeypatch.setattr(main, "get_engine", lambda: _Engine())
+    monkeypatch.setattr(main.cache, "health", lambda: True)
+    monkeypatch.setattr(
+        main.sig,
+        "stock_source_readiness",
+        lambda: {"ready": True, "reason": None, "sellable_available_qty": 200.0},
+    )
+
+    health = main._service_health()
+
+    assert health["status"] == "healthy"
+    assert health["history_complete"] is False
+    assert health["source_history_start"] == "2025-01-01"
+    assert health["effective_start"] == "2025-01-01"
+    assert health["history_windows"]["velocity"]["effective_days"] == 10

@@ -1,6 +1,10 @@
 """Pure unit tests for ABC/XYZ/lifecycle classification (no DB)."""
 from __future__ import annotations
 
+from datetime import date
+
+import pytest
+
 from app.core.config import get_settings
 from app.domain.models import AbcClass, LifecycleStage, XyzClass
 from app.services import classification as cl
@@ -15,6 +19,24 @@ def test_month_labels_trailing_oldest_first():
 def test_series_from_fills_zeros():
     labels = cl.month_labels("2026-06-24", 3)
     assert cl.series_from({"2026-06": 5.0}, labels) == [0.0, 0.0, 5.0]
+
+
+def test_month_labels_and_dense_series_never_invent_pre_source_zeros():
+    labels = cl.month_labels("2026-07-25", 24, date(2025, 1, 1))
+    series = cl.series_from(
+        {"2024-12": 999.0, "2025-01": 1.0, "2026-07": 2.0},
+        labels,
+    )
+
+    assert labels[0] == "2025-01"
+    assert labels[-1] == "2026-07"
+    assert len(labels) == len(series) == 19
+    assert 999.0 not in series
+
+
+def test_month_labels_reject_as_of_before_source_floor():
+    with pytest.raises(ValueError, match="as_of_date_before_source_history_start"):
+        cl.month_labels("2024-12-31", 12, date(2025, 1, 1))
 
 
 def test_demand_cv_stable_vs_intermittent():

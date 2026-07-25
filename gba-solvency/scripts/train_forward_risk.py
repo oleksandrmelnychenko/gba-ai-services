@@ -26,9 +26,10 @@ CALIBRATION/BANDS:
   the SAME cutpoints are scored on the held-out OOT fold as a generalization check. We require the
   in-sample realized forward-default rates to be MONOTONE and print both in-sample and OOT rates.
 
-ONLY-OVERWRITE GATE:
-  This script writes forward_scorecard_coeffs.json ONLY when --commit is passed AND the new
-  behavioral OOT AUC and band separation beat the incumbent. Without --commit it just reports.
+PUBLICATION GATE:
+  This script writes forward_scorecard_coeffs.json ONLY when --commit is passed AND event
+  support, behavioral OOT AUC and band monotonicity pass absolute production thresholds.
+  When event support fails, --commit publishes an explicit unavailable status instead.
 
 Usage:
     .venv/bin/python scripts/train_forward_risk.py            # report only (no artifact write)
@@ -37,7 +38,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import warnings
 from pathlib import Path
 
@@ -49,6 +49,20 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import brier_score_loss, roc_auc_score
 from sklearn.model_selection import GroupKFold
 
+from app.core.config import get_settings
+from app.risk.lineage import (
+    FORWARD_ARTIFACT_ROLE,
+    FORWARD_DATASET_ROLE,
+    FORWARD_MIN_OOT_AUC,
+    FORWARD_MIN_UNIQUE_POSITIVE_CLIENTS,
+    LINEAGE_SCHEMA_VERSION,
+    attach_training_lineage,
+    model_payload_sha256,
+    utc_now,
+    validate_dataset_manifest,
+    write_json_atomic,
+)
+
 warnings.filterwarnings("ignore")
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -59,7 +73,7 @@ ART.mkdir(parents=True, exist_ok=True)
 OUT.mkdir(parents=True, exist_ok=True)
 
 TARGET = "forward_default"
-OLD_OOT_AUC = 0.847  # incumbent behavioral_only OOT AUC to beat.
+OLD_OOT_AUC = 0.847  # legacy benchmark only; it is not a floor-compliant incumbent.
 
 # Aging / debt-level features that mechanically drive the forward label.
 AGING_COLS = [
@@ -312,10 +326,16 @@ def serialize_sc(model, name) -> dict:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--commit", action="store_true",
-                    help="write forward_scorecard_coeffs.json iff it beats the incumbent.")
+                    help="publish either a gated artifact or explicit unavailable status.")
     args = ap.parse_args()
 
     df = pd.read_parquet(POOL).fillna(0.0)
+    dataset_lineage = validate_dataset_manifest(
+        POOL,
+        df,
+        dataset_role=FORWARD_DATASET_ROLE,
+        target_column=TARGET,
+    )
     atrisk = df[df["total_debt_eur"] > 0].copy()
 
     has_new = bool(CANDIDATE_BEH) and all(c in df.columns for c in CANDIDATE_BEH)
@@ -324,6 +344,7 @@ def main():
     full_feats = AGING_COLS + beh_base
 
     report = {
+        "source_history_start": get_settings().source_history_start_date.isoformat(),
         "pool_full_n": int(len(df)), "pool_full_pos": int(df[TARGET].sum()),
         "atrisk_n": int(len(atrisk)), "atrisk_pos": int(atrisk[TARGET].sum()),
         "atrisk_rate": round(float(atrisk[TARGET].mean()), 4),
@@ -331,6 +352,7 @@ def main():
         "unique_pos_clients": int(atrisk[atrisk[TARGET] == 1]["client_id"].nunique()),
         "n_vintages": int(atrisk["vintage"].nunique()),
         "has_candidate_features": has_new, "old_oot_auc": OLD_OOT_AUC,
+        "dataset_lineage": dataset_lineage,
     }
 
     print("=" * 78)
@@ -342,6 +364,51 @@ def main():
           f"(ever-positive: {report['unique_pos_clients']})  <- TRUE event ceiling")
     print(f"Candidate new features present: {has_new}  ({CANDIDATE_BEH})")
     print()
+
+    event_support_ok = (
+        report["unique_pos_clients"] >= FORWARD_MIN_UNIQUE_POSITIVE_CLIENTS
+    )
+    report["minimum_unique_positive_clients"] = FORWARD_MIN_UNIQUE_POSITIVE_CLIENTS
+    report["event_support_ok"] = event_support_ok
+    if not event_support_ok:
+        report["production_gate"] = {
+            "gate": "forward_6m_production_v1",
+            "passed": False,
+            "reason": "insufficient_unique_positive_clients",
+            "minimum_unique_positive_clients": FORWARD_MIN_UNIQUE_POSITIVE_CLIENTS,
+            "observed_unique_positive_clients": report["unique_pos_clients"],
+            "observed_positive_rows": report["atrisk_pos"],
+            "observed_atrisk_rows": report["atrisk_n"],
+        }
+        write_json_atomic(OUT / "metrics.json", report)
+        print(
+            "GATE FAILED before fitting: "
+            f"{report['unique_pos_clients']} unique positive clients < "
+            f"{FORWARD_MIN_UNIQUE_POSITIVE_CLIENTS}."
+        )
+        if args.commit:
+            status = {
+                "lineage_schema_version": LINEAGE_SCHEMA_VERSION,
+                "artifact_role": FORWARD_ARTIFACT_ROLE,
+                "status": "unavailable",
+                "reason": "insufficient_unique_positive_clients",
+                "source_history_start": get_settings().source_history_start_date.isoformat(),
+                "minimum_unique_positive_clients": FORWARD_MIN_UNIQUE_POSITIVE_CLIENTS,
+                "observed_unique_positive_clients": report["unique_pos_clients"],
+                "observed_positive_rows": report["atrisk_pos"],
+                "observed_atrisk_rows": report["atrisk_n"],
+                "dataset_sha256": dataset_lineage["parquet_sha256"],
+                "dataset_lineage": dataset_lineage,
+                "evaluated_at": utc_now(),
+            }
+            write_json_atomic(ART / "forward_model_status.json", status)
+            (ART / "forward_scorecard_coeffs.json").unlink(missing_ok=True)
+            print(
+                "PUBLISHED fail-closed forward status; stale forward artifact removed."
+            )
+        else:
+            print("Report-only run; production forward status was not changed.")
+        return
 
     tr, te, train_v, test_v = temporal_split(atrisk)
     report["train_vintages"] = train_v
@@ -443,8 +510,11 @@ def main():
     report["bands_monotone"] = monotone
     print(f"Bands monotone (in-sample): {monotone}")
 
-    coeffs = {
+    trained_at = utc_now()
+    coeffs_payload = {
         "model": "forward_sev180_scorecard",
+        "source_history_start": get_settings().source_history_start_date.isoformat(),
+        "trained_at": trained_at,
         "horizon_months": 6,
         "population": "at-risk-with-debt (total_debt_eur>0, not already SEV180)",
         "base_rate": round(float(atrisk[TARGET].mean()), 4),
@@ -461,19 +531,62 @@ def main():
     }
 
     report["new_oot_auc"] = new_oot_auc
-    (OUT / "metrics.json").write_text(json.dumps(report, indent=2, default=str))
+    validation = {
+        "gate": "forward_6m_production_v1",
+        "passed": (
+            new_oot_auc >= FORWARD_MIN_OOT_AUC
+            and monotone
+            and event_support_ok
+        ),
+        "minimum_unique_positive_clients": FORWARD_MIN_UNIQUE_POSITIVE_CLIENTS,
+        "observed_unique_positive_clients": report["unique_pos_clients"],
+        "minimum_oot_auc": FORWARD_MIN_OOT_AUC,
+        "oot_auc": new_oot_auc,
+        "bands_monotone": monotone,
+    }
+    report["production_gate"] = validation
+    training_run_id = (
+        f"forward-{trained_at.replace(':', '').replace('-', '')}-"
+        f"{dataset_lineage['parquet_sha256'][:12]}"
+    )
+    coeffs = attach_training_lineage(
+        coeffs_payload,
+        artifact_role=FORWARD_ARTIFACT_ROLE,
+        dataset_manifest=dataset_lineage,
+        validation=validation,
+        training_run_id=training_run_id,
+        trained_at=trained_at,
+    )
+    report["training_lineage"] = coeffs["training_lineage"]
+    write_json_atomic(OUT / "metrics.json", report)
     print(f"\nSaved metrics -> {OUT / 'metrics.json'}")
 
-    # ----- ONLY-OVERWRITE GATE
-    improves = new_oot_auc > OLD_OOT_AUC and monotone
+    # ----- PUBLICATION GATE
+    improves = validation["passed"]
     print("\n" + "=" * 78)
-    print(f"GATE: new OOT AUC {new_oot_auc} > old {OLD_OOT_AUC}? "
-          f"{new_oot_auc > OLD_OOT_AUC} ; bands monotone? {monotone} -> improves={improves}")
+    print(f"GATE: new OOT AUC {new_oot_auc} >= floor {FORWARD_MIN_OOT_AUC}? "
+          f"{new_oot_auc >= FORWARD_MIN_OOT_AUC} ; bands monotone? {monotone} ; "
+          f"unique positive clients {report['unique_pos_clients']} >= "
+          f"{FORWARD_MIN_UNIQUE_POSITIVE_CLIENTS}? {event_support_ok} -> pass={improves}")
     if args.commit and improves:
-        (ART / "forward_scorecard_coeffs.json").write_text(json.dumps(coeffs, indent=2))
+        write_json_atomic(ART / "forward_scorecard_coeffs.json", coeffs)
+        write_json_atomic(
+            ART / "forward_model_status.json",
+            {
+                "lineage_schema_version": LINEAGE_SCHEMA_VERSION,
+                "artifact_role": FORWARD_ARTIFACT_ROLE,
+                "status": "available",
+                "reason": None,
+                "source_history_start": get_settings().source_history_start_date.isoformat(),
+                "training_run_id": training_run_id,
+                "model_payload_sha256": model_payload_sha256(coeffs),
+                "dataset_sha256": dataset_lineage["parquet_sha256"],
+                "evaluated_at": trained_at,
+            },
+        )
         print(f"COMMITTED new artifact -> {ART / 'forward_scorecard_coeffs.json'}")
     elif args.commit:
-        print("NOT committed: did not beat the incumbent. Artifact left unchanged.")
+        print("NOT committed: production validation gate failed.")
     else:
         print("Report-only run (no --commit). Artifact left unchanged.")
     print("=" * 78)

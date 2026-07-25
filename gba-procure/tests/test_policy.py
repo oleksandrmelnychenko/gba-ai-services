@@ -193,12 +193,12 @@ def test_zero_demand_is_infinite_cover():
 def test_lead_time_geo_fallback_by_currency(monkeypatch):
     from app.services.forecasting import lead_time as lt
     monkeypatch.setattr(lt.repo, "producer_lead_times", lambda pid, asof, lo, hi: [])
-    monkeypatch.setattr(lt.repo, "producer_agreement_currency", lambda pid: 10038)
+    monkeypatch.setattr(lt.repo, "producer_agreement_currency", lambda pid, asof: 10038)
     mean, std, src = lt.producer_lead_time(1, "2026-06-15")
     assert mean == 7.0 and src == "geo" and std > 0
-    monkeypatch.setattr(lt.repo, "producer_agreement_currency", lambda pid: 3)
+    monkeypatch.setattr(lt.repo, "producer_agreement_currency", lambda pid, asof: 3)
     assert lt.producer_lead_time(1, "2026-06-15")[0] == 35.0
-    monkeypatch.setattr(lt.repo, "producer_agreement_currency", lambda pid: None)
+    monkeypatch.setattr(lt.repo, "producer_agreement_currency", lambda pid, asof: None)
     assert lt.producer_lead_time(1, "2026-06-15")[2] == "default"
 
 

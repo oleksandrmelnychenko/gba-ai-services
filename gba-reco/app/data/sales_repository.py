@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from app.core.config import get_settings
+from app.core.history import source_history_start_iso
 from app.data.db import in_clause, query
 
 _UBIQUITY_CACHE: dict[float, tuple[float, frozenset[int]]] = {}
@@ -83,6 +84,7 @@ def source_readiness(max_lag_days: int) -> dict[str, Any]:
                 WHERE oi.IsValidForCurrentSale = 1
                       AND oi.ProductID IS NOT NULL
                       AND oi.ProductID NOT IN {synth_ph}
+                      AND o.Created >= :history_start
                 ORDER BY o.Created DESC, o.ID DESC
             ) AS latest_sale_at,
             (
@@ -101,7 +103,7 @@ def source_readiness(max_lag_days: int) -> dict[str, Any]:
                       AND (s.AvailableForReSale = 1 OR s.IsResale = 1)
             ) AS sellable_storage_count
         """,
-        synth_params,
+        {"history_start": source_history_start_iso(), **synth_params},
     )
     row = rows[0] if rows else {}
     latest = row.get("latest_sale_at")
@@ -177,6 +179,7 @@ def _query_ubiquitous(pct: float) -> frozenset[int]:
             JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
             WHERE oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
                   AND o.Created >= DATEADD(month, -12, GETDATE())
+                  AND o.Created >= :history_start
         ),
         tot AS (SELECT COUNT(DISTINCT cid) AS n FROM base)
         SELECT b.pid AS pid
@@ -184,7 +187,7 @@ def _query_ubiquitous(pct: float) -> frozenset[int]:
         GROUP BY b.pid, tot.n
         HAVING COUNT(DISTINCT b.cid) * 1.0 / NULLIF(tot.n, 0) > :pct
         """,
-        {"pct": pct},
+        {"pct": pct, "history_start": source_history_start_iso()},
     )
     return frozenset(int(r["pid"]) for r in rows)
 
@@ -291,10 +294,15 @@ def count_orders_before(customer_id: int, as_of_date: str) -> int:
         JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
         JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
         WHERE ca.ClientID = :cid AND o.Created < :asof
+              AND o.Created >= :history_start
               AND oi.IsValidForCurrentSale = 1
               AND oi.ProductID IS NOT NULL
         """,
-        {"cid": customer_id, "asof": as_of_date},
+        {
+            "cid": customer_id,
+            "asof": as_of_date,
+            "history_start": source_history_start_iso(),
+        },
     )
     return int(rows[0]["n"]) if rows else 0
 
@@ -318,13 +326,19 @@ def repurchase_rate(customer_id: int, as_of_date: str) -> float:
             JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
             JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
             WHERE ca.ClientID = :cid AND o.Created < :asof
+                  AND o.Created >= :history_start
                   AND oi.IsValidForCurrentSale = 1
                   AND oi.ProductID IS NOT NULL
                   AND oi.ProductID NOT IN {synth_ph}
             GROUP BY oi.ProductID
         ) t
         """,
-        {"cid": customer_id, "asof": as_of_date, **synth_params},
+        {
+            "cid": customer_id,
+            "asof": as_of_date,
+            "history_start": source_history_start_iso(),
+            **synth_params,
+        },
     )
     if not rows or not rows[0]["total_products"]:
         return 0.0
@@ -339,10 +353,15 @@ def product_frequency(customer_id: int, as_of_date: str) -> dict[int, int]:
         JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
         JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
         WHERE ca.ClientID = :cid AND o.Created < :asof
+              AND o.Created >= :history_start
               AND oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
         GROUP BY oi.ProductID
         """,
-        {"cid": customer_id, "asof": as_of_date},
+        {
+            "cid": customer_id,
+            "asof": as_of_date,
+            "history_start": source_history_start_iso(),
+        },
     )
     return {int(r["pid"]): int(r["cnt"]) for r in rows}
 
@@ -355,12 +374,64 @@ def product_last_purchase(customer_id: int, as_of_date: str) -> dict[int, object
         JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
         JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
         WHERE ca.ClientID = :cid AND o.Created < :asof
+              AND o.Created >= :history_start
               AND oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
         GROUP BY oi.ProductID
         """,
-        {"cid": customer_id, "asof": as_of_date},
+        {
+            "cid": customer_id,
+            "asof": as_of_date,
+            "history_start": source_history_start_iso(),
+        },
     )
     return {int(r["pid"]): r["last_dt"] for r in rows}
+
+
+def owned_live_product_ids(customer_id: int, as_of_date: str) -> set[int]:
+    """Live catalog identities of every product previously bought by the client.
+
+    Order history frequently points at soft-deleted product generations after a catalog
+    re-sync. Comparing raw ProductID values would therefore let a newer generation of an
+    already-bought product leak into discovery. Resolve each historical row with the exact
+    same newest-live-VendorCode rule as ``live_remap``. The whole lookup stays in SQL, avoiding
+    an unbounded ProductID ``IN`` list for clients with wide histories.
+    """
+    rows = query(
+        """
+        WITH Owned AS (
+            SELECT DISTINCT oi.ProductID AS historical_id
+            FROM dbo.ClientAgreement ca
+            JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
+            JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
+            WHERE ca.ClientID = :cid AND o.Created < :asof
+                  AND o.Created >= :history_start
+                  AND oi.IsValidForCurrentSale = 1
+                  AND oi.ProductID IS NOT NULL
+        )
+        SELECT DISTINCT
+               CASE WHEN historical.Deleted = 0
+                    THEN historical.ID
+                    ELSE live.live_id
+               END AS pid
+        FROM Owned owned
+        JOIN dbo.Product historical ON historical.ID = owned.historical_id
+        OUTER APPLY (
+            SELECT TOP 1 current_product.ID AS live_id
+            FROM dbo.Product current_product
+            WHERE historical.Deleted <> 0
+                  AND current_product.VendorCode = historical.VendorCode
+                  AND current_product.Deleted = 0
+            ORDER BY current_product.ID DESC
+        ) live
+        WHERE historical.Deleted = 0 OR live.live_id IS NOT NULL
+        """,
+        {
+            "cid": customer_id,
+            "asof": as_of_date,
+            "history_start": source_history_start_iso(),
+        },
+    )
+    return {int(row["pid"]) for row in rows}
 
 
 def customer_products(customer_id: int, as_of_date: str, limit: int = 500) -> set[int]:
@@ -373,11 +444,17 @@ def customer_products(customer_id: int, as_of_date: str, limit: int = 500) -> se
             JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
             JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
             WHERE ca.ClientID = :cid AND o.Created < :asof
+                  AND o.Created >= :history_start
                   AND oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
             ORDER BY o.Created DESC, o.ID DESC, oi.ProductID ASC
         ) t
         """,
-        {"cid": customer_id, "asof": as_of_date, "lim": limit},
+        {
+            "cid": customer_id,
+            "asof": as_of_date,
+            "lim": limit,
+            "history_start": source_history_start_iso(),
+        },
     )
     return {int(r["ProductID"]) for r in rows}
 
@@ -408,12 +485,20 @@ def candidate_similar_customers(product_ids: set[int], exclude_id: int, as_of_da
         JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
         WHERE ca.ClientID <> :exclude
               AND o.Created < :asof
+              AND o.Created >= :history_start
               AND oi.IsValidForCurrentSale = 1
               AND oi.ProductID IN {placeholder}
         GROUP BY ca.ClientID
         ORDER BY overlap DESC, ca.ClientID ASC
         """,
-        {"exclude": exclude_id, "asof": as_of_date, "lim": limit, **pparams, **extra},
+        {
+            "exclude": exclude_id,
+            "asof": as_of_date,
+            "lim": limit,
+            "history_start": source_history_start_iso(),
+            **pparams,
+            **extra,
+        },
     )
     return [int(r["cid"]) for r in rows]
 
@@ -433,9 +518,14 @@ def customer_products_bulk(customer_ids: list[int], as_of_date: str) -> dict[int
         JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
         JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
         WHERE ca.ClientID IN {placeholder} AND o.Created < :asof
+              AND o.Created >= :history_start
               AND oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
         """,
-        {"asof": as_of_date, **params},
+        {
+            "asof": as_of_date,
+            "history_start": source_history_start_iso(),
+            **params,
+        },
     )
     out: dict[int, set[int]] = {}
     for r in rows:
@@ -467,6 +557,7 @@ def collaborative_products(
             JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
             JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
             WHERE ca.ClientID = :cid AND o.Created < :asof
+                  AND o.Created >= :history_start
                   AND oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
         ),
         Sim AS (
@@ -483,6 +574,7 @@ def collaborative_products(
             JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
             JOIN Sim s ON ca.ClientID = s.customer_id
             WHERE o.Created < :asof
+                  AND o.Created >= :history_start
                   AND oi.IsValidForCurrentSale = 1
                   AND oi.ProductID IS NOT NULL
                   AND NOT EXISTS (SELECT 1 FROM Owned ow WHERE ow.pid = oi.ProductID)
@@ -494,7 +586,12 @@ def collaborative_products(
         GROUP BY np.pid
         HAVING COUNT(DISTINCT s.customer_id) >= 2
         """,
-        {"asof": as_of_date, "cid": customer_id, **sim_params},
+        {
+            "asof": as_of_date,
+            "cid": customer_id,
+            "history_start": source_history_start_iso(),
+            **sim_params,
+        },
     )
     return {int(r["pid"]): float(r["score"]) for r in rows}
 

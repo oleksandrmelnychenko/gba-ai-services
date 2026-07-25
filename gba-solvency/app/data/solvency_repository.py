@@ -43,6 +43,10 @@ def _synthetic_not_in() -> tuple[str, dict[str, Any]]:
     return placeholder, params
 
 
+def _history_start() -> str:
+    return get_settings().source_history_start_date.isoformat()
+
+
 def source_readiness(max_lag_days: int) -> dict[str, Any]:
     """Factual source probe used by health/readiness.
 
@@ -82,7 +86,7 @@ def source_readiness(max_lag_days: int) -> dict[str, Any]:
             (
                 SELECT COUNT_BIG(*)
                 FROM dbo.Debt d
-                WHERE d.Deleted = 0 AND d.Created > '2000-01-01'
+                WHERE d.Deleted = 0 AND d.Created IS NOT NULL
             ) AS live_debt_count,
             (
                 SELECT COUNT_BIG(*)
@@ -118,6 +122,7 @@ def source_readiness(max_lag_days: int) -> dict[str, Any]:
     result = {
         "business_ready": not reasons,
         "reasons": reasons,
+        "source_history_start": settings.source_history_start_date.isoformat(),
         "latest_sale_at": latest.isoformat() if isinstance(latest, datetime) else None,
         "max_source_lag_days": max_lag_days,
         "buyer_count": buyer_count,
@@ -189,9 +194,15 @@ def payment_status_counts(client_id: int, as_of_date: str, window_months: int) -
         WHERE ca.ClientID = :cid
               AND s.Created <= :asof
               AND s.Created >= DATEADD(month, :neg_months, :asof)
+              AND s.Created >= :history_start
         GROUP BY bsps.SalePaymentStatusType
         """,
-        {"cid": client_id, "asof": as_of_date, "neg_months": -window_months},
+        {
+            "cid": client_id,
+            "asof": as_of_date,
+            "neg_months": -window_months,
+            "history_start": _history_start(),
+        },
     )
     out = {"paid": 0, "overpaid": 0, "partial": 0, "notpaid": 0, "refund": 0}
     for r in rows:
@@ -240,9 +251,16 @@ def open_unpaid_stats(client_id: int, as_of_date: str, window_months: int) -> di
         WHERE ca.ClientID = :cid
               AND s.Created <= :asof
               AND s.Created >= DATEADD(month, :neg_months, :asof)
+              AND s.Created >= :history_start
               AND bsps.SalePaymentStatusType IN {placeholder}
         """,
-        {"cid": client_id, "asof": as_of_date, "neg_months": -window_months, **params},
+        {
+            "cid": client_id,
+            "asof": as_of_date,
+            "neg_months": -window_months,
+            "history_start": _history_start(),
+            **params,
+        },
     )
     r = rows[0] if rows else {}
     return {
@@ -275,11 +293,18 @@ def open_unpaid_aging_buckets(client_id: int, as_of_date: str,
             WHERE ca.ClientID = :cid
                   AND s.Created <= :asof
                   AND s.Created >= DATEADD(month, :neg_months, :asof)
+                  AND s.Created >= :history_start
                   AND bsps.SalePaymentStatusType IN {placeholder}
         ) t
         GROUP BY bucket
         """,
-        {"cid": client_id, "asof": as_of_date, "neg_months": -window_months, **params},
+        {
+            "cid": client_id,
+            "asof": as_of_date,
+            "neg_months": -window_months,
+            "history_start": _history_start(),
+            **params,
+        },
     )
     return [{"bucket": r["bucket"], "count": int(r["cnt"] or 0)} for r in rows]
 
@@ -399,8 +424,14 @@ def total_sales_count(client_id: int, as_of_date: str, window_months: int) -> in
         WHERE ca.ClientID = :cid
               AND s.Created <= :asof
               AND s.Created >= DATEADD(month, :neg_months, :asof)
+              AND s.Created >= :history_start
         """,
-        {"cid": client_id, "asof": as_of_date, "neg_months": -window_months},
+        {
+            "cid": client_id,
+            "asof": as_of_date,
+            "neg_months": -window_months,
+            "history_start": _history_start(),
+        },
     )
     return int(rows[0]["n"]) if rows else 0
 
@@ -456,7 +487,8 @@ def turnover_eur(client_id: int, as_of_date: str, window_months: int,
     GetCalculatedProductPriceWithSharesAndVat; the agreement-currency value is the *Local engine
     price = EUR x ExchangeRateAmount). So NO GetExchangedToEuroValue conversion — applying it would
     wrongly divide non-EUR-agreement turnover by the FX rate. Filters honor traps (a)/(b):
-    IsValidForCurrentSale=1, NO Deleted=0 filter, ProductID NOT IN synthetic set, Created > '2000-01-01'.
+    IsValidForCurrentSale=1, NO Deleted=0 filter, ProductID NOT IN synthetic set, and the shared
+    source-history boundary.
     """
     ph, syn = _synthetic_not_in()
     rows = query(
@@ -473,13 +505,13 @@ def turnover_eur(client_id: int, as_of_date: str, window_months: int,
         WHERE ca.ClientID = :cid
               AND oi.IsValidForCurrentSale = 1
               AND oi.ProductID NOT IN {ph}
-              AND s.Created > '2000-01-01'
+              AND s.Created >= :history_start
               AND s.Created <= :asof
               AND s.Created >= DATEADD(month, :neg_months, :asof)
         """,
         {
             "cid": client_id, "asof": as_of_date, "neg_months": -window_months,
-            "fxdate": fx_date, **syn,
+            "fxdate": fx_date, "history_start": _history_start(), **syn,
         },
     )
     return float(round_cent(rows[0]["turnover"])) if rows else 0.0
@@ -504,14 +536,14 @@ def turnover_eur_by_currency(client_id: int, as_of_date: str, window_months: int
         WHERE ca.ClientID = :cid
               AND oi.IsValidForCurrentSale = 1
               AND oi.ProductID NOT IN {ph}
-              AND s.Created > '2000-01-01'
+              AND s.Created >= :history_start
               AND s.Created <= :asof
               AND s.Created >= DATEADD(month, :neg_months, :asof)
         GROUP BY a.CurrencyID
         """,
         {
             "cid": client_id, "asof": as_of_date, "neg_months": -window_months,
-            "fxdate": fx_date, **syn,
+            "fxdate": fx_date, "history_start": _history_start(), **syn,
         },
     )
     return [
@@ -527,15 +559,14 @@ def activity_stats(client_id: int, as_of_date: str, window_months: int) -> dict[
     """order_count / tenure_months / recency_days, over REAL sales only.
 
     order_count = COUNT(DISTINCT Sale.ID) in window.
-    tenure_months = DATEDIFF(month, MIN(Sale.Created excl sentinel 1980-01-01), as_of) over ALL
-    history (not windowed). recency_days = DATEDIFF(day, MAX(Sale.Created), as_of) over history.
+    tenure_months = DATEDIFF(month, MIN(Sale.Created), as_of) over all available history from
+    SOURCE_HISTORY_START_DATE. recency_days uses the same bounded available history.
 
     A Sale only counts if it carries a real, valid, non-synthetic line — i.e. EXISTS a
     OrderItem with IsValidForCurrentSale=1 and ProductID not in the synthetic-1С set. Without
     this gate the ~21.7k standalone single-line debt-injection Sales (synthetic ProductID) would
     inflate order_count and skew tenure/recency for affected clients (data trap (b)).
     """
-    s = get_settings()
     ph, syn = _synthetic_not_in()
     rows = query(
         f"""
@@ -546,18 +577,20 @@ def activity_stats(client_id: int, as_of_date: str, window_months: int) -> dict[
              WHERE ca2.ClientID = :cid
                    AND s2.Created <= :asof
                    AND s2.Created >= DATEADD(month, :neg_months, :asof)
+                   AND s2.Created >= :history_start
                    AND EXISTS (
                        SELECT 1 FROM dbo.OrderItem oi2
                        WHERE oi2.OrderID = s2.OrderID
                              AND oi2.ProductID NOT IN {ph}
                              AND oi2.IsValidForCurrentSale = 1
                    )) AS order_count,
-            DATEDIFF(month,
-                MIN(CASE WHEN s.Created > :sentinel THEN s.Created END), :asof) AS tenure_months,
+            DATEDIFF(month, MIN(s.Created), :asof) AS tenure_months,
             DATEDIFF(day, MAX(s.Created), :asof) AS recency_days
         FROM dbo.Sale s
         JOIN dbo.ClientAgreement ca ON ca.ID = s.ClientAgreementID
-        WHERE ca.ClientID = :cid AND s.Created <= :asof
+        WHERE ca.ClientID = :cid
+              AND s.Created >= :history_start
+              AND s.Created <= :asof
               AND EXISTS (
                   SELECT 1 FROM dbo.OrderItem oi
                   WHERE oi.OrderID = s.OrderID
@@ -565,8 +598,13 @@ def activity_stats(client_id: int, as_of_date: str, window_months: int) -> dict[
                         AND oi.IsValidForCurrentSale = 1
               )
         """,
-        {"cid": client_id, "asof": as_of_date, "neg_months": -window_months,
-         "sentinel": s.tenure_sentinel_date, **syn},
+        {
+            "cid": client_id,
+            "asof": as_of_date,
+            "neg_months": -window_months,
+            "history_start": _history_start(),
+            **syn,
+        },
     )
     r = rows[0] if rows else {}
     return {
@@ -603,6 +641,7 @@ def return_qty_rate(client_id: int, as_of_date: str, window_months: int) -> floa
                       AND sr.ClientID = :cid
                       AND sr.FromDate <= :asof
                       AND sr.FromDate >= DATEADD(month, :neg_months, :asof)
+                      AND sr.FromDate >= :history_start
                 GROUP BY sri.SaleReturnID, sri.OrderItemID
              ) line) AS return_qty,
             (SELECT ISNULL(SUM(oi.Qty), 0)
@@ -614,9 +653,16 @@ def return_qty_rate(client_id: int, as_of_date: str, window_months: int) -> floa
                    AND oi.IsValidForCurrentSale = 1
                    AND oi.ProductID NOT IN {ph}
                    AND s3.Created <= :asof
-                   AND s3.Created >= DATEADD(month, :neg_months, :asof)) AS sold_qty
+                   AND s3.Created >= DATEADD(month, :neg_months, :asof)
+                   AND s3.Created >= :history_start) AS sold_qty
         """,
-        {"cid": client_id, "asof": as_of_date, "neg_months": -window_months, **syn},
+        {
+            "cid": client_id,
+            "asof": as_of_date,
+            "neg_months": -window_months,
+            "history_start": _history_start(),
+            **syn,
+        },
     )
     if not rows:
         return 0.0
@@ -638,7 +684,7 @@ def client_flags(client_id: int) -> dict[str, Any]:
 def debt_sync_is_live() -> bool:
     """Probe whether the Debt table is quiesced / usable.
 
-    Live when there are rows with Deleted=0 AND sane Created (post-2000). If the sync is in
+    Live when there are rows with Deleted=0 and a business timestamp. If the sync is in
     progress every row is Deleted=1, so this returns False and the engine falls back to the
     live open-unpaid proxy. Recorded as SolvencyScore.debt_load_source.
     """
@@ -646,7 +692,7 @@ def debt_sync_is_live() -> bool:
         """
         SELECT COUNT(*) AS live_rows
         FROM dbo.Debt
-        WHERE Deleted = 0 AND Created > '2000-01-01'
+        WHERE Deleted = 0 AND Created IS NOT NULL
         """,
     )
     return bool(rows and int(rows[0]["live_rows"] or 0) > 0)
@@ -680,15 +726,22 @@ def synthetic_line_drift_check() -> dict[str, Any]:
                    * CAST(oi.PricePerItem AS decimal(19, 6))
                ) AS turnover
         FROM dbo.OrderItem oi
+        JOIN dbo.[Order] o ON o.ID = oi.OrderID
         WHERE oi.IsValidForCurrentSale = 1
               AND oi.ProductID NOT IN """ + ph + """
+              AND o.Created >= :history_start
+              AND o.Created <= :asof
         GROUP BY oi.ProductID
         ORDER BY SUM(
             CAST(oi.Qty AS decimal(19, 6))
             * CAST(oi.PricePerItem AS decimal(19, 6))
         ) DESC
         """,
-        syn,
+        {
+            **syn,
+            "history_start": _history_start(),
+            "asof": datetime.now(),
+        },
     )
     top = ranked[0] if ranked else None
     second = ranked[1] if len(ranked) > 1 else None
@@ -768,7 +821,7 @@ def monthly_turnover_series(client_id: int, as_of_date: str, window_months: int,
         WHERE ca.ClientID = :cid
               AND oi.IsValidForCurrentSale = 1
               AND oi.ProductID NOT IN {ph}
-              AND s.Created > '2000-01-01'
+              AND s.Created >= :history_start
               AND s.Created <= :asof
               AND s.Created >= DATEADD(month, :neg_months, :asof)
         GROUP BY FORMAT(s.Created, 'yyyy-MM')
@@ -776,7 +829,7 @@ def monthly_turnover_series(client_id: int, as_of_date: str, window_months: int,
         """,
         {
             "cid": client_id, "asof": as_of_date, "neg_months": -window_months,
-            "fxdate": fx_date, **syn,
+            "fxdate": fx_date, "history_start": _history_start(), **syn,
         },
     )
     return [

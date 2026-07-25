@@ -124,11 +124,18 @@ def test_live_identity_and_history_money_reconcile_exactly(monkeypatch):
 
     from app.api import main
     from app.core.config import get_settings
+    from app.core.history import resolve_history_window
     from app.data import signals_repository as sig
     from app.data.db import query
     from app.services import forecast as fc
 
     as_of = main._today()
+    cfg = get_settings()
+    window = resolve_history_window(
+        as_of,
+        cfg.history_months,
+        cfg.source_history_start_date,
+    )
     synth = sig.synthetic_product_id()
     seeds = query(
         """
@@ -149,14 +156,18 @@ def test_live_identity_and_history_money_reconcile_exactly(monkeypatch):
               AND p.Deleted = 0
               AND c.NetUID IS NOT NULL
               AND p.NetUID IS NOT NULL
-              AND o.Created >= DATEADD(
-                  month, 1 - :months, DATEFROMPARTS(YEAR(:asof), MONTH(:asof), 1)
-              )
+              AND o.Created >= :source_history_start
+              AND o.Created >= :history_start
               AND o.Created < :asof
         GROUP BY ca.ClientID, c.NetUID, oi.ProductID, p.NetUID
         ORDER BY active_months DESC, ca.ClientID, oi.ProductID
         """,
-        {"synth": synth, "months": get_settings().history_months, "asof": as_of},
+        {
+            "synth": synth,
+            "source_history_start": window.source_history_start.isoformat(),
+            "history_start": window.effective_start.isoformat(),
+            "asof": as_of,
+        },
     )
     assert seeds
     seed = seeds[0]
@@ -200,9 +211,8 @@ def test_live_identity_and_history_money_reconcile_exactly(monkeypatch):
             WHERE ca.ClientID = :client_id
                   AND oi.IsValidForCurrentSale = 1
                   AND oi.ProductID <> :synth
-                  AND o.Created >= DATEADD(
-                      month, 1 - :months, DATEFROMPARTS(YEAR(:asof), MONTH(:asof), 1)
-                  )
+                  AND o.Created >= :source_history_start
+                  AND o.Created >= :history_start
                   AND o.Created < :asof
             GROUP BY CONVERT(char(7), o.Created, 120)
         """,
@@ -216,9 +226,8 @@ def test_live_identity_and_history_money_reconcile_exactly(monkeypatch):
             JOIN dbo.[Order] o ON o.ID = oi.OrderID
             WHERE oi.ProductID = :product_id
                   AND oi.IsValidForCurrentSale = 1
-                  AND o.Created >= DATEADD(
-                      month, 1 - :months, DATEFROMPARTS(YEAR(:asof), MONTH(:asof), 1)
-                  )
+                  AND o.Created >= :source_history_start
+                  AND o.Created >= :history_start
                   AND o.Created < :asof
             GROUP BY CONVERT(char(7), o.Created, 120)
         """,
@@ -235,9 +244,8 @@ def test_live_identity_and_history_money_reconcile_exactly(monkeypatch):
                   AND oi.ProductID = :product_id
                   AND oi.IsValidForCurrentSale = 1
                   AND oi.ProductID <> :synth
-                  AND o.Created >= DATEADD(
-                      month, 1 - :months, DATEFROMPARTS(YEAR(:asof), MONTH(:asof), 1)
-                  )
+                  AND o.Created >= :source_history_start
+                  AND o.Created >= :history_start
                   AND o.Created < :asof
             GROUP BY CONVERT(char(7), o.Created, 120)
         """,
@@ -246,7 +254,8 @@ def test_live_identity_and_history_money_reconcile_exactly(monkeypatch):
         "client_id": seed["client_id"],
         "product_id": seed["product_id"],
         "synth": synth,
-        "months": get_settings().history_months,
+        "source_history_start": window.source_history_start.isoformat(),
+        "history_start": window.effective_start.isoformat(),
         "asof": as_of,
     }
     for key, sql in scope_sql.items():

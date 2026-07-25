@@ -84,7 +84,14 @@ def service():
 
 
 @pytest.fixture(scope="module")
-def uah_client(repo) -> int:
+def source_history_start() -> str:
+    from app.core.config import get_settings
+
+    return get_settings().source_history_start_date.isoformat()
+
+
+@pytest.fixture(scope="module")
+def uah_client(repo, source_history_start) -> int:
     """A real client whose turnover flows through a UAH agreement in the window."""
     from app.data.db import query
 
@@ -100,7 +107,7 @@ def uah_client(repo) -> int:
         WHERE a.CurrencyID = :uah
               AND oi.IsValidForCurrentSale = 1
               AND oi.ProductID NOT IN {placeholder}
-              AND s.Created > '2000-01-01'
+              AND s.Created >= :history_start
               AND s.Created <= :asof
               AND s.Created >= DATEADD(month, -12, :asof)
         GROUP BY ca.ClientID
@@ -108,7 +115,12 @@ def uah_client(repo) -> int:
                AND SUM(oi.Qty * oi.PricePerItem) > 10000
         ORDER BY SUM(oi.Qty * oi.PricePerItem) DESC
         """,
-        {"uah": UAH_CURRENCY_ID, "asof": _AS_OF, **synthetic},
+        {
+            "uah": UAH_CURRENCY_ID,
+            "asof": _AS_OF,
+            "history_start": source_history_start,
+            **synthetic,
+        },
     )
     if not rows:
         pytest.skip("no UAH client with material recent turnover in dev DB")
@@ -116,7 +128,9 @@ def uah_client(repo) -> int:
 
 
 @skip_no_db
-def test_uah_turnover_bucket_is_not_divided_by_fx_rate(repo, uah_client):
+def test_uah_turnover_bucket_is_not_divided_by_fx_rate(
+    repo, uah_client, source_history_start
+):
     from app.data.db import query
 
     placeholder, synthetic = repo._synthetic_not_in()
@@ -141,7 +155,7 @@ def test_uah_turnover_bucket_is_not_divided_by_fx_rate(repo, uah_client):
               AND a.CurrencyID = :uah
               AND oi.IsValidForCurrentSale = 1
               AND oi.ProductID NOT IN {placeholder}
-              AND s.Created > '2000-01-01'
+              AND s.Created >= :history_start
               AND s.Created <= :asof
               AND s.Created >= DATEADD(month, -12, :asof)
         """,
@@ -150,6 +164,7 @@ def test_uah_turnover_bucket_is_not_divided_by_fx_rate(repo, uah_client):
             "uah": UAH_CURRENCY_ID,
             "asof": _AS_OF,
             "fx": _AS_OF,
+            "history_start": source_history_start,
             **synthetic,
         },
     )
@@ -188,14 +203,24 @@ def test_nonexistent_client_raises_lookup(service):
 @skip_no_db
 def test_real_uah_client_scores_in_band(service, uah_client):
     result = service.score_client(uah_client, None, _AS_OF, 12, use_cache=False)
+    features = service.risk_dataset.features_one(uah_client, _AS_OF, 12)
     assert result.client_id == uah_client
     assert 0 <= result.score <= 100
     assert result.rating in {"A", "B", "C", "D"}
-    # v3 contract: explainable contributions + 6mo forward early-warning; sub_factors deprecated.
+    # v3 contract: explainable contributions plus a 6mo signal only inside that model's
+    # declared population (positive debt, not already SEV180); sub_factors are deprecated.
     assert result.pd is not None and 0.0 <= result.pd <= 1.0
     assert result.contributions and len(result.contributions) > 0
-    assert result.forward_risk is not None
-    assert result.forward_risk.band in {"low", "medium", "high", "very_high"}
+    if (
+        features["total_debt_eur"] <= 0
+        or features["overdue_eur_180plus"] >= service.risk_dataset.SEV180_MIN_EUR
+    ):
+        assert result.forward_risk is None
+        assert result.forward_risk_status == "not_applicable"
+    else:
+        assert result.forward_risk is None
+        assert result.forward_risk_status == "model_unavailable"
+        assert "3 < 30" in result.forward_risk_reason
     assert result.sub_factors is None
     assert result.model_version == "creditscore-v3"
 

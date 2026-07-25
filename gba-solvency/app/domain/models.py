@@ -61,6 +61,7 @@ class CapType(StrEnum):
     UTILIZATION_HARD_40 = "utilization_hard_40"
     UTILIZATION_SOFT_60 = "utilization_soft_60"
     BLOCKED_HALF = "blocked_half"
+    CURRENT_SEV180_PD_FLOOR = "current_sev180_pd_floor"
 
 
 class SubFactor(BaseModel):
@@ -103,6 +104,12 @@ class ForwardRiskBand(StrEnum):
     VERY_HIGH = "very_high"
 
 
+class ForwardRiskStatus(StrEnum):
+    AVAILABLE = "available"
+    NOT_APPLICABLE = "not_applicable"
+    MODEL_UNAVAILABLE = "model_unavailable"
+
+
 class ForwardRisk(BaseModel):
     """6-month forward (early-warning) risk: band + PD from the forward scorecard."""
     band: ForwardRiskBand
@@ -127,6 +134,8 @@ class SolvencyScore(BaseModel):
     )
     contributions: list[Contribution] | None = None
     forward_risk: ForwardRisk | None = None
+    forward_risk_status: ForwardRiskStatus = ForwardRiskStatus.MODEL_UNAVAILABLE
+    forward_risk_reason: str | None = None
     sub_factors: SubFactors | None = None
     caps_applied: list[CapType] = Field(default_factory=list)
     debt_load_source: DebtLoadSource | None = None
@@ -136,9 +145,13 @@ class SolvencyScore(BaseModel):
     currency_breakdown: list[CurrencyExposure] | None = None
     data_sufficiency: DataSufficiency = DataSufficiency.OK
     data_sufficiency_reason: str | None = None
+    source_history_start: str = "2025-01-01"
+    effective_start: str | None = None
+    history_complete: bool = True
     as_of_date: str | None = None
     window_months: int = 12
     model_version: str = "creditscore-v3"
+    current_model_run_id: str | None = None
 
 
 class GaugeChart(BaseModel):
@@ -203,6 +216,9 @@ class SolvencyCharts(BaseModel):
         default="pending",
         description="pending until Debt sync settles (not live-buildable yet)",
     )
+    source_history_start: str = "2025-01-01"
+    effective_start: str | None = None
+    history_complete: bool = True
     as_of_date: str | None = None
     window_months: int = 12
     model_version: str = "creditscore100-v2"

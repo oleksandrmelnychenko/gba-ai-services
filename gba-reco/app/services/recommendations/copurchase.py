@@ -17,10 +17,19 @@ import math
 from collections import defaultdict
 
 from app.core.config import get_settings
+from app.core.history import (
+    full_history_coverage,
+    source_history_start_iso,
+)
 from app.data import cache
 from app.data import sales_repository as repo
 from app.data.db import in_clause, query
-from app.domain.models import ProductRec, RecommendationResult, RecSource
+from app.domain.models import (
+    ProductRec,
+    RecommendationResult,
+    RecSource,
+    RecSourceDetail,
+)
 
 _COOC_ROW_CAP = 1500
 
@@ -33,10 +42,15 @@ def _client_products_with_freq(customer_id: int, as_of: str) -> dict[int, float]
         JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
         JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
         WHERE ca.ClientID = :cid AND oi.IsValidForCurrentSale = 1
-              AND o.Created < :asof AND oi.ProductID IS NOT NULL
+              AND o.Created < :asof AND o.Created >= :history_start
+              AND oi.ProductID IS NOT NULL
         GROUP BY oi.ProductID
         """,
-        {"cid": customer_id, "asof": as_of},
+        {
+            "cid": customer_id,
+            "asof": as_of,
+            "history_start": source_history_start_iso(),
+        },
     )
     return {int(r["pid"]): float(r["c"]) for r in rows}
 
@@ -61,7 +75,9 @@ def _cooccurring_products(seed_products: list[int], as_of: str, limit_seed: int 
             FROM dbo.ClientAgreement ca
             JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
             JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-            WHERE oi.IsValidForCurrentSale = 1 AND o.Created < :asof AND oi.ProductID IN {seed_ph}
+            WHERE oi.IsValidForCurrentSale = 1
+                  AND o.Created < :asof AND o.Created >= :history_start
+                  AND oi.ProductID IN {seed_ph}
         ),
         cand AS (
             SELECT DISTINCT ca.ClientID AS cid, oi.ProductID AS cand
@@ -69,7 +85,9 @@ def _cooccurring_products(seed_products: list[int], as_of: str, limit_seed: int 
             JOIN dbo.ClientAgreement ca ON ca.ClientID = sc.cid
             JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
             JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-            WHERE oi.IsValidForCurrentSale = 1 AND o.Created < :asof AND oi.ProductID IS NOT NULL
+            WHERE oi.IsValidForCurrentSale = 1
+                  AND o.Created < :asof AND o.Created >= :history_start
+                  AND oi.ProductID IS NOT NULL
         )
         SELECT TOP (:cap) sc.seed AS seed, c.cand AS cand, COUNT(DISTINCT sc.cid) AS co_clients
         FROM seed_clients sc
@@ -78,7 +96,12 @@ def _cooccurring_products(seed_products: list[int], as_of: str, limit_seed: int 
         HAVING COUNT(DISTINCT sc.cid) >= 2
         ORDER BY COUNT(DISTINCT sc.cid) DESC, sc.seed ASC, c.cand ASC
         """,
-        {"asof": as_of, "cap": _COOC_ROW_CAP, **seed_params},
+        {
+            "asof": as_of,
+            "cap": _COOC_ROW_CAP,
+            "history_start": source_history_start_iso(),
+            **seed_params,
+        },
     )
     if not rows:
         return {}
@@ -107,10 +130,16 @@ def _product_degrees(product_ids: list[int], as_of: str) -> dict[int, int]:
         FROM dbo.ClientAgreement ca
         JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
         JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-        WHERE oi.IsValidForCurrentSale = 1 AND o.Created < :asof AND oi.ProductID IN {ph}
+        WHERE oi.IsValidForCurrentSale = 1
+              AND o.Created < :asof AND o.Created >= :history_start
+              AND oi.ProductID IN {ph}
         GROUP BY oi.ProductID
         """,
-        {"asof": as_of, **params},
+        {
+            "asof": as_of,
+            "history_start": source_history_start_iso(),
+            **params,
+        },
     )
     return {int(r["pid"]): int(r["deg"]) for r in rows}
 
@@ -129,8 +158,10 @@ def recommend(
     client's own purchase history — so it works even for clients with no valid sales yet."""
     from datetime import datetime
     started = datetime.now()
+    history = full_history_coverage(as_of_date)
 
     excl = repo.ubiquitous_product_ids(get_settings().ubiquity_exclude_pct) | cache.get_negatives(customer_id)
+    owned_live = repo.owned_live_product_ids(customer_id, as_of_date)
     own = {p: f for p, f in _client_products_with_freq(customer_id, as_of_date).items() if p not in excl}
     seeds = [p for p in seed_product_ids if p not in excl] if seed_product_ids else list(own.keys())
     co = {p: s for p, s in _cooccurring_products(seeds, as_of_date).items() if p not in excl}
@@ -169,12 +200,25 @@ def recommend(
     ranked = [item for item in window if item[0] in stocked][:top_n]
     recs = [
         ProductRec(product_id=pid, score=round(score, 4), rank=i + 1,
-                   segment="COPURCHASE", source=src)
+                   segment="COPURCHASE", source=src,
+                   source_detail=(
+                       RecSourceDetail.REPURCHASE_HISTORY
+                       if src == RecSource.REPURCHASE
+                       else RecSourceDetail.COPURCHASE
+                   ))
         for i, (pid, (score, src)) in enumerate(ranked)
     ]
     # Translate dead catalog-generation ids onto live rows (see live_remap docstring).
     from app.services.recommendations import live_remap
     recs = live_remap.remap_recs_to_live(recs)
+    for item in recs:
+        if item.product_id in owned_live:
+            item.source = RecSource.REPURCHASE
+            item.source_detail = RecSourceDetail.REPURCHASE_HISTORY
+    if not include_owned:
+        # The first filter above compares historical raw ids. Repeat after live remapping so a
+        # different catalog generation of an already-bought product cannot pass as discovery.
+        recs = [item for item in recs if item.source == RecSource.DISCOVERY]
     final_stock = repo.in_stock_product_ids([item.product_id for item in recs])
     recs = [item for item in recs if item.product_id in final_stock]
     for index, item in enumerate(recs, start=1):
@@ -184,5 +228,9 @@ def recommend(
     return RecommendationResult(
         customer_id=customer_id, recommendations=recs, count=len(recs),
         discovery_count=discovery, segment="COPURCHASE",
-        latency_ms=round(latency, 2), as_of_date=as_of_date, model_version="copurchase-v1",
+        latency_ms=round(latency, 2), as_of_date=as_of_date,
+        source_history_start=history.source_history_start.isoformat(),
+        effective_start=history.effective_start.isoformat(),
+        history_complete=history.history_complete,
+        model_version="copurchase-v2-history-floor-20250101",
     )

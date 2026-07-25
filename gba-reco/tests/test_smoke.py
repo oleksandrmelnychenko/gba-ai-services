@@ -5,7 +5,13 @@ import pytest
 from pydantic import ValidationError
 
 from app.data.db import in_clause
-from app.domain.models import ProductRec, RecommendationResult, RecSource, Segment
+from app.domain.models import (
+    ProductRec,
+    RecommendationResult,
+    RecSource,
+    RecSourceDetail,
+    Segment,
+)
 
 
 def test_in_clause_parameterized():
@@ -31,8 +37,12 @@ def test_result_contract_shape():
     r = RecommendationResult(
         customer_id=1,
         recommendations=[ProductRec(product_id=5, score=0.9, rank=1, segment="LIGHT",
-                                    source=RecSource.REPURCHASE)],
+                                    source=RecSource.REPURCHASE,
+                                    source_detail=RecSourceDetail.REPURCHASE_HISTORY)],
         count=1, discovery_count=0, segment="LIGHT",
+        source_history_start="2025-01-01",
+        effective_start="2025-01-01",
+        history_complete=True,
     )
     dumped = r.model_dump(mode="json")
     # contract fields the .NET DTO expects
@@ -40,6 +50,10 @@ def test_result_contract_shape():
                   "precision_estimate", "latency_ms", "cached"):
         assert field in dumped
     assert dumped["recommendations"][0]["source"] == "repurchase"
+    assert dumped["recommendations"][0]["source_detail"] == "repurchase_history"
+    assert dumped["source_history_start"] == "2025-01-01"
+    assert dumped["effective_start"] == "2025-01-01"
+    assert dumped["history_complete"] is True
 
 
 @pytest.mark.parametrize(
@@ -55,6 +69,7 @@ def test_result_contract_shape():
                     rank=1,
                     segment="LIGHT",
                     source=RecSource.REPURCHASE,
+                    source_detail=RecSourceDetail.REPURCHASE_HISTORY,
                 ),
                 ProductRec(
                     product_id=5,
@@ -62,6 +77,7 @@ def test_result_contract_shape():
                     rank=2,
                     segment="LIGHT",
                     source=RecSource.REPURCHASE,
+                    source_detail=RecSourceDetail.REPURCHASE_HISTORY,
                 ),
             ],
             "count": 2,
@@ -78,11 +94,15 @@ def test_result_contract_rejects_mismatched_counts_and_duplicate_products(overri
                 rank=1,
                 segment="LIGHT",
                 source=RecSource.REPURCHASE,
+                source_detail=RecSourceDetail.REPURCHASE_HISTORY,
             )
         ],
         "count": 1,
         "discovery_count": 0,
         "segment": "LIGHT",
+        "source_history_start": "2025-01-01",
+        "effective_start": "2025-01-01",
+        "history_complete": True,
         **overrides,
     }
     with pytest.raises(ValidationError):
@@ -100,11 +120,15 @@ def test_result_contract_rejects_row_segment_drift():
                     rank=1,
                     segment="HEAVY",
                     source=RecSource.REPURCHASE,
+                    source_detail=RecSourceDetail.REPURCHASE_HISTORY,
                 )
             ],
             count=1,
             discovery_count=0,
             segment="LIGHT",
+            source_history_start="2025-01-01",
+            effective_start="2025-01-01",
+            history_complete=True,
         )
 
 

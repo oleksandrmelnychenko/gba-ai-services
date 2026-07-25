@@ -5,6 +5,8 @@ No DB: every test runs on hand-built dense monthly series so the math is determi
 
 from __future__ import annotations
 
+from datetime import date
+
 from app.services.forecasting import backtest, classify, selection
 from scripts import run_backtest
 
@@ -202,3 +204,14 @@ def test_run_backtest_json_summary_contract():
     }
     assert summary["selection"]["auto_mae"] == 5.5
     assert summary["selection"]["legacy_mae"] == 55.0
+
+
+def test_backtest_dense_series_respects_source_history_floor():
+    dense = run_backtest._dense(
+        {"2024-12": 999.0, "2025-01": 10.0, "2025-03": 30.0},
+        date(2025, 3, 25),
+        24,
+        date(2025, 1, 1),
+    )
+
+    assert dense == [10.0, 0.0, 30.0]

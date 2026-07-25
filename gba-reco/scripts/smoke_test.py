@@ -5,6 +5,7 @@ Usage: DB_PASSWORD=... .venv/bin/python scripts/smoke_test.py
 from __future__ import annotations
 
 import sys
+from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -12,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.services.recommendations import recommender  # noqa: E402
 
 TEST_CUSTOMERS = [410169, 410175, 410176, 410180]
-AS_OF = "2024-07-01"
+AS_OF = date.today().isoformat()
 
 
 def main() -> None:

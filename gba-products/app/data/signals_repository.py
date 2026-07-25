@@ -47,6 +47,12 @@ from typing import Any
 
 from app.core import exact_numbers as exact
 from app.core.config import get_settings
+from app.core.history import (
+    HistoryWindow,
+    day_history_window,
+    month_history_window,
+    resolve_history_window,
+)
 from app.data.db import in_clause, query
 
 # 1С debt/balance-import document type on dbo.ProductIncome.SourceDocumentType. Such lots carry an
@@ -67,6 +73,17 @@ _SALE_PRICE = "CAST(oi.PricePerItem AS decimal(28, 14))"
 _SALE_AMOUNT = f"{_SALE_QTY} * {_SALE_PRICE}"
 _RETURN_QTY = "CAST(sri.Qty AS decimal(18, 8))"
 
+_SALES_HISTORY_WINDOW = (
+    "o.Created >= :source_history_start "
+    "AND o.Created >= :history_start "
+    "AND o.Created < :asof"
+)
+_RETURNS_HISTORY_WINDOW = (
+    "sr.FromDate >= :source_history_start "
+    "AND sr.FromDate >= :history_start "
+    "AND sr.FromDate < :asof"
+)
+
 # The synthetic "Ввід боргів" (debt-entry) product carries accounting noise — it is a 1С
 # debt-injection line, not a real sale or return (it ranks #1 by revenue, ~€7.4M). Every
 # sales-spine aggregate (velocity / avg sale price / monthly units) and the returns query must
@@ -77,6 +94,44 @@ _RETURN_QTY = "CAST(sri.Qty AS decimal(18, 8))"
 _SYNTHETIC_FALLBACK_ID = 29555414
 _SYNTHETIC_REFRESH_SECONDS = 3600
 _synthetic_cached: tuple[int, float] | None = None
+
+
+def _window_params(as_of: str, window: HistoryWindow) -> dict[str, Any]:
+    return {
+        "asof": as_of,
+        "source_history_start": window.source_history_start.isoformat(),
+        "history_start": window.effective_start.isoformat(),
+    }
+
+
+def _day_history_params(as_of: str, window_days: int) -> tuple[HistoryWindow, dict[str, Any]]:
+    window = day_history_window(
+        as_of,
+        window_days,
+        get_settings().source_history_start_date,
+    )
+    return window, _window_params(as_of, window)
+
+
+def _month_history_params(as_of: str, months: int) -> tuple[HistoryWindow, dict[str, Any]]:
+    window = month_history_window(
+        as_of,
+        months,
+        get_settings().source_history_start_date,
+    )
+    return window, _window_params(as_of, window)
+
+
+def _explicit_history_params(
+    as_of: str,
+    requested_start: str,
+) -> tuple[HistoryWindow, dict[str, Any]]:
+    window = resolve_history_window(
+        as_of,
+        requested_start,
+        get_settings().source_history_start_date,
+    )
+    return window, _window_params(as_of, window)
 
 
 def synthetic_product_id() -> int:
@@ -282,15 +337,16 @@ def stock_source_readiness() -> dict[str, Any]:
 
 def sold_product_ids(as_of: str, window_days: int) -> set[int]:
     """Distinct ProductIDs with at least one valid sale line in the window (Order.Created)."""
+    _, params = _day_history_params(as_of, window_days)
     rows = query(
-        """
+        f"""
         SELECT DISTINCT oi.ProductID AS product_id
         FROM dbo.OrderItem oi
         JOIN dbo.[Order] o ON o.ID = oi.OrderID
         WHERE oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
-              AND o.Created >= DATEADD(day, -:win, :asof) AND o.Created < :asof
+              AND {_SALES_HISTORY_WINDOW}
         """,
-        {"asof": as_of, "win": window_days},
+        params,
     )
     return {int(r["product_id"]) for r in rows}
 
@@ -298,7 +354,8 @@ def sold_product_ids(as_of: str, window_days: int) -> set[int]:
 def sales_velocity(as_of: str, window_days: int,
                    product_ids: Sequence[int] | None = None) -> list[dict]:
     """Per-product sold qty / order count / recency over the window (Order.Created)."""
-    params: dict[str, Any] = {"asof": as_of, "win": window_days, "synth": synthetic_product_id()}
+    _, params = _day_history_params(as_of, window_days)
+    params["synth"] = synthetic_product_id()
     flt = _in_filter("oi.ProductID", "p", product_ids, params)
     return query(
         f"""
@@ -311,7 +368,7 @@ def sales_velocity(as_of: str, window_days: int,
         FROM dbo.OrderItem oi
         JOIN dbo.[Order] o ON o.ID = oi.OrderID
         WHERE oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL AND oi.ProductID <> :synth
-              AND o.Created >= DATEADD(day, -:win, :asof) AND o.Created < :asof{flt}
+              AND {_SALES_HISTORY_WINDOW}{flt}
         GROUP BY oi.ProductID
         """,
         params,
@@ -321,7 +378,8 @@ def sales_velocity(as_of: str, window_days: int,
 def avg_sale_price_eur(as_of: str, window_days: int,
                        product_ids: Sequence[int] | None = None) -> list[dict]:
     """Per-product qty-weighted average SALE price in EUR (OrderItem.PricePerItem is already EUR)."""
-    params: dict[str, Any] = {"asof": as_of, "win": window_days, "synth": synthetic_product_id()}
+    _, params = _day_history_params(as_of, window_days)
+    params["synth"] = synthetic_product_id()
     flt = _in_filter("oi.ProductID", "p", product_ids, params)
     return query(
         f"""
@@ -335,8 +393,7 @@ def avg_sale_price_eur(as_of: str, window_days: int,
                   AND oi.ProductID IS NOT NULL
                   AND oi.ProductID <> :synth
                   AND oi.PricePerItem > 0
-                  AND o.Created >= DATEADD(day, -:win, :asof)
-                  AND o.Created < :asof{flt}
+                  AND {_SALES_HISTORY_WINDOW}{flt}
             GROUP BY oi.ProductID
         )
         SELECT product_id,
@@ -370,7 +427,8 @@ def returns_for_products(as_of: str, window_days: int,
       - Active returns only: sr.Deleted = 0 AND sr.IsCanceled = 0. Exclude the synthetic debt-entry
         product. oi.PricePerItem is already EUR (no conversion).
     """
-    params: dict[str, Any] = {"asof": as_of, "win": window_days, "synth": synthetic_product_id()}
+    _, params = _day_history_params(as_of, window_days)
+    params["synth"] = synthetic_product_id()
     flt = _in_filter("oi.ProductID", "p", product_ids, params)
     return query(
         f"""
@@ -394,7 +452,7 @@ def returns_for_products(as_of: str, window_days: int,
             JOIN dbo.SaleReturn sr ON sr.ID = sri.SaleReturnID
                  AND sr.Deleted = 0 AND sr.IsCanceled = 0
             WHERE sri.Deleted = 0 AND oi.ProductID IS NOT NULL AND oi.ProductID <> :synth
-                  AND sr.FromDate >= DATEADD(day, -:win, :asof) AND sr.FromDate < :asof{flt}
+                  AND {_RETURNS_HISTORY_WINDOW}{flt}
             GROUP BY oi.ProductID, sri.SaleReturnID, sri.OrderItemID
         ) line
         GROUP BY product_id
@@ -407,7 +465,8 @@ def monthly_units(as_of: str, months: int,
                   product_ids: Sequence[int] | None = None) -> list[dict]:
     """Per-product per-month units sold over the trailing window (Order.Created) — feeds XYZ CV,
     trend and lifecycle. Months with no sales are absent; the caller fills the grid with zeros."""
-    params: dict[str, Any] = {"asof": as_of, "months": months, "synth": synthetic_product_id()}
+    _, params = _month_history_params(as_of, months)
+    params["synth"] = synthetic_product_id()
     flt = _in_filter("oi.ProductID", "p", product_ids, params)
     return query(
         f"""
@@ -417,12 +476,7 @@ def monthly_units(as_of: str, months: int,
         FROM dbo.OrderItem oi
         JOIN dbo.[Order] o ON o.ID = oi.OrderID
         WHERE oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL AND oi.ProductID <> :synth
-              AND o.Created >= DATEFROMPARTS(
-                  YEAR(DATEADD(month, 1 - :months, :asof)),
-                  MONTH(DATEADD(month, 1 - :months, :asof)),
-                  1
-              )
-              AND o.Created < :asof{flt}
+              AND {_SALES_HISTORY_WINDOW}{flt}
         GROUP BY oi.ProductID, CONVERT(char(7), o.Created, 126)
         """,
         params,
@@ -437,6 +491,13 @@ def monthly_product_sales(product_id: int, window_start: str, as_of: str) -> lis
     ``OrderItem.PricePerItem`` is already EUR. The caller owns the dense month grid because SQL only
     returns months with sales.
     """
+    _, params = _explicit_history_params(as_of, window_start)
+    params.update(
+        {
+            "product_id": int(product_id),
+            "synth": synthetic_product_id(),
+        }
+    )
     return query(
         f"""
         WITH MonthlySales AS (
@@ -449,8 +510,7 @@ def monthly_product_sales(product_id: int, window_start: str, as_of: str) -> lis
             WHERE oi.IsValidForCurrentSale = 1
                   AND oi.ProductID = :product_id
                   AND oi.ProductID <> :synth
-                  AND o.Created >= :window_start
-                  AND o.Created < :asof
+                  AND {_SALES_HISTORY_WINDOW}
             GROUP BY CONVERT(char(7), o.Created, 126)
         )
         SELECT ym,
@@ -462,12 +522,7 @@ def monthly_product_sales(product_id: int, window_start: str, as_of: str) -> lis
         FROM MonthlySales
         ORDER BY ym
         """,
-        {
-            "product_id": int(product_id),
-            "window_start": window_start,
-            "asof": as_of,
-            "synth": synthetic_product_id(),
-        },
+        params,
     )
 
 
@@ -479,7 +534,8 @@ def regional_product_sales(as_of: str, window_days: int, product_ids: Sequence[i
     ClientAgreement (`Order.ClientAgreementID -> ClientAgreement.ClientID -> Client.RegionID`).
     Do NOT use `RegionCodeID`: it is per-client address/code granularity and does not group demand.
     """
-    params: dict[str, Any] = {"asof": as_of, "win": window_days, "synth": synthetic_product_id()}
+    _, params = _day_history_params(as_of, window_days)
+    params["synth"] = synthetic_product_id()
     flt = _in_filter("oi.ProductID", "p", product_ids, params)
     region_filter = ""
     if region_id is not None:
@@ -501,7 +557,7 @@ def regional_product_sales(as_of: str, window_days: int, product_ids: Sequence[i
         LEFT JOIN dbo.Region r ON r.ID = c.RegionID
         WHERE oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL AND oi.ProductID <> :synth
               AND c.RegionID IS NOT NULL
-              AND o.Created >= DATEADD(day, -:win, :asof) AND o.Created < :asof{flt}{region_filter}
+              AND {_SALES_HISTORY_WINDOW}{flt}{region_filter}
         GROUP BY oi.ProductID, c.RegionID
         """,
         params,
@@ -510,6 +566,8 @@ def regional_product_sales(as_of: str, window_days: int, product_ids: Sequence[i
 
 def regional_demand_summary(as_of: str, window_days: int) -> list[dict]:
     """Portfolio demand summary by Client.RegionID over the sales window."""
+    _, params = _day_history_params(as_of, window_days)
+    params["synth"] = synthetic_product_id()
     return query(
         f"""
         SELECT c.RegionID AS region_id,
@@ -526,21 +584,29 @@ def regional_demand_summary(as_of: str, window_days: int) -> list[dict]:
         LEFT JOIN dbo.Region r ON r.ID = c.RegionID
         WHERE oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL AND oi.ProductID <> :synth
               AND c.RegionID IS NOT NULL
-              AND o.Created >= DATEADD(day, -:win, :asof) AND o.Created < :asof
+              AND {_SALES_HISTORY_WINDOW}
         GROUP BY c.RegionID
         ORDER BY revenue_eur DESC
         """,
-        {"asof": as_of, "win": window_days, "synth": synthetic_product_id()},
+        params,
     )
 
 
-def product_meta(product_ids: Sequence[int]) -> dict[int, dict]:
-    """Product display metadata plus the latest factual supply producer."""
+def product_meta(product_ids: Sequence[int], as_of: str) -> dict[int, dict]:
+    """Product display metadata plus the latest factual producer in ``[floor, as_of)``."""
+    floor = get_settings().source_history_start_date
+    source_window = resolve_history_window(as_of, floor, floor)
     out: dict[int, dict] = {}
     ids = [int(x) for x in product_ids]
     for i in range(0, len(ids), 1000):
         chunk = ids[i:i + 1000]
         ph, params = in_clause("p", chunk)
+        params.update(
+            {
+                "asof": as_of,
+                "source_history_start": source_window.source_history_start.isoformat(),
+            }
+        )
         rows = query(
             f"""
             WITH factual_supply AS (
@@ -555,6 +621,8 @@ def product_meta(product_ids: Sequence[int]) -> dict[int, dict]:
                 JOIN dbo.SupplyOrder so ON so.ID = si.SupplyOrderID
                 WHERE si.Deleted = 0
                       AND so.ClientID IS NOT NULL
+                      AND si.DateFrom >= :source_history_start
+                      AND si.DateFrom < :asof
                       AND sioi.ProductID IN {ph}
 
                 UNION ALL
@@ -570,6 +638,8 @@ def product_meta(product_ids: Sequence[int]) -> dict[int, dict]:
                 WHERE sou.Deleted = 0
                       AND NOT (sou.IsFromCockpit = 1 AND sou.IsPlaced = 0)
                       AND COALESCE(soui.SupplierID, sou.SupplierID) IS NOT NULL
+                      AND sou.FromDate >= :source_history_start
+                      AND sou.FromDate < :asof
                       AND soui.ProductID IN {ph}
             ),
             latest_producer AS (

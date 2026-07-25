@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import date
+
 import pytest
 
 from app.core.config import Settings
@@ -52,3 +54,15 @@ def test_runtime_config_rejects_minimum_history_above_history_window():
 
     with pytest.raises(RuntimeError, match="MIN_HISTORY_MONTHS"):
         settings.validate_runtime_configuration()
+
+
+def test_source_history_start_date_defaults_and_parses_iso_override():
+    default = Settings(_env_file=None, db_password="unused")
+    overridden = Settings(
+        _env_file=None,
+        db_password="unused",
+        source_history_start_date="2025-02-03",
+    )
+
+    assert default.source_history_start_date == date(2025, 1, 1)
+    assert overridden.source_history_start_date == date(2025, 2, 3)

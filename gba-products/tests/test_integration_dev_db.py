@@ -142,9 +142,16 @@ def test_all_stock_quantity_and_currency_rows_reconcile_exactly_to_direct_sql():
 
 
 def _assert_return_total_matches_canonical_sum(product_id: int, window_days: int = 365):
+    from app.core.config import get_settings
+    from app.core.history import day_history_window
     from app.data import signals_repository as sig
     from app.data.db import query
 
+    window = day_history_window(
+        _AS_OF,
+        window_days,
+        get_settings().source_history_start_date,
+    )
     expected = query(
         """
         SELECT SUM(sri.Qty) AS returned_qty
@@ -155,13 +162,15 @@ def _assert_return_total_matches_canonical_sum(product_id: int, window_days: int
         WHERE sri.Deleted = 0
               AND oi.ProductID = :product_id
               AND oi.ProductID <> :synth
-              AND sr.FromDate >= DATEADD(day, -:win, :asof)
+              AND sr.FromDate >= :source_history_start
+              AND sr.FromDate >= :history_start
               AND sr.FromDate < :asof
         """,
         {
             "product_id": product_id,
             "synth": sig.synthetic_product_id(),
-            "win": window_days,
+            "source_history_start": window.source_history_start.isoformat(),
+            "history_start": window.effective_start.isoformat(),
             "asof": _AS_OF,
         },
     )
@@ -173,9 +182,16 @@ def _assert_return_total_matches_canonical_sum(product_id: int, window_days: int
 
 
 def test_partial_return_uses_salereturnitem_qty_not_original_sold_qty():
+    from app.core.config import get_settings
+    from app.core.history import day_history_window
     from app.data import signals_repository as sig
     from app.data.db import query
 
+    window = day_history_window(
+        _AS_OF,
+        365,
+        get_settings().source_history_start_date,
+    )
     rows = query(
         """
         SELECT TOP 1 oi.ProductID AS product_id
@@ -185,13 +201,19 @@ def test_partial_return_uses_salereturnitem_qty_not_original_sold_qty():
              AND sr.Deleted = 0 AND sr.IsCanceled = 0
         WHERE sri.Deleted = 0
               AND oi.ProductID <> :synth
-              AND sr.FromDate >= DATEADD(day, -365, :asof)
+              AND sr.FromDate >= :source_history_start
+              AND sr.FromDate >= :history_start
               AND sr.FromDate < :asof
         GROUP BY oi.ProductID, sri.SaleReturnID, sri.OrderItemID
         HAVING SUM(sri.Qty) > 0 AND SUM(sri.Qty) < MAX(oi.Qty)
         ORDER BY oi.ProductID
         """,
-        {"synth": sig.synthetic_product_id(), "asof": _AS_OF},
+        {
+            "synth": sig.synthetic_product_id(),
+            "source_history_start": window.source_history_start.isoformat(),
+            "history_start": window.effective_start.isoformat(),
+            "asof": _AS_OF,
+        },
     )
     if not rows:
         pytest.skip("no partial active return in the current integration dataset")
@@ -199,9 +221,16 @@ def test_partial_return_uses_salereturnitem_qty_not_original_sold_qty():
 
 
 def test_multiple_return_rows_are_summed_not_replaced_by_sold_qty():
+    from app.core.config import get_settings
+    from app.core.history import day_history_window
     from app.data import signals_repository as sig
     from app.data.db import query
 
+    window = day_history_window(
+        _AS_OF,
+        365,
+        get_settings().source_history_start_date,
+    )
     rows = query(
         """
         SELECT TOP 1 oi.ProductID AS product_id
@@ -211,13 +240,19 @@ def test_multiple_return_rows_are_summed_not_replaced_by_sold_qty():
              AND sr.Deleted = 0 AND sr.IsCanceled = 0
         WHERE sri.Deleted = 0
               AND oi.ProductID <> :synth
-              AND sr.FromDate >= DATEADD(day, -365, :asof)
+              AND sr.FromDate >= :source_history_start
+              AND sr.FromDate >= :history_start
               AND sr.FromDate < :asof
         GROUP BY oi.ProductID, sri.SaleReturnID, sri.OrderItemID
         HAVING COUNT(*) > 1 AND SUM(sri.Qty) <> MAX(sri.Qty)
         ORDER BY oi.ProductID
         """,
-        {"synth": sig.synthetic_product_id(), "asof": _AS_OF},
+        {
+            "synth": sig.synthetic_product_id(),
+            "source_history_start": window.source_history_start.isoformat(),
+            "history_start": window.effective_start.isoformat(),
+            "asof": _AS_OF,
+        },
     )
     if not rows:
         pytest.skip("no multi-row active return in the current integration dataset")
@@ -226,6 +261,7 @@ def test_multiple_return_rows_are_summed_not_replaced_by_sold_qty():
 
 def test_live_sales_currency_half_cent_and_quantity_reconcile_to_direct_sql():
     from app.core import exact_numbers as exact
+    from app.core.config import get_settings
     from app.data import signals_repository as sig
     from app.data.db import query
     from app.services import product_analytics
@@ -246,6 +282,8 @@ def test_live_sales_currency_half_cent_and_quantity_reconcile_to_direct_sql():
             JOIN dbo.[Order] o ON o.ID = oi.OrderID
             WHERE oi.IsValidForCurrentSale = 1
                   AND oi.ProductID <> :synth
+                  AND o.Created >= :source_history_start
+                  AND o.Created < :asof
             GROUP BY oi.ProductID, CONVERT(char(7), o.Created, 126)
         )
         SELECT TOP 1 *
@@ -254,7 +292,11 @@ def test_live_sales_currency_half_cent_and_quantity_reconcile_to_direct_sql():
               <> CAST(exact_revenue_eur AS decimal(38, 2))
         ORDER BY ym DESC, product_id
         """,
-        {"synth": sig.synthetic_product_id()},
+        {
+            "synth": sig.synthetic_product_id(),
+            "source_history_start": get_settings().source_history_start_date.isoformat(),
+            "asof": _AS_OF,
+        },
     )
     assert candidates, "expected a live half-cent binary-float drift fixture"
     expected = candidates[0]
@@ -302,10 +344,63 @@ def test_per_product_signals_for_a_stocked_sku():
     vel = sig.sales_velocity(_AS_OF, 365, [pid])
     price = sig.avg_sale_price_eur(_AS_OF, 365, [pid])
     rets = sig.returns_for_products(_AS_OF, 365, [pid])
-    meta = sig.product_meta([pid])
+    meta = sig.product_meta([pid], _AS_OF)
     assert isinstance(vel, list) and isinstance(price, list) and isinstance(rets, list)
     assert pid in meta and "name" in meta[pid]
     assert "primary_producer_id" in meta[pid] and "primary_producer_name" in meta[pid]
+
+
+def test_latest_factual_producer_reconciles_to_as_of_and_source_floor():
+    from app.core.config import get_settings
+    from app.data import signals_repository as sig
+    from app.data.db import query
+
+    floor = get_settings().source_history_start_date.isoformat()
+    rows = query(
+        """
+        WITH factual_supply AS (
+            SELECT sioi.ProductID AS product_id,
+                   so.ClientID AS producer_id,
+                   si.DateFrom AS source_date,
+                   si.ID AS source_document_id,
+                   sioi.ID AS source_line_id
+            FROM dbo.SupplyInvoice si
+            JOIN dbo.SupplyInvoiceOrderItem sioi
+                 ON sioi.SupplyInvoiceID = si.ID AND sioi.Deleted = 0
+            JOIN dbo.SupplyOrder so ON so.ID = si.SupplyOrderID
+            WHERE si.Deleted = 0
+                  AND so.ClientID IS NOT NULL
+                  AND si.DateFrom >= :source_history_start
+                  AND si.DateFrom < :asof
+
+            UNION ALL
+
+            SELECT soui.ProductID,
+                   COALESCE(soui.SupplierID, sou.SupplierID),
+                   sou.FromDate,
+                   sou.ID,
+                   soui.ID
+            FROM dbo.SupplyOrderUkraine sou
+            JOIN dbo.SupplyOrderUkraineItem soui
+                 ON soui.SupplyOrderUkraineID = sou.ID AND soui.Deleted = 0
+            WHERE sou.Deleted = 0
+                  AND NOT (sou.IsFromCockpit = 1 AND sou.IsPlaced = 0)
+                  AND COALESCE(soui.SupplierID, sou.SupplierID) IS NOT NULL
+                  AND sou.FromDate >= :source_history_start
+                  AND sou.FromDate < :asof
+        )
+        SELECT TOP 1 product_id, producer_id
+        FROM factual_supply
+        ORDER BY source_date DESC, source_document_id DESC, source_line_id DESC
+        """,
+        {"source_history_start": floor, "asof": _AS_OF},
+    )
+    assert rows, "expected a factual supply row inside the source-history interval"
+    expected = rows[0]
+
+    actual = sig.product_meta([int(expected["product_id"])], _AS_OF)
+
+    assert actual[int(expected["product_id"])]["primary_producer_id"] == expected["producer_id"]
 
 
 def test_snapshot_runs_end_to_end():
@@ -322,6 +417,8 @@ def test_snapshot_runs_end_to_end():
     assert snap["total_eur_value"] == exact.money(
         sum((Decimal(str(row["eur_value"])) for row in snap["rows"]), Decimal("0"))
     )
+    assert snap["source_history_start"] == "2025-01-01"
+    assert snap["history_fingerprint"]
 
 
 def test_portfolio_build_is_consistent():
@@ -347,6 +444,8 @@ def test_portfolio_build_is_consistent():
     assert ov["total_revenue_eur"] == exact.money(
         sum((Decimal(str(row["revenue_eur"])) for row in rows), Decimal("0"))
     )
+    assert build["source_history_start"] == "2025-01-01"
+    assert build["history_fingerprint"]
 
 
 def test_mvp_endpoints_via_testclient():
@@ -361,6 +460,7 @@ def test_mvp_endpoints_via_testclient():
     assert client.get("/health").status_code == 200
     ov = client.get("/assortment/overview")
     assert ov.status_code == 200 and ov.json()["count"] > 0
+    assert ov.json()["source_history_start"] == "2025-01-01"
     health = client.get("/assortment/health", params={"limit": 5, "sort": "frozen_eur"})
     assert health.status_code == 200 and len(health.json()["tasks"]) <= 5
     demand = client.get("/assortment/health", params={"limit": 5, "sort": "demand"})
@@ -396,6 +496,7 @@ def test_regional_endpoints_via_testclient():
         params={"region_id": region_id, "sort": "regional_revenue", "limit": 5, "stocked_only": False},
     )
     assert health.status_code == 200
+    assert "regional" in health.json()["history_windows"]
     tasks = health.json()["tasks"]
     assert tasks and all(t["region_id"] == region_id for t in tasks)
     assert all("regional_revenue_eur" in t and "regional_units" in t for t in tasks)

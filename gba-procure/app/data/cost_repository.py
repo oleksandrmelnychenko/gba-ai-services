@@ -10,6 +10,7 @@ from __future__ import annotations
 from decimal import ROUND_HALF_UP, Decimal
 from statistics import median
 
+from app.core.history import history_start_iso
 from app.core.logging import get_logger
 from app.data.db import in_clause, query
 from app.data.synthetic import synthetic_product_id
@@ -41,7 +42,14 @@ def _fetch_cost_rows(
     for start in range(0, len(ids), _IN_CHUNK):
         chunk = ids[start : start + _IN_CHUNK]
         ph, params = in_clause("p", chunk)
-        params.update({"asof": as_of, "days": history_days, "syn": syn})
+        params.update(
+            {
+                "asof": as_of,
+                "days": history_days,
+                "history_start": history_start_iso(),
+                "syn": syn,
+            }
+        )
         international_producer_filter = "AND so.ClientID IS NOT NULL"
         ukraine_producer_filter = "AND COALESCE(soui.SupplierID, sou.SupplierID) IS NOT NULL"
         if producer_id is not None:
@@ -69,6 +77,7 @@ def _fetch_cost_rows(
                   AND sioi.ProductID IN {ph}
                   {international_producer_filter}
                   AND si.DateFrom >= DATEADD(day, -:days, :asof)
+                  AND si.DateFrom >= :history_start
                   AND si.DateFrom < :asof
 
             UNION ALL
@@ -90,6 +99,7 @@ def _fetch_cost_rows(
                   AND soui.ProductID IN {ph}
                   {ukraine_producer_filter}
                   AND sou.FromDate >= DATEADD(day, -:days, :asof)
+                  AND sou.FromDate >= :history_start
                   AND sou.FromDate < :asof
             """,
             params,
@@ -124,7 +134,14 @@ def sale_prices_eur(
     for start in range(0, len(ids), _IN_CHUNK):
         chunk = ids[start : start + _IN_CHUNK]
         ph, params = in_clause("p", chunk)
-        params.update({"asof": as_of, "days": history_days, "syn": syn})
+        params.update(
+            {
+                "asof": as_of,
+                "days": history_days,
+                "history_start": history_start_iso(),
+                "syn": syn,
+            }
+        )
         rows = query(
             f"""
             SELECT oi.ProductID AS pid, oi.PricePerItem AS price
@@ -136,6 +153,7 @@ def sale_prices_eur(
                   AND oi.ProductID IN {ph}
                   AND o.Created < :asof
                   AND o.Created >= DATEADD(day, -:days, :asof)
+                  AND o.Created >= :history_start
             """,
             params,
         )

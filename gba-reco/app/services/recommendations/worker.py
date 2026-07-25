@@ -21,6 +21,7 @@ import time
 from datetime import datetime
 
 from app.core.config import get_settings
+from app.core.history import require_supported_as_of, source_history_start_iso
 from app.core.logging import get_logger
 from app.data import cache
 from app.data.db import query
@@ -32,6 +33,7 @@ _CHURN_WARN_RATIO = 0.30
 
 
 def active_clients(as_of: str, active_days: int) -> list[int]:
+    require_supported_as_of(as_of)
     rows = query(
         """
         SELECT DISTINCT ca.ClientID AS cid
@@ -40,10 +42,15 @@ def active_clients(as_of: str, active_days: int) -> list[int]:
         JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
         WHERE oi.IsValidForCurrentSale = 1
               AND o.Created >= DATEADD(day, -:days, :asof)
+              AND o.Created >= :history_start
               AND o.Created < :asof
         ORDER BY ca.ClientID
         """,
-        {"days": active_days, "asof": as_of},
+        {
+            "days": active_days,
+            "asof": as_of,
+            "history_start": source_history_start_iso(),
+        },
     )
     return [int(r["cid"]) for r in rows]
 

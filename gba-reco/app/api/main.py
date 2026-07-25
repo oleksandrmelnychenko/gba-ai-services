@@ -11,15 +11,21 @@ from typing import Annotated, Literal, Self
 from fastapi import FastAPI, HTTPException, Path, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.core.config import get_settings
+from app.core.history import require_supported_as_of
 from app.core.logging import get_logger
 from app.core.metrics import METRICS
 from app.data import cache
 from app.data import sales_repository as repo
 from app.data.db import dispose, get_engine
-from app.domain.models import ProductRec, RecommendationResult, RecSource
+from app.domain.models import (
+    ProductRec,
+    RecommendationResult,
+    RecSource,
+    RecSourceDetail,
+)
 from app.services.recommendations import copurchase, service
 
 settings = get_settings()
@@ -88,6 +94,13 @@ class RecommendRequest(BaseModel):
         "instead of the client's own purchase history",
     )
 
+    @field_validator("as_of_date")
+    @classmethod
+    def supported_history_date(cls, value: date | None) -> date | None:
+        if value is not None:
+            require_supported_as_of(value)
+        return value
+
     @model_validator(mode="after")
     def unique_product_ids(self) -> Self:
         if self.product_ids and len(self.product_ids) != len(set(self.product_ids)):
@@ -102,6 +115,13 @@ class BatchRequest(BaseModel):
     include_discovery: bool = True
     use_cache: bool = True
     region_scope: bool = False
+
+    @field_validator("as_of_date")
+    @classmethod
+    def supported_history_date(cls, value: date | None) -> date | None:
+        if value is not None:
+            require_supported_as_of(value)
+        return value
 
     @model_validator(mode="after")
     def unique_customer_ids(self) -> Self:
@@ -165,6 +185,7 @@ def health() -> dict:
         "source_history_contract_ready": source_history_contract_ready,
         "version": "0.1.0",
         "model_version": cache._MODEL_VERSION,
+        "source_history_start": settings.source_history_start_date.isoformat(),
     }
 
 
@@ -223,7 +244,8 @@ def recommend_copurchase(req: RecommendRequest) -> RecommendationResult:
             cached["cached"] = True
             cached["recommendations"] = [
                 ProductRec(product_id=r["product_id"], score=r["score"], rank=r["rank"],
-                           segment=r["segment"], source=RecSource(r["source"]))
+                           segment=r["segment"], source=RecSource(r["source"]),
+                           source_detail=RecSourceDetail(r["source_detail"]))
                 for r in cached["recommendations"]
             ]
             result = RecommendationResult(**cached)

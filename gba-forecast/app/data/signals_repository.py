@@ -28,16 +28,17 @@ from decimal import Decimal
 from typing import Any
 
 from app.core.config import get_settings
+from app.core.history import HistoryWindow, resolve_history_window
 from app.data.db import query
 
-# Trailing calendar-month predicate shared by every series query.  For a mid-month
-# ``as_of`` a naive ``DATEADD(month, -:months, :asof)`` spans ``months + 1`` distinct
-# YYYY-MM buckets.  Anchoring on the first day of the current month makes the SQL
-# source contain at most exactly ``:months`` calendar buckets, matching the model.
+# Trailing calendar-month predicate shared by every series query. ``history_start`` is the
+# requested rolling start clamped to the factual source floor. Keeping both predicates is
+# intentional defense-in-depth: no caller can accidentally read pre-source rows even if its
+# effective-window calculation regresses.
 _WINDOW = (
-    "o.Created >= DATEADD("
-    "month, 1 - :months, DATEFROMPARTS(YEAR(:asof), MONTH(:asof), 1)"
-    ") AND o.Created < :asof"
+    "o.Created >= :source_history_start "
+    "AND o.Created >= :history_start "
+    "AND o.Created < :asof"
 )
 _EUR_AMOUNT = (
     "CAST(oi.Qty AS decimal(18, 8)) * CAST(oi.PricePerItem AS decimal(28, 14))"
@@ -70,19 +71,13 @@ THEN 1 ELSE 0 END AS source_schema_present
 _SALES_SOURCE_STATUS_SQL = """
 SELECT
     COUNT_BIG(*) AS canonical_row_count,
-    SUM(CASE WHEN o.Created >= DATEADD(
-        month, 1 - :months, DATEFROMPARTS(YEAR(:asof), MONTH(:asof), 1)
-    ) THEN 1 ELSE 0 END)
+    SUM(CASE WHEN o.Created >= :history_start THEN 1 ELSE 0 END)
         AS history_row_count,
     COUNT(DISTINCT CASE
-        WHEN o.Created >= DATEADD(
-            month, 1 - :months, DATEFROMPARTS(YEAR(:asof), MONTH(:asof), 1)
-        ) THEN oi.ProductID
+        WHEN o.Created >= :history_start THEN oi.ProductID
     END) AS history_product_count,
     COUNT(DISTINCT CASE
-        WHEN o.Created >= DATEADD(
-            month, 1 - :months, DATEFROMPARTS(YEAR(:asof), MONTH(:asof), 1)
-        ) THEN ca.ClientID
+        WHEN o.Created >= :history_start THEN ca.ClientID
     END) AS history_client_count,
     MAX(o.Created) AS latest_sale_at,
     SUM(CASE
@@ -95,8 +90,26 @@ JOIN dbo.[Order] o ON o.ID = oi.OrderID
 LEFT JOIN dbo.ClientAgreement ca ON ca.ID = o.ClientAgreementID
 WHERE oi.IsValidForCurrentSale = 1
       AND oi.ProductID <> :synth
+      AND o.Created >= :source_history_start
       AND o.Created < :asof
 """
+
+
+def _resolved_history_window(as_of: str | datetime, months: int) -> HistoryWindow:
+    return resolve_history_window(
+        as_of,
+        months,
+        get_settings().source_history_start_date,
+    )
+
+
+def _history_query_params(as_of: str | datetime, months: int) -> tuple[HistoryWindow, dict[str, Any]]:
+    window = _resolved_history_window(as_of, months)
+    return window, {
+        "asof": as_of,
+        "source_history_start": window.source_history_start.isoformat(),
+        "history_start": window.effective_start.isoformat(),
+    }
 
 
 def synthetic_product_id() -> int:
@@ -148,6 +161,7 @@ def sales_source_status(as_of: datetime, months: int) -> dict[str, Any]:
     ``as_of`` is the same exclusive upper bound used by the forecast queries, so readiness
     cannot be green for rows that the model itself would not yet consume.
     """
+    _, window_params = _history_query_params(as_of, months)
     schema_rows = query(_SALES_SOURCE_SCHEMA_SQL)
     schema_present = bool(schema_rows and schema_rows[0].get("source_schema_present"))
     if not schema_present:
@@ -164,8 +178,7 @@ def sales_source_status(as_of: datetime, months: int) -> dict[str, Any]:
     rows = query(
         _SALES_SOURCE_STATUS_SQL,
         {
-            "asof": as_of,
-            "months": months,
+            **window_params,
             "synth": synthetic_product_id(),
         },
     )
@@ -193,14 +206,20 @@ def forecast_source_fingerprint(
     Count/sums/checksum plus update timestamps make cache reuse conditional on the underlying
     factual quantities, prices, identity links, validity, and sale dates remaining unchanged.
     """
+    window, params = _history_query_params(as_of, months)
+    boundary_parts = (
+        window.as_of.isoformat(),
+        months,
+        window.source_history_start.isoformat(),
+        window.effective_start.isoformat(),
+        window.history_complete,
+    )
     if client_id is None and product_id is None:
-        return "no-scope"
+        return hashlib.sha256(
+            "|".join(map(str, ("no-scope", *boundary_parts))).encode()
+        ).hexdigest()[:24]
 
-    params: dict[str, Any] = {
-        "asof": as_of,
-        "months": months,
-        "synth": synthetic_product_id(),
-    }
+    params["synth"] = synthetic_product_id()
     if client_id is not None and product_id is not None:
         scope = "(ca.ClientID = :cid OR oi.ProductID = :pid)"
         params.update({"cid": client_id, "pid": product_id})
@@ -245,8 +264,7 @@ def forecast_source_fingerprint(
     epoch_parts = (
         client_id,
         product_id,
-        as_of,
-        months,
+        *boundary_parts,
         params["synth"],
         row.get("row_count") or 0,
         row.get("max_item_id") or 0,
@@ -280,6 +298,8 @@ def product_id_for_netuid(net_uid: str) -> int | None:
 
 def monthly_sales_by_client(client_id: int, as_of: str, months: int) -> list[dict]:
     """Per-month EUR sale amount for one client (across all its agreements), trailing window."""
+    _, params = _history_query_params(as_of, months)
+    params.update({"cid": client_id, "synth": synthetic_product_id()})
     return query(
         f"""
         SELECT CONVERT(char(7), o.Created, 120) AS ym,
@@ -293,12 +313,14 @@ def monthly_sales_by_client(client_id: int, as_of: str, months: int) -> list[dic
         GROUP BY CONVERT(char(7), o.Created, 120)
         ORDER BY ym
         """,
-        {"cid": client_id, "asof": as_of, "months": months, "synth": synthetic_product_id()},
+        params,
     )
 
 
 def monthly_sales_by_product(product_id: int, as_of: str, months: int) -> list[dict]:
     """Per-month EUR sale amount for one product across all clients, trailing window."""
+    _, params = _history_query_params(as_of, months)
+    params["pid"] = product_id
     return query(
         f"""
         SELECT CONVERT(char(7), o.Created, 120) AS ym,
@@ -310,7 +332,7 @@ def monthly_sales_by_product(product_id: int, as_of: str, months: int) -> list[d
         GROUP BY CONVERT(char(7), o.Created, 120)
         ORDER BY ym
         """,
-        {"pid": product_id, "asof": as_of, "months": months},
+        params,
     )
 
 
@@ -318,6 +340,14 @@ def monthly_sales_by_client_and_product(
     client_id: int, product_id: int, as_of: str, months: int
 ) -> list[dict]:
     """Per-month EUR sale amount for one client buying one product, trailing window."""
+    _, params = _history_query_params(as_of, months)
+    params.update(
+        {
+            "cid": client_id,
+            "pid": product_id,
+            "synth": synthetic_product_id(),
+        }
+    )
     return query(
         f"""
         SELECT CONVERT(char(7), o.Created, 120) AS ym,
@@ -332,13 +362,7 @@ def monthly_sales_by_client_and_product(
         GROUP BY CONVERT(char(7), o.Created, 120)
         ORDER BY ym
         """,
-        {
-            "cid": client_id,
-            "pid": product_id,
-            "asof": as_of,
-            "months": months,
-            "synth": synthetic_product_id(),
-        },
+        params,
     )
 
 
@@ -410,6 +434,8 @@ def sample_client_monthly_series(as_of: str, months: int, limit: int) -> list[di
     (IsValidForCurrentSale = 1) rules as the live per-client query; the synthetic product is
     excluded.
     """
+    _, params = _history_query_params(as_of, months)
+    params.update({"lim": limit, "synth": synthetic_product_id()})
     return query(
         f"""
         WITH ranked AS (
@@ -440,7 +466,7 @@ def sample_client_monthly_series(as_of: str, months: int, limit: int) -> list[di
         GROUP BY ca.ClientID, CONVERT(char(7), o.Created, 120)
         ORDER BY ca.ClientID, ym
         """,
-        {"asof": as_of, "months": months, "lim": limit, "synth": synthetic_product_id()},
+        params,
     )
 
 
@@ -450,6 +476,8 @@ def sample_product_monthly_series(as_of: str, months: int, limit: int) -> list[d
     Mirrors sample_client_monthly_series for products. The synthetic product is excluded so it
     never enters the evaluation sample.
     """
+    _, params = _history_query_params(as_of, months)
+    params.update({"lim": limit, "synth": synthetic_product_id()})
     return query(
         f"""
         WITH ranked AS (
@@ -478,7 +506,7 @@ def sample_product_monthly_series(as_of: str, months: int, limit: int) -> list[d
         GROUP BY oi.ProductID, CONVERT(char(7), o.Created, 120)
         ORDER BY oi.ProductID, ym
         """,
-        {"asof": as_of, "months": months, "lim": limit, "synth": synthetic_product_id()},
+        params,
     )
 
 

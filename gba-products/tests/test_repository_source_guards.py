@@ -109,7 +109,10 @@ def test_stock_readiness_detects_populated_global_but_empty_sellable_scope():
 
 
 def test_windows_are_parameterized():
-    assert ":asof" in _SRC and ":win" in _SRC
+    assert ":asof" in _SRC
+    assert ":source_history_start" in _SRC
+    assert ":history_start" in _SRC
+    assert "DATEADD(day, -:win, :asof)" not in _SRC
 
 
 def _returns_fn() -> str:
@@ -204,8 +207,10 @@ def test_product_monthly_analytics_uses_canonical_sales_spine_and_actual_eur_rev
     body = _SRC[start:end]
 
     assert "oi.IsValidForCurrentSale = 1" in body
-    assert "o.Created >= :window_start" in body
-    assert "o.Created < :asof" in body
+    assert "_SALES_HISTORY_WINDOW" in body
+    assert "o.Created >= :source_history_start" in _SRC
+    assert "o.Created >= :history_start" in _SRC
+    assert "o.Created < :asof" in _SRC
     assert "oi.ProductID = :product_id" in body
     assert "oi.ProductID <> :synth" in body
     assert "COUNT(DISTINCT o.ID) AS order_count" in body
@@ -227,7 +232,7 @@ def test_regional_demand_uses_client_region_id_not_region_code():
     sql = "".join(body.split('"""')[2:])
     assert "RegionCodeID" not in sql
     assert "oi.IsValidForCurrentSale = 1" in body
-    assert "o.Created" in body
+    assert "_SALES_HISTORY_WINDOW" in body
     assert "oi.ProductID <> :synth" in body
 
 
@@ -240,4 +245,8 @@ def test_latest_producer_uses_factual_invoice_and_ukraine_item_spines():
     assert "COALESCE(soui.SupplierID, sou.SupplierID)" in body
     assert "sou.FromDate AS source_date" in body
     assert "sou.IsFromCockpit = 1 AND sou.IsPlaced = 0" in body
+    assert "si.DateFrom >= :source_history_start" in body
+    assert "si.DateFrom < :asof" in body
+    assert "sou.FromDate >= :source_history_start" in body
+    assert "sou.FromDate < :asof" in body
     assert "JOIN dbo.SupplyOrderItem soi" not in body

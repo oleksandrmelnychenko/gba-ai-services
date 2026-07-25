@@ -12,14 +12,20 @@ from typing import Literal
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.core.config import get_settings
+from app.core.history import require_supported_as_of, rolling_coverage
 from app.core.logging import get_logger
 from app.core.metrics import METRICS
 from app.data import cache, feedback, masters
 from app.data.db import dispose, get_engine
-from app.domain.models import CartReplenishmentPlan, PlanCharts, ProducerPurchasePlan
+from app.domain.models import (
+    MODEL_VERSION,
+    CartReplenishmentPlan,
+    PlanCharts,
+    ProducerPurchasePlan,
+)
 from app.services.replenishment import policy, worker
 
 log = get_logger("api")
@@ -159,6 +165,13 @@ class PlanRequest(BaseModel):
     as_of_date: date | None = None
     only_needed: bool = True
 
+    @field_validator("as_of_date")
+    @classmethod
+    def validate_as_of_date(cls, value: date | None) -> date | None:
+        if value is not None:
+            require_supported_as_of(value)
+        return value
+
 
 class CartPlanRequest(BaseModel):
     as_of_date: date | None = None
@@ -168,15 +181,30 @@ class CartPlanRequest(BaseModel):
     method: Literal["greedy", "milp"] = "greedy"
     active_days: int | None = Field(default=None, strict=True, ge=1, le=730)
 
+    @field_validator("as_of_date")
+    @classmethod
+    def validate_as_of_date(cls, value: date | None) -> date | None:
+        if value is not None:
+            require_supported_as_of(value)
+        return value
+
 
 class PlanChartsRequest(BaseModel):
     producer_id: int | None = Field(default=None, strict=True, gt=0)
     as_of_date: date | None = None
     top_n: int = Field(default=15, strict=True, ge=1, le=100)
 
+    @field_validator("as_of_date")
+    @classmethod
+    def validate_as_of_date(cls, value: date | None) -> date | None:
+        if value is not None:
+            require_supported_as_of(value)
+        return value
+
 
 @app.get("/health")
 def health() -> dict:
+    coverage = rolling_coverage(_today(), settings.history_days)
     db_ok = True
     try:
         with get_engine().connect() as c:
@@ -218,10 +246,11 @@ def health() -> dict:
         "business_reason": business_reason or None,
         "canonical_cart_items": canonical_cart_items,
         "source_readiness": source_readiness,
-        "source_history_start": source_history_start,
+        **coverage.as_metadata(),
+        "history_not_applicable": ["inventory", "reservations"],
         "source_history_contract_ready": source_history_contract_ready,
         "version": "0.1.0",
-        "model_version": "procure-hist120-v1",
+        "model_version": MODEL_VERSION,
     }
 
 

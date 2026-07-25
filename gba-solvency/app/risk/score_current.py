@@ -21,12 +21,45 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from app.risk.lineage import (
+    CURRENT_ARTIFACT_ROLE,
+    CURRENT_SEV180_MIN_EUR,
+    CURRENT_SEV180_PD_FLOOR,
+    LineageError,
+    validate_production_artifact,
+)
+
 _ART = Path(__file__).resolve().parent / "artifacts" / "scorecard_coefficients.json"
 
 
 @lru_cache(maxsize=1)
 def _card() -> dict[str, Any]:
-    return json.loads(_ART.read_text())
+    card = json.loads(_ART.read_text())
+    try:
+        validate_production_artifact(card, artifact_role=CURRENT_ARTIFACT_ROLE)
+    except LineageError as exc:
+        raise RuntimeError(f"current scorecard lineage rejected: {exc}") from exc
+    return card
+
+
+def current_model_readiness() -> dict[str, Any]:
+    """Cheap load-time readiness, including the exact accepted training run."""
+    try:
+        card = _card()
+    except (OSError, json.JSONDecodeError, RuntimeError) as exc:
+        return {"ready": False, "reason": str(exc), "training_run_id": None}
+    lineage = card["training_lineage"]
+    return {
+        "ready": True,
+        "reason": None,
+        "training_run_id": lineage["training_run_id"],
+        "trained_at": lineage["trained_at"],
+        "source_history_start": lineage["source_history_start"],
+        "dataset_sha256": lineage["dataset"]["parquet_sha256"],
+        "rows": lineage["dataset"]["rows"],
+        "positives": lineage["dataset"]["positives"],
+        "oof_auc": lineage["validation"]["oof_auc"],
+    }
 
 
 def _woe_value(v: float | None, splits: list[float], woe: list[float]) -> float:
@@ -82,6 +115,11 @@ def score_current(features: dict[str, float]) -> dict[str, Any]:
     b = card["calibration"]["b"]
     z = a * lin + b
     pd = 1.0 / (1.0 + math.exp(-z))
+    policy_overrides: list[str] = []
+    severe_current = float(features.get("overdue_eur_180plus", 0.0) or 0.0)
+    if severe_current >= CURRENT_SEV180_MIN_EUR:
+        pd = max(pd, CURRENT_SEV180_PD_FLOOR)
+        policy_overrides.append("current_sev180_pd_floor")
 
     sm = card["score_mapping"]
     pd_c = min(max(pd, 1e-6), 1 - 1e-6)
@@ -101,5 +139,6 @@ def score_current(features: dict[str, float]) -> dict[str, Any]:
         "linear_predictor": round(lin, 4),
         "contributions": contribs,
         "model": card["model"],
-        "model_version": "sev180-current-v1",
+        "model_version": card["training_lineage"]["training_run_id"],
+        "policy_overrides": policy_overrides,
     }

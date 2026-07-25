@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import UTC, datetime
 
+from app.core import history
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.domain.models import TaskType, Urgency
@@ -152,6 +153,8 @@ def _window_tag(as_of: str) -> str:
 def generate_for_manager(manager_id: int, as_of: str | None = None) -> dict:
     s = get_settings()
     as_of = as_of or datetime.now(UTC).strftime("%Y-%m-%d")
+    coverage = history.rolling_days(as_of, 365)
+    as_of = coverage.as_of.isoformat()
     window = _window_tag(as_of)
 
     # collect candidates from all generators
@@ -177,6 +180,13 @@ def generate_for_manager(manager_id: int, as_of: str | None = None) -> dict:
         _apply_feedback_penalty(candidates, lifecycle.feedback_rejections(manager_id, s.feedback_window_days))
     except Exception as exc:  # noqa: BLE001
         log.warning("feedback_penalty_skipped", manager_id=manager_id, error=str(exc))
+
+    signal_history = {
+        "as_of": as_of,
+        **coverage.metadata(),
+    }
+    for task in candidates:
+        task.signals = {**task.signals, **signal_history}
 
     # highest expected EUR first so caps keep the BEST tasks; priority remains the legacy fallback
     # and tie-breaker for candidates without an EV score.
@@ -267,6 +277,7 @@ def generate_for_manager(manager_id: int, as_of: str | None = None) -> dict:
     counters["skipped_capped"] = len(capped_task_keys)
     stats = {"manager_id": manager_id, "as_of": as_of, "candidates": len(candidates),
              "generators_total": len(_GENERATORS), "generators_failed": generators_failed,
-             "by_type": {tt.value: n for tt, n in per_type.items()}, **counters}
+             "by_type": {tt.value: n for tt, n in per_type.items()},
+             **coverage.metadata(), **counters}
     log.info("generation_done", **stats)
     return stats

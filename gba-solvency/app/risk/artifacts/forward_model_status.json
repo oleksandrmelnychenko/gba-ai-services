@@ -1,0 +1,90 @@
+{
+  "lineage_schema_version": 1,
+  "artifact_role": "forward_6m_scorecard",
+  "status": "unavailable",
+  "reason": "insufficient_unique_positive_clients",
+  "source_history_start": "2025-01-01",
+  "minimum_unique_positive_clients": 30,
+  "observed_unique_positive_clients": 3,
+  "observed_positive_rows": 19,
+  "observed_atrisk_rows": 1159,
+  "dataset_sha256": "238ada59132861e8c9421760eb47e2aa304e6ea18f0b420416f4169148f4a749",
+  "dataset_lineage": {
+    "lineage_schema_version": 1,
+    "dataset_role": "forward_6m_training",
+    "builder": "scripts/build_vintages.py",
+    "built_at": "2026-07-25T13:06:42+00:00",
+    "source_history_start": "2025-01-01",
+    "transactional_history_policy": "clamped_to_source_history_start",
+    "current_state_exceptions": [
+      "open_debt_balances_as_of_feature_date",
+      "current_credit_terms_as_of_feature_date"
+    ],
+    "window_months": 12,
+    "date_coverage": [
+      {
+        "feature_date": "2025-09-10",
+        "label_date": "2026-03-10",
+        "requested_start": "2024-09-10",
+        "effective_start": "2025-01-01",
+        "history_complete": false
+      },
+      {
+        "feature_date": "2025-09-24",
+        "label_date": "2026-03-24",
+        "requested_start": "2024-09-24",
+        "effective_start": "2025-01-01",
+        "history_complete": false
+      },
+      {
+        "feature_date": "2025-10-08",
+        "label_date": "2026-04-08",
+        "requested_start": "2024-10-08",
+        "effective_start": "2025-01-01",
+        "history_complete": false
+      },
+      {
+        "feature_date": "2025-10-22",
+        "label_date": "2026-04-22",
+        "requested_start": "2024-10-22",
+        "effective_start": "2025-01-01",
+        "history_complete": false
+      },
+      {
+        "feature_date": "2025-11-05",
+        "label_date": "2026-05-05",
+        "requested_start": "2024-11-05",
+        "effective_start": "2025-01-01",
+        "history_complete": false
+      },
+      {
+        "feature_date": "2025-11-19",
+        "label_date": "2026-05-19",
+        "requested_start": "2024-11-19",
+        "effective_start": "2025-01-01",
+        "history_complete": false
+      },
+      {
+        "feature_date": "2025-12-03",
+        "label_date": "2026-06-03",
+        "requested_start": "2024-12-03",
+        "effective_start": "2025-01-01",
+        "history_complete": false
+      },
+      {
+        "feature_date": "2025-12-17",
+        "label_date": "2026-06-17",
+        "requested_start": "2024-12-17",
+        "effective_start": "2025-01-01",
+        "history_complete": false
+      }
+    ],
+    "rows": 33267,
+    "positives": 19,
+    "unique_clients": 4159,
+    "unique_positive_clients": 3,
+    "target_column": "forward_default",
+    "parquet_sha256": "238ada59132861e8c9421760eb47e2aa304e6ea18f0b420416f4169148f4a749"
+  },
+  "evaluated_at": "2026-07-25T13:19:35+00:00"
+}

@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 
 from app.core.config import get_settings
+from app.core.history import coverage
 from app.data import solvency_repository as repo
 from app.domain.models import (
     AgingBar,
@@ -140,12 +141,20 @@ def _score_sparkline(client_id: int, as_of: str, window_months: int) -> list[Sco
     dedicated thread pool instead of run sequentially — this is the dominant cost of the chart
     build. `pool.map` preserves input order, so the emitted list is identical to the serial order.
     """
-    workers = max(1, min(_MAX_DB_WORKERS, window_months))
+    base = datetime.strptime(as_of, "%Y-%m-%d").date()
+    start = _month_floor(_add_months(base, -(window_months - 1)))
+    floor_month = _month_floor(coverage(as_of, window_months).source_history_start)
+    first_index = max(
+        0,
+        (floor_month.year - start.year) * 12 + floor_month.month - start.month,
+    )
+    indices = range(first_index, window_months)
+    workers = max(1, min(_MAX_DB_WORKERS, len(indices)))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         return list(
             pool.map(
                 lambda i: _sparkline_point(client_id, as_of, window_months, i),
-                range(window_months),
+                indices,
             )
         )
 
@@ -165,6 +174,7 @@ def build_charts(client_id: int, as_of_date: str | None, window_months: int) -> 
 def _build_charts_locked(client_id: int, as_of_date: str | None, window_months: int) -> SolvencyCharts:
     settings = get_settings()
     as_of = as_of_date or settings.resolve_fx_date(None)
+    history = coverage(as_of, window_months)
     fx_date = settings.resolve_fx_date(as_of_date)
 
     # The direct chart queries and the score-sparkline are independent and each open their own
@@ -225,6 +235,9 @@ def _build_charts_locked(client_id: int, as_of_date: str | None, window_months: 
         score_sparkline=sparkline,
         turnover_trend=_turnover_trend(monthly),
         aging_over_time_heatmap="pending",
+        source_history_start=history.source_history_start.isoformat(),
+        effective_start=history.effective_start.isoformat(),
+        history_complete=history.history_complete,
         as_of_date=as_of,
         window_months=window_months,
     )

@@ -5,6 +5,8 @@ plan still builds. Collections live in the shared gba-nba Mongo instance, procur
 """
 from __future__ import annotations
 
+from datetime import date
+
 from pymongo import ASCENDING, MongoClient
 from pymongo.collection import Collection
 
@@ -115,7 +117,11 @@ def upsert_product_terms(producer_id: int, product_id: int, terms: dict) -> dict
     return doc
 
 
-def seed_derived_terms(min_orders: int = 3, overwrite: bool = False) -> dict:
+def seed_derived_terms(
+    min_orders: int = 3,
+    overwrite: bool = False,
+    as_of: str | None = None,
+) -> dict:
     """Seed product_terms from real supply history (MOQ=min observed qty, multiple=PackingStandard).
     Skips buyer-curated rows (source != 'derived') unless overwrite."""
     from app.data import supply_repository as repo
@@ -123,7 +129,7 @@ def seed_derived_terms(min_orders: int = 3, overwrite: bool = False) -> dict:
     coll = _product_terms()
     if coll is None:
         raise RuntimeError("masters_store_unavailable")
-    terms = repo.derive_moq_terms(min_orders)
+    terms = repo.derive_moq_terms(as_of or date.today().isoformat(), min_orders)
     seeded = skipped = 0
     for t in terms:
         existing = coll.find_one(

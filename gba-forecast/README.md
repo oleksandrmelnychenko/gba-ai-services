@@ -29,6 +29,7 @@ ALLOW_OPEN_INTERNAL_API=false
 FORECAST_HORIZON_MONTHS=6
 MAX_FORECAST_HORIZON_MONTHS=24
 HISTORY_MONTHS=24
+SOURCE_HISTORY_START_DATE=2025-01-01
 SOURCE_MAX_AGE_HOURS=168
 FORECAST_METHOD=auto
 MIN_HISTORY_MONTHS=3
@@ -45,6 +46,11 @@ window, and its newest sale is within `SOURCE_MAX_AGE_HOURS`.
 series use the window mean, intermittent/lumpy series use SBA, and no-demand series stay on the
 safe moving average. `MIN_HISTORY_MONTHS=3` suppresses forecasts for keys with fewer than three
 non-zero history months.
+
+`SOURCE_HISTORY_START_DATE` is the factual lower boundary shared by SQL reads, dense model
+series, backtests, source fingerprints, and cache keys. A requested `HISTORY_MONTHS` window is
+clamped to that date; forecast/readiness metadata reports whether the full rolling window is
+available.
 
 ## Deploy
 
@@ -76,6 +82,9 @@ Expected forecast response shape:
   "meta": {
     "status": "ready",
     "as_of": "2026-07-25",
+    "source_history_start": "2025-01-01",
+    "effective_start": "2025-01-01",
+    "history_complete": false,
     "horizon_months": 6,
     "currency": "EUR",
     "requested": {"client_net_id": "<uuid>", "product_net_id": null},

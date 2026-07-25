@@ -10,7 +10,7 @@ from pydantic import ValidationError
 
 from app.api.main import CartPlanRequest, ProducerProfileUpdate, app
 from app.core.config import get_settings
-from app.domain.models import CartReplenishmentPlan
+from app.domain.models import MODEL_VERSION, CartReplenishmentPlan
 
 _HEADERS = {"X-Internal-Api-Key": get_settings().internal_api_key}
 client = TestClient(app)
@@ -29,6 +29,13 @@ def _source(*, ready: bool = True, reason: str | None = None) -> dict:
 
 def _canonical_zero_payload(source_fingerprint: str = "source-fp") -> dict:
     return {
+        "as_of_date": "2026-06-15",
+        "source_history_start": "2025-01-01",
+        "effective_start": "2026-02-15",
+        "effective_history_days": 120,
+        "history_complete": True,
+        "history_not_applicable": ["inventory", "reservations"],
+        "model_version": MODEL_VERSION,
         "item_count": 0,
         "total_item_count": 0,
         "is_truncated": False,
@@ -250,6 +257,9 @@ def test_health_is_healthy_with_matching_evaluated_zero_cart(monkeypatch):
     assert result["business_reason"] is None
     assert result["canonical_cart_items"] == 0
     assert result["source_history_start"] == "2025-01-01"
+    assert result["effective_start"] == "2026-02-15"
+    assert result["effective_history_days"] == 120
+    assert result["history_complete"] is True
     assert result["source_history_contract_ready"] is True
     assert (
         result["source_readiness"]["source_history_start"]

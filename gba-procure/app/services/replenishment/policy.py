@@ -18,6 +18,7 @@ from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal
 
 from app.core.config import get_settings
+from app.core.history import rolling_coverage
 from app.data import cache, feedback, masters
 from app.data import cost_repository as cost_repo
 from app.data import supply_repository as repo
@@ -255,6 +256,7 @@ def build_plan(producer_id: int, as_of: str, only_needed: bool = True,
                abc_map: dict[int, str] | None = None,
                producer_name=_UNSET) -> ProducerPurchasePlan:
     s = get_settings()
+    coverage = rolling_coverage(as_of, s.history_days)
     lt_mean, lt_std, lt_source = lead_time_svc.producer_lead_time(producer_id, as_of)
     product_ids = repo.products_for_producer(producer_id, as_of, s.history_days)
 
@@ -295,9 +297,20 @@ def build_plan(producer_id: int, as_of: str, only_needed: bool = True,
         )
         dr = demand_rows.get(pid, [])
         abc = abc_map.get(pid, "C")
-        xyz, _cv, _adi = segmentation.xyz_from_daily(dr, as_of, s.history_days)
+        xyz, _cv, _adi = segmentation.xyz_from_daily(
+            dr,
+            as_of,
+            coverage.effective_history_days,
+        )
         method = demand_svc.method_for_xyz(xyz) if s.per_quadrant_forecast else None
-        forecast = demand_svc.forecast_from_rows(pid, dr, s.forecast_horizon_days, method=method)
+        forecast = demand_svc.forecast_from_rows(
+            pid,
+            dr,
+            s.forecast_horizon_days,
+            method=method,
+            effective_history_days=coverage.effective_history_days,
+            effective_start=coverage.effective_start,
+        )
         season_factor = 1.0
         if s.seasonality_enabled:
             season_factor = demand_svc.seasonal_index_for(
@@ -387,6 +400,7 @@ def build_plan(producer_id: int, as_of: str, only_needed: bool = True,
         items=items,
         item_count=len(items),
         as_of_date=as_of,
+        **coverage.as_metadata(),
     )
 
 
@@ -414,6 +428,7 @@ def build_cart_plan(as_of: str, only_needed: bool = True, limit: int | None = No
                     active_days: int | None = None,
                     source_fingerprint: str | None = None) -> CartReplenishmentPlan:
     s = get_settings()
+    coverage = rolling_coverage(as_of, s.history_days)
     producer_ids = repo.all_producers(as_of, active_days or s.history_days)
     abc_map = classify_svc.get_abc_map(as_of, s.history_days)
     names = repo.producer_names(producer_ids)
@@ -478,6 +493,7 @@ def build_cart_plan(as_of: str, only_needed: bool = True, limit: int | None = No
             value_captured_eur=_round_decimal(value, _CENT),
             selected_count=len(chosen), deferred_count=len(items) - len(chosen),
             method_used=method_used,
+            **coverage.as_metadata(),
         )
 
     items.sort(
@@ -499,6 +515,7 @@ def build_cart_plan(as_of: str, only_needed: bool = True, limit: int | None = No
         duplicate_supplier_options_removed=duplicate_supplier_options_removed,
         **totals,
         as_of_date=as_of,
+        **coverage.as_metadata(),
     )
 
 
@@ -604,6 +621,7 @@ def build_charts(
     reuse build_cart_plan (needed-only across all producers). demand_series covers the top few.
     """
     s = get_settings()
+    coverage = rolling_coverage(as_of, s.history_days)
     top_n = max(0, int(top_n))
 
     if producer_id is not None:
@@ -678,4 +696,5 @@ def build_charts(
         days_of_cover_hist=days_of_cover_hist,
         top_items=top_items,
         demand_series=demand_series,
+        **coverage.as_metadata(),
     )

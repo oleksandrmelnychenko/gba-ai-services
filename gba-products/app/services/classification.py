@@ -9,20 +9,32 @@ import statistics
 from datetime import date, datetime
 
 from app.core.config import Settings
+from app.core.history import month_history_window
 from app.domain.models import AbcClass, LifecycleStage, XyzClass
 
 
-def month_labels(as_of: str, months: int) -> list[str]:
-    """The `months` trailing 'YYYY-MM' labels ending in as_of's month (oldest first)."""
+def month_labels(
+    as_of: str,
+    months: int,
+    source_history_start: date | None = None,
+) -> list[str]:
+    """Trailing labels, clamped so dense zero-fill never predates factual history."""
     d = datetime.strptime(as_of, "%Y-%m-%d").date()
+    if source_history_start is None:
+        start = month_history_window(as_of, months, date.min).requested_start
+    else:
+        start = month_history_window(as_of, months, source_history_start).effective_start
     out: list[str] = []
-    y, m = d.year, d.month
-    for _ in range(months):
+    y, m = start.year, start.month
+    current_index = y * 12 + m - 1
+    end_index = d.year * 12 + d.month - 1
+    while current_index <= end_index:
         out.append(f"{y:04d}-{m:02d}")
-        m -= 1
-        if m == 0:
-            y, m = y - 1, 12
-    return list(reversed(out))
+        m += 1
+        if m == 13:
+            y, m = y + 1, 1
+        current_index += 1
+    return out
 
 
 def series_from(units_by_ym: dict[str, float], labels: list[str]) -> list[float]:

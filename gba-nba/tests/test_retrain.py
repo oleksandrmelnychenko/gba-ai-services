@@ -34,16 +34,26 @@ retrain = _load_retrain()
 # ----------------------------------------------------------------------- rolling snapshots
 def test_rolling_snapshots_only_fully_labelled_vintages():
     today = dt.date(2026, 6, 26)
-    snaps = retrain.rolling_snapshots(today, n=9, h_days=60)
-    assert len(snaps) == 9
+    snaps = retrain.rolling_snapshots(today, n=4, h_days=60)
+    assert len(snaps) == 4
     assert snaps == sorted(snaps)  # ascending, oldest first
     # latest usable vintage = most recent month-start >= 60d before today.
     # 2026-06-26 - 60d = 2026-04-27 -> month start 2026-04-01.
     assert snaps[-1] == "2026-04-01"
-    assert snaps[0] == "2025-08-01"
+    assert snaps[0] == "2026-01-01"
     # every vintage is at least h_days in the past (label window complete)
     for s in snaps:
         assert dt.date.fromisoformat(s) <= today - dt.timedelta(days=60)
+
+
+def test_rolling_snapshots_rejects_partial_source_history():
+    with pytest.raises(ValueError, match="partial history"):
+        retrain.rolling_snapshots(dt.date(2026, 6, 26), n=5, h_days=60)
+
+
+def test_rolling_snapshots_requires_positive_count():
+    with pytest.raises(ValueError, match="positive"):
+        retrain.rolling_snapshots(dt.date(2026, 6, 26), n=0, h_days=60)
 
 
 def test_rolling_snapshots_rolls_forward_with_today():
@@ -140,17 +150,24 @@ def test_live_labels_empty_when_no_outcomes(patched_mongo):
 
 def test_live_labels_shapes_terminal_outcomes(patched_mongo):
     from app.ml import dataset as ds
+    history_meta = {
+        "as_of": "2026-07-25",
+        "source_history_start": "2025-01-01",
+        "effective_start": "2025-07-25",
+        "history_complete": True,
+    }
     patched_mongo["tasks"].insert_many([
         # a SOLD debt_followup terminal task -> label 1, sig_ columns mapped
         {"task_key": "k1", "status": "done", "task_type": "debt_followup", "client_id": 10,
          "priority": 80.0, "outcome": {"sold": True, "amount": 500.0},
          "signals": {"overdue_amount": 1200.0, "days_past_terms": 30, "max_overdue_days": 40,
-                     "debt_lines": 2, "monetary": 9000.0, "recency_days": 5, "order_count": 12}},
+                     "debt_lines": 2, "monetary": 9000.0, "recency_days": 5, "order_count": 12,
+                     **history_meta}},
         # a NOT-SOLD cross_sell -> label 0
         {"task_key": "k2", "status": "done", "task_type": "cross_sell", "client_id": 11,
          "priority": 30.0, "outcome": {"sold": False},
          "signals": {"top_score": 0.42, "candidates": 4, "monetary": 4000.0,
-                     "recency_days": 8, "order_count": 6}},
+                     "recency_days": 8, "order_count": 6, **history_meta}},
         # dismissed with no outcome -> excluded (no label)
         {"task_key": "k3", "status": "dismissed", "task_type": "reorder_due", "client_id": 12,
          "signals": {"elapsed_days": 20}},
@@ -185,7 +202,9 @@ def test_live_labels_unionable_with_backfill_schema(patched_mongo):
         {"task_key": "k1", "status": "done", "task_type": "churn_winback", "client_id": 20,
          "priority": 50.0, "outcome": {"sold": True},
          "signals": {"drop_ratio": 0.2, "silence_days": 95, "recent_orders": 1, "prior_orders": 8,
-                     "monetary": 7000.0, "recency_days": 95, "order_count": 8}})
+                     "monetary": 7000.0, "recency_days": 95, "order_count": 8,
+                     "as_of": "2026-07-25", "source_history_start": "2025-01-01",
+                     "effective_start": "2025-07-25", "history_complete": True}})
     live = ds.live_labels()
     # the exact column set a backfill row carries (base() schema + label/old_priority/vintage),
     # so a live frame is row-for-row unionable via pd.concat.
@@ -236,6 +255,17 @@ def test_main_swaps_on_pass_restores_on_fail(tmp_path, monkeypatch):
             }))
             (art / "MODEL_CARD.md").write_text(
                 f"rows 100 clients 10 base 20.0% CV 0.700 OOT {new_auc:.3f} old 0.500")
+            (art / "model_meta.json").write_text(json.dumps({
+                "source_history_start": "2025-01-01",
+                "training_window_days": 365,
+                "training_vintages": [
+                    "2026-01-01",
+                    "2026-02-01",
+                    "2026-03-01",
+                    "2026-04-01",
+                    "2026-05-01",
+                ],
+            }))
         return _train
 
     import sys

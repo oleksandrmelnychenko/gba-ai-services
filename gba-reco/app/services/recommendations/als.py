@@ -16,8 +16,18 @@ from datetime import datetime
 
 import numpy as np
 
+from app.core.history import (
+    full_history_coverage,
+    require_supported_as_of,
+    source_history_start_iso,
+)
 from app.data.db import query
-from app.domain.models import ProductRec, RecommendationResult, RecSource
+from app.domain.models import (
+    ProductRec,
+    RecommendationResult,
+    RecSource,
+    RecSourceDetail,
+)
 
 # small, fast defaults; tune on real data later
 _FACTORS = 32
@@ -25,8 +35,9 @@ _ITERATIONS = 12
 _ALPHA = 40.0
 _REG = 0.1
 
-# cache trained models per as_of (avoid retraining for every eval case)
-_MODEL_CACHE: dict[str, ALSModel] = {}
+# Cache trained models per history-floor + as_of namespace (avoid retraining for every eval case
+# without ever reusing a model trained against an older source boundary).
+_MODEL_CACHE: dict[tuple[str, str], ALSModel] = {}
 
 
 class ALSModel:
@@ -50,16 +61,19 @@ class ALSModel:
 
 
 def _load_interactions(as_of: str):
+    require_supported_as_of(as_of)
     rows = query(
         """
         SELECT ca.ClientID AS cid, oi.ProductID AS pid, COUNT(DISTINCT o.ID) AS cnt
         FROM dbo.ClientAgreement ca
         JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
         JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-        WHERE oi.IsValidForCurrentSale = 1 AND o.Created < :asof AND oi.ProductID IS NOT NULL
+        WHERE oi.IsValidForCurrentSale = 1
+              AND o.Created < :asof AND o.Created >= :history_start
+              AND oi.ProductID IS NOT NULL
         GROUP BY ca.ClientID, oi.ProductID
         """,
-        {"asof": as_of},
+        {"asof": as_of, "history_start": source_history_start_iso()},
     )
     return rows
 
@@ -111,13 +125,16 @@ def _train(as_of: str) -> ALSModel:
 
 
 def get_model(as_of: str) -> ALSModel:
-    if as_of not in _MODEL_CACHE:
-        _MODEL_CACHE[as_of] = _train(as_of)
-    return _MODEL_CACHE[as_of]
+    require_supported_as_of(as_of)
+    key = (source_history_start_iso(), as_of)
+    if key not in _MODEL_CACHE:
+        _MODEL_CACHE[key] = _train(as_of)
+    return _MODEL_CACHE[key]
 
 
 def recommend(customer_id: int, as_of_date: str, top_n: int = 25) -> RecommendationResult:
     started = datetime.now()
+    history = full_history_coverage(as_of_date)
     model = get_model(as_of_date)
     scored = model.recommend(customer_id, top_n)
     owned = model.owned.get(customer_id, set())
@@ -125,6 +142,11 @@ def recommend(customer_id: int, as_of_date: str, top_n: int = 25) -> Recommendat
         ProductRec(
             product_id=pid, score=round(score, 4), rank=i + 1, segment="ALS",
             source=RecSource.REPURCHASE if pid in owned else RecSource.DISCOVERY,
+            source_detail=(
+                RecSourceDetail.REPURCHASE_HISTORY
+                if pid in owned
+                else RecSourceDetail.SIMILAR_CLIENTS
+            ),
         )
         for i, (pid, score) in enumerate(scored)
     ]
@@ -133,5 +155,9 @@ def recommend(customer_id: int, as_of_date: str, top_n: int = 25) -> Recommendat
     return RecommendationResult(
         customer_id=customer_id, recommendations=recs, count=len(recs),
         discovery_count=discovery, segment="ALS",
-        latency_ms=round(latency, 2), as_of_date=as_of_date, model_version="als-v1",
+        latency_ms=round(latency, 2), as_of_date=as_of_date,
+        source_history_start=history.source_history_start.isoformat(),
+        effective_start=history.effective_start.isoformat(),
+        history_complete=history.history_complete,
+        model_version="als-v2-history-floor-20250101",
     )

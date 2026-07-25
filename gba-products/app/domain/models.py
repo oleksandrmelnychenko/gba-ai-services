@@ -41,8 +41,13 @@ class ProductAnalyticsWindow(BaseModel):
     """Exact sales window used by the per-product analytics endpoint."""
 
     months: int = Field(ge=1, le=24)
+    source_history_start: date
+    requested_start: date
+    effective_start: date
     start: date
     end_exclusive: date
+    history_complete: bool
+    effective_days: int = Field(ge=0)
     includes_partial_current_month: Literal[True] = True
 
 
@@ -78,6 +83,11 @@ class ProductAnalyticsDataQuality(BaseModel):
         "revenue_eur / units (quantity-weighted)"
     )
     zero_months_filled: Literal[True] = True
+    source_history_start: date
+    requested_start: date
+    effective_start: date
+    history_complete: bool
+    zero_fill_begins_at: Literal["effective_start"] = "effective_start"
     stock_is_current: Literal[True] = True
     stock_history_available: Literal[False] = False
     stock_note: str = (
@@ -90,6 +100,11 @@ class ProductAnalyticsResponse(BaseModel):
     product_id: int
     as_of: date
     model_version: str
+    source_history_start: date
+    requested_start: date
+    effective_start: date
+    history_complete: bool
+    history_fingerprint: str
     window: ProductAnalyticsWindow
     snapshot: dict[str, Any]
     sales_series: list[MonthlySalesPoint]

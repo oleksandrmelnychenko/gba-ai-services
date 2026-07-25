@@ -17,9 +17,12 @@ from enum import IntEnum
 from statistics import median
 from typing import Any
 
+from app.core.config import get_settings
+from app.core.history import history_start_iso, rolling_coverage
 from app.data import supply_repository as repo
 from app.data.db import in_clause, query
 from app.data.synthetic import synthetic_product_id
+from app.domain.models import MODEL_VERSION
 
 _CENT = Decimal("0.01")
 _FOUR_DECIMALS = Decimal("0.0001")
@@ -184,6 +187,7 @@ def _rows_digest(rows: list[dict[str, Any]]) -> str:
 
 def collect_source_epoch(as_of: str, history_days: int) -> str:
     """Hash mutation-sensitive, compact watermarks before and after reconciliation."""
+    coverage = rolling_coverage(as_of, history_days)
     syn = synthetic_product_id()
     supply = query(
         """
@@ -234,9 +238,15 @@ def collect_source_epoch(as_of: str, history_days: int) -> str:
                )) AS row_checksum
         FROM SupplyRows
         WHERE source_date >= DATEADD(day, -:cost_days, :asof)
+              AND source_date >= :history_start
               AND source_date < :asof
         """,
-        {"asof": as_of, "cost_days": _COST_HISTORY_DAYS, "syn": syn},
+        {
+            "asof": as_of,
+            "cost_days": _COST_HISTORY_DAYS,
+            "history_start": history_start_iso(),
+            "syn": syn,
+        },
     )
     demand = query(
         """
@@ -254,9 +264,15 @@ def collect_source_epoch(as_of: str, history_days: int) -> str:
         WHERE oi.IsValidForCurrentSale = 1
               AND oi.ProductID <> :syn
               AND o.Created >= DATEADD(day, -:days, :asof)
+              AND o.Created >= :history_start
               AND o.Created < :asof
         """,
-        {"asof": as_of, "days": history_days, "syn": syn},
+        {
+            "asof": as_of,
+            "days": history_days,
+            "history_start": history_start_iso(),
+            "syn": syn,
+        },
     )
     inventory = query(
         """
@@ -319,9 +335,11 @@ def collect_source_epoch(as_of: str, history_days: int) -> str:
         FROM dbo.ProductIncomeItem pii
         JOIN dbo.ProductIncome pinc
           ON pinc.ID = pii.ProductIncomeID AND pinc.Deleted = 0
-        WHERE pii.Deleted = 0 AND pinc.FromDate < :asof
+        WHERE pii.Deleted = 0
+              AND pinc.FromDate >= :history_start
+              AND pinc.FromDate < :asof
         """,
-        {"asof": as_of},
+        {"asof": as_of, "history_start": history_start_iso()},
     )
     return _rows_digest(
         [
@@ -329,6 +347,7 @@ def collect_source_epoch(as_of: str, history_days: int) -> str:
             {"kind": "demand", **(demand[0] if demand else {})},
             {"kind": "inventory", **(inventory[0] if inventory else {})},
             {"kind": "receipts", **(receipts[0] if receipts else {})},
+            {"kind": "history_contract", **coverage.as_metadata()},
         ]
     )
 
@@ -432,6 +451,7 @@ def _collect_on_order(product_ids: list[int], as_of: str) -> dict[int, Decimal]:
                 WHERE plpoi.Deleted = 0
                       AND sioi.ProductID <> :syn
                       AND sioi.ProductID IN {placeholders}
+                      AND si.DateFrom >= :history_start
                       AND si.DateFrom < :asof
                 GROUP BY sioi.ProductID
 
@@ -446,6 +466,7 @@ def _collect_on_order(product_ids: list[int], as_of: str) -> dict[int, Decimal]:
                       AND NOT (sou.IsFromCockpit = 1 AND sou.IsPlaced = 0)
                       AND soui.ProductID <> :syn
                       AND soui.ProductID IN {placeholders}
+                      AND sou.FromDate >= :history_start
                       AND sou.FromDate < :asof
                 GROUP BY soui.ProductID
             ),
@@ -462,6 +483,7 @@ def _collect_on_order(product_ids: list[int], as_of: str) -> dict[int, Decimal]:
                 WHERE pii.Deleted = 0
                       AND sioi.ProductID <> :syn
                       AND sioi.ProductID IN {placeholders}
+                      AND pinc.FromDate >= :history_start
                       AND pinc.FromDate < :asof
                 GROUP BY sioi.ProductID
 
@@ -480,6 +502,7 @@ def _collect_on_order(product_ids: list[int], as_of: str) -> dict[int, Decimal]:
                       AND NOT (sou.IsFromCockpit = 1 AND sou.IsPlaced = 0)
                       AND soui.ProductID <> :syn
                       AND soui.ProductID IN {placeholders}
+                      AND pinc.FromDate >= :history_start
                       AND pinc.FromDate < :asof
                 GROUP BY soui.ProductID
             ),
@@ -500,7 +523,12 @@ def _collect_on_order(product_ids: list[int], as_of: str) -> dict[int, Decimal]:
               ON received.product_id = ordered.product_id
             WHERE ordered.qty - ISNULL(received.qty, 0) > 0.000001
             """,
-            {"asof": as_of, "syn": syn, **params},
+            {
+                "asof": as_of,
+                "history_start": history_start_iso(),
+                "syn": syn,
+                **params,
+            },
         )
         for row in rows:
             on_order[int(row["product_id"])] = _decimal(row["qty"])
@@ -535,6 +563,7 @@ def _collect_cost_rows(
                   AND sioi.ProductID <> :syn
                   AND sioi.ProductID IN {placeholders}
                   AND si.DateFrom >= DATEADD(day, -:days, :asof)
+                  AND si.DateFrom >= :history_start
                   AND si.DateFrom < :asof
 
             UNION ALL
@@ -556,11 +585,13 @@ def _collect_cost_rows(
                   AND soui.ProductID <> :syn
                   AND soui.ProductID IN {placeholders}
                   AND sou.FromDate >= DATEADD(day, -:days, :asof)
+                  AND sou.FromDate >= :history_start
                   AND sou.FromDate < :asof
             """,
             {
                 "asof": as_of,
                 "days": _COST_HISTORY_DAYS,
+                "history_start": history_start_iso(),
                 "syn": syn,
                 **params,
             },
@@ -736,6 +767,38 @@ def validate_canonical_plan(
             "plan date must equal the audited date",
             expected=as_of,
             actual=payload.get("as_of_date"),
+        )
+    expected_history = rolling_coverage(as_of, get_settings().history_days).as_metadata()
+    actual_history = {
+        key: payload.get(key)
+        for key in expected_history
+    }
+    if actual_history != expected_history:
+        _issue(
+            issues,
+            "C011",
+            "contract",
+            "plan history coverage metadata must match the source floor",
+            expected=expected_history,
+            actual=actual_history,
+        )
+    if payload.get("history_not_applicable") != ["inventory", "reservations"]:
+        _issue(
+            issues,
+            "C012",
+            "contract",
+            "current inventory and reservations must be explicit history N/A inputs",
+            expected=["inventory", "reservations"],
+            actual=payload.get("history_not_applicable"),
+        )
+    if payload.get("model_version") != MODEL_VERSION:
+        _issue(
+            issues,
+            "C013",
+            "contract",
+            "plan model version must identify the active source-history floor",
+            expected=MODEL_VERSION,
+            actual=payload.get("model_version"),
         )
 
     product_occurrences: defaultdict[int, int] = defaultdict(int)
@@ -1034,6 +1097,7 @@ def run_reconciliation(
     facts_loader: Callable[[Mapping[str, Any], str], SourceFacts] | None = None,
 ) -> ReconciliationReport:
     """Run a complete read-only audit around a caller-supplied plan builder."""
+    rolling_coverage(as_of, history_days)
     readiness_loader = readiness_loader or repo.procurement_source_readiness
     epoch_loader = epoch_loader or collect_source_epoch
     facts_loader = facts_loader or collect_source_facts

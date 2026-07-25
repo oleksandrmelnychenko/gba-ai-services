@@ -22,6 +22,8 @@ Usage:
                                                   [max_skus] [band=AB|A]
 Defaults: as_of=2026-01-01 pre_months=9 post_months=5 max_skus=400 band=AB
 Reads the dev DB via the service read-only creds (.env). Read-only; no live service touched.
+Every pre/post query is hard-clamped to SOURCE_HISTORY_START_DATE; a pre-floor as_of exits with
+code 2, and the JSON report carries the same source/effective/completeness lineage as serving.
 """
 from __future__ import annotations
 
@@ -31,11 +33,28 @@ from datetime import date
 
 import numpy as np
 
+from app.core.config import get_settings
+from app.core.history import history_metadata, trailing_month_history_window
 from app.data.db import query
 from app.services.pricing import elasticity as el
 
 
+def _history_query_params(as_of: str, months: int) -> dict[str, str | int]:
+    settings = get_settings()
+    window = trailing_month_history_window(
+        as_of,
+        months,
+        settings.source_history_start_date,
+    )
+    return {
+        "asof": window.as_of.isoformat(),
+        "neg": -months,
+        "source_history_start": window.source_history_start.isoformat(),
+    }
+
+
 def _estimable_products(as_of: str, pre_months: int, min_lines: int, max_skus: int) -> list[int]:
+    history_params = _history_query_params(as_of, pre_months)
     rows = query(
         """
         SELECT TOP (:max_skus) oi.ProductID AS pid, COUNT(*) AS n_lines
@@ -48,16 +67,22 @@ def _estimable_products(as_of: str, pre_months: int, min_lines: int, max_skus: i
               AND oi.Qty > 0
               AND s.Created < :asof
               AND s.Created >= DATEADD(month, :neg, :asof)
+              AND s.Created >= :source_history_start
         GROUP BY oi.ProductID
         HAVING COUNT(*) >= :min_lines
         ORDER BY COUNT(*) DESC
         """,
-        {"asof": as_of, "neg": -pre_months, "min_lines": min_lines, "max_skus": max_skus},
+        {
+            **history_params,
+            "min_lines": min_lines,
+            "max_skus": max_skus,
+        },
     )
     return [int(r["pid"]) for r in rows]
 
 
 def _pre_panel(pid: int, as_of: str, pre_months: int) -> list[el.PanelCell]:
+    history_params = _history_query_params(as_of, pre_months)
     rows = query(
         """
         SELECT o.ClientAgreementID AS agreement_id,
@@ -70,9 +95,10 @@ def _pre_panel(pid: int, as_of: str, pre_months: int) -> list[el.PanelCell]:
         WHERE oi.ProductID = :pid AND oi.IsValidForCurrentSale = 1
               AND oi.ProductID <> 25422404 AND oi.PricePerItem > 0 AND oi.Qty > 0
               AND s.Created < :asof AND s.Created >= DATEADD(month, :neg, :asof)
+              AND s.Created >= :source_history_start
         GROUP BY o.ClientAgreementID, FORMAT(s.Created, 'yyyy-MM')
         """,
-        {"pid": pid, "asof": as_of, "neg": -pre_months},
+        {"pid": pid, **history_params},
     )
     return [
         el.PanelCell(int(r["agreement_id"]), str(r["month"]), float(r["qty"]), float(r["price"]))
@@ -82,6 +108,7 @@ def _pre_panel(pid: int, as_of: str, pre_months: int) -> list[el.PanelCell]:
 
 def _period_aggregate(pid: int, lo: str, hi: str) -> tuple[float, float] | None:
     """Volume-weighted price and total Qty for a product over [lo, hi). None if no valid sales."""
+    source_history_start = get_settings().source_history_start_date.isoformat()
     rows = query(
         """
         SELECT SUM(oi.Qty) AS q,
@@ -92,8 +119,14 @@ def _period_aggregate(pid: int, lo: str, hi: str) -> tuple[float, float] | None:
         WHERE oi.ProductID = :pid AND oi.IsValidForCurrentSale = 1
               AND oi.ProductID <> 25422404 AND oi.PricePerItem > 0 AND oi.Qty > 0
               AND s.Created >= :lo AND s.Created < :hi
+              AND s.Created >= :source_history_start
         """,
-        {"pid": pid, "lo": lo, "hi": hi},
+        {
+            "pid": pid,
+            "lo": lo,
+            "hi": hi,
+            "source_history_start": source_history_start,
+        },
     )
     if not rows or rows[0]["q"] is None or rows[0]["p"] is None:
         return None
@@ -115,6 +148,16 @@ def main() -> int:
     min_lines = 500 if band == "A" else 100
 
     as_of_d = date.fromisoformat(as_of)
+    settings = get_settings()
+    try:
+        pre_window = trailing_month_history_window(
+            as_of_d,
+            pre_months,
+            settings.source_history_start_date,
+        )
+    except ValueError as exc:
+        print(json.dumps({"error": str(exc), "as_of": as_of}))
+        return 2
     post_hi = _add_months(as_of_d, post_months).isoformat()
     rel_flat = 0.01  # price moves under 1% carry no directional signal -> excluded
 
@@ -174,6 +217,11 @@ def main() -> int:
         return float(np.percentile(xs, q)) if xs else None
 
     report = {
+        **history_metadata(
+            pre_window,
+            model_version=settings.model_version,
+            trailing_window_months=pre_months,
+        ),
         "as_of": as_of, "band": band, "min_lines": min_lines,
         "pre_months": pre_months, "post_months": post_months,
         "skus_attempted": n_attempt,

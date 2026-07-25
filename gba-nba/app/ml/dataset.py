@@ -31,11 +31,13 @@ import datetime as dt
 import pandas as pd
 
 from app.clients import reco_client
+from app.core import history
 from app.core.config import get_settings
 from app.data import signals_repository as sig
 from app.data.db import in_clause, query
 
 H_DAYS = 60
+TRAINING_WINDOW_DAYS = 365
 DEBT_PAYDOWN_FRACTION = 0.5  # >=50% of overdue@T paid in (T,T+H] = debt_followup success.
 
 
@@ -44,7 +46,7 @@ def _t_plus_h(asof: str, h: int = H_DAYS) -> str:
     return d.isoformat()
 
 
-def _excluded_pids() -> set[int]:
+def _excluded_pids(asof: str) -> set[int]:
     """The synthetic accounting ids (HARD guard — debt-entry «Ввід боргів», resolved live via
     sig.synthetic_product_ids so re-mints can't stale the pin) UNION the data-driven ubiquity set
     (generator-calibrated pct). The synthetic ids are excluded unconditionally so the guard holds
@@ -52,7 +54,9 @@ def _excluded_pids() -> set[int]:
     exclusion semantics to app.data.signals_repository._excluded so the live feature row matches
     the training distribution."""
     s = get_settings()
-    return set(sig.synthetic_product_ids()) | set(sig.ubiquitous_product_ids(s.ubiquity_exclude_pct))
+    return set(sig.synthetic_product_ids()) | set(
+        sig.ubiquitous_product_ids(s.ubiquity_exclude_pct, asof)
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -63,11 +67,16 @@ def client_features(client_ids: list[int], asof: str, window_days: int = 365) ->
     and trailing-365d distinct order_count. Synthetic + hard-excluded SKUs removed from turnover."""
     if not client_ids:
         return {}
+    window = history.rolling_days(asof, window_days)
     out: dict[int, dict] = {cid: {"monetary": 0.0, "recency_days": None, "order_count": 0}
                             for cid in client_ids}
     ph, params = in_clause("c", client_ids)
-    excl = _excluded_pids()
-    eph, eparams = in_clause("x", sorted(excl))
+    excl = _excluded_pids(window.as_of.isoformat())
+    not_in = ""
+    if excl:
+        eph, eparams = in_clause("x", sorted(excl))
+        not_in = f" AND oi.ProductID NOT IN {eph}"
+        params = {**params, **eparams}
     rows = query(
         f"""
         SELECT ca.ClientID AS client_id,
@@ -77,12 +86,16 @@ def client_features(client_ids: list[int], asof: str, window_days: int = 365) ->
         FROM dbo.ClientAgreement ca
         JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
         JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-        WHERE oi.IsValidForCurrentSale = 1 AND o.Created >= DATEADD(day, -:win, :asof) AND o.Created < :asof
+        WHERE oi.IsValidForCurrentSale = 1 AND o.Created >= :start AND o.Created < :asof
               AND oi.ProductID IS NOT NULL AND ca.ClientID IN {ph}
-              AND oi.ProductID NOT IN {eph}
+              {not_in}
         GROUP BY ca.ClientID
         """,
-        {"asof": asof, "win": window_days, **params, **eparams},
+        {
+            "asof": window.as_of.isoformat(),
+            "start": window.effective_start.isoformat(),
+            **params,
+        },
     )
     for r in rows:
         cid = int(r["client_id"])
@@ -99,6 +112,7 @@ def client_features(client_ids: list[int], asof: str, window_days: int = 365) ->
 # --------------------------------------------------------------------------------------
 def reorder_candidates(asof: str) -> list[dict]:
     s = get_settings()
+    window = history.factual_window(asof)
     rows = query(
         """
         WITH per_product AS (
@@ -109,7 +123,9 @@ def reorder_candidates(asof: str) -> list[dict]:
             JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
             JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
             JOIN dbo.Client c ON c.ID = ca.ClientID
-            WHERE oi.IsValidForCurrentSale = 1 AND o.Created < :asof AND oi.ProductID IS NOT NULL
+            WHERE oi.IsValidForCurrentSale = 1
+                  AND o.Created >= :source_start AND o.Created < :asof
+                  AND oi.ProductID IS NOT NULL
                   AND c.Deleted = 0
             GROUP BY ca.ClientID, oi.ProductID
             HAVING COUNT(DISTINCT o.ID) >= 3
@@ -128,9 +144,14 @@ def reorder_candidates(asof: str) -> list[dict]:
         FROM cyc
         WHERE elapsed_days >= cycle_days AND elapsed_days <= cycle_days * :maxmult
         """,
-        {"asof": asof, "mincyc": s.reorder_min_cycle_days, "maxmult": s.reorder_max_overdue_mult},
+        {
+            "asof": window.as_of.isoformat(),
+            "source_start": window.effective_start.isoformat(),
+            "mincyc": s.reorder_min_cycle_days,
+            "maxmult": s.reorder_max_overdue_mult,
+        },
     )
-    excl = _excluded_pids()
+    excl = _excluded_pids(window.as_of.isoformat())
     out = []
     for r in rows:
         pid = int(r["product_id"])
@@ -150,6 +171,7 @@ def reorder_candidates(asof: str) -> list[dict]:
 
 def debt_candidates(asof: str) -> list[dict]:
     s = get_settings()
+    window = history.rolling_days(asof, s.debt_max_age_days)
     rows = query(
         """
         SELECT c.ID AS client_id,
@@ -163,12 +185,18 @@ def debt_candidates(asof: str) -> list[dict]:
         JOIN dbo.Client c ON c.ID = cid.ClientID AND c.Deleted = 0
         LEFT JOIN dbo.Agreement a ON a.ID = cid.AgreementID
         WHERE cid.Deleted = 0 AND d.Total > 0
+              AND d.Created >= :start AND d.Created < :asof
               AND DATEDIFF(day, d.Created, :asof) > ISNULL(a.NumberDaysDebt, 0)
               AND DATEDIFF(day, d.Created, :asof) <= :maxage
         GROUP BY c.ID
         HAVING SUM(dbo.GetExchangedToEuroValue(d.Total, ISNULL(a.CurrencyID, 2), d.Created)) >= :minamt
         """,
-        {"asof": asof, "maxage": s.debt_max_age_days, "minamt": s.debt_min_amount},
+        {
+            "asof": window.as_of.isoformat(),
+            "start": window.effective_start.isoformat(),
+            "maxage": s.debt_max_age_days,
+            "minamt": s.debt_min_amount,
+        },
     )
     return [{
         "client_id": int(r["client_id"]),
@@ -180,6 +208,12 @@ def debt_candidates(asof: str) -> list[dict]:
 
 
 def churn_candidates(asof: str, recent_days: int = 90, baseline_days: int = 365) -> list[dict]:
+    baseline = history.rolling_days(asof, baseline_days)
+    recent_window = history.rolling_days(asof, recent_days)
+    recent_span_days = (recent_window.as_of - recent_window.effective_start).days
+    prior_span_days = (recent_window.effective_start - baseline.effective_start).days
+    if recent_span_days <= 0 or prior_span_days <= 0:
+        return []
     rows = query(
         """
         WITH client_orders AS (
@@ -188,13 +222,13 @@ def churn_candidates(asof: str, recent_days: int = 90, baseline_days: int = 365)
             JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
             JOIN dbo.OrderItem oi ON oi.OrderID = o.ID AND oi.IsValidForCurrentSale = 1
             JOIN dbo.Client c ON c.ID = ca.ClientID
-            WHERE o.Created < :asof AND c.Deleted = 0
+            WHERE o.Created >= :start AND o.Created < :asof AND c.Deleted = 0
         ),
         agg AS (
             SELECT client_id,
-                   SUM(CASE WHEN dt >= DATEADD(day, -:recent, :asof) THEN 1 ELSE 0 END) AS recent_orders,
-                   SUM(CASE WHEN dt >= DATEADD(day, -:base, :asof)
-                            AND dt < DATEADD(day, -:recent, :asof) THEN 1 ELSE 0 END) AS prior_orders,
+                   SUM(CASE WHEN dt >= :recent_start THEN 1 ELSE 0 END) AS recent_orders,
+                   SUM(CASE WHEN dt >= :start
+                            AND dt < :recent_start THEN 1 ELSE 0 END) AS prior_orders,
                    MAX(dt) AS last_order
             FROM client_orders GROUP BY client_id
         )
@@ -202,9 +236,16 @@ def churn_candidates(asof: str, recent_days: int = 90, baseline_days: int = 365)
                DATEDIFF(day, last_order, :asof) AS silence_days
         FROM agg
         WHERE prior_orders >= 2
-              AND (recent_orders * 1.0 / :recent) < 0.5 * (prior_orders * 1.0 / (:base - :recent))
+              AND (recent_orders * 1.0 / :recent_span)
+                  < 0.5 * (prior_orders * 1.0 / :prior_span)
         """,
-        {"asof": asof, "recent": recent_days, "base": baseline_days},
+        {
+            "asof": baseline.as_of.isoformat(),
+            "start": baseline.effective_start.isoformat(),
+            "recent_start": recent_window.effective_start.isoformat(),
+            "recent_span": recent_span_days,
+            "prior_span": prior_span_days,
+        },
     )
     out = []
     for r in rows:
@@ -223,13 +264,14 @@ def churn_candidates(asof: str, recent_days: int = 90, baseline_days: int = 365)
 def active_clients(asof: str) -> list[int]:
     """cross_sell pool: clients with >= min_orders distinct orders in last recent_days (manager-free)."""
     s = get_settings()
+    window = history.rolling_days(asof, s.cross_sell_recent_days)
     rows = query(
         """
         WITH act AS (
             SELECT ca.ClientID AS cid
             FROM dbo.ClientAgreement ca
             JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
-                 AND o.Created >= DATEADD(day, -:recent, :asof) AND o.Created < :asof
+                 AND o.Created >= :start AND o.Created < :asof
             JOIN dbo.OrderItem oi ON oi.OrderID = o.ID AND oi.IsValidForCurrentSale = 1
             JOIN dbo.Client c ON c.ID = ca.ClientID AND c.Deleted = 0
             GROUP BY ca.ClientID
@@ -237,7 +279,11 @@ def active_clients(asof: str) -> list[int]:
         )
         SELECT cid FROM act
         """,
-        {"asof": asof, "recent": s.cross_sell_recent_days, "minord": s.cross_sell_min_orders},
+        {
+            "asof": window.as_of.isoformat(),
+            "start": window.effective_start.isoformat(),
+            "minord": s.cross_sell_min_orders,
+        },
     )
     return [int(r["cid"]) for r in rows]
 
@@ -253,18 +299,35 @@ def _reco_raw_cached(cid: int, asof: str, reco_timeout: int) -> list[dict]:
     import json
     import os
 
-    os.makedirs(_RECO_CACHE_DIR, exist_ok=True)
-    path = os.path.join(_RECO_CACHE_DIR, f"{asof}_{cid}.json")
+    canonical_asof = history.require_as_of(asof).isoformat()
+    source_start = history.source_history_start().isoformat()
+    cache_dir = os.path.join(_RECO_CACHE_DIR, f"source_{source_start}")
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, f"{canonical_asof}_{cid}.json")
     if os.path.exists(path):
         with open(path) as fh:
-            return json.load(fh)
+            cached = json.load(fh)
+        if (
+            isinstance(cached, dict)
+            and cached.get("source_history_start") == source_start
+            and cached.get("as_of") == canonical_asof
+            and isinstance(cached.get("recommendations"), list)
+        ):
+            return cached["recommendations"]
     from app.services.generators.cross_sell import _RECO_REQUEST_N
-    recs = reco_client.recommend(cid, top_n=_RECO_REQUEST_N, as_of_date=asof,
+    recs = reco_client.recommend(cid, top_n=_RECO_REQUEST_N, as_of_date=canonical_asof,
                                  path="/recommend/copurchase", timeout=reco_timeout)
     if recs:  # only cache non-empty (empty may be a transient timeout — allow retry)
         tmp = path + ".tmp"
         with open(tmp, "w") as fh:
-            json.dump(recs, fh)
+            json.dump(
+                {
+                    "source_history_start": source_start,
+                    "as_of": canonical_asof,
+                    "recommendations": recs,
+                },
+                fh,
+            )
         os.replace(tmp, path)
     return recs
 
@@ -285,7 +348,7 @@ def cross_sell_candidates(asof: str, max_workers: int = 32, reco_timeout: int = 
     if not reco_client.is_healthy():
         return []
     cids = active_clients(asof)
-    excl = _excluded_pids()
+    excl = _excluded_pids(asof)
 
     def _one(cid: int) -> dict | None:
         recs = _reco_raw_cached(cid, asof, reco_timeout)
@@ -430,6 +493,7 @@ def _old_priority(task_type: str, row: dict, monetary: float) -> float:
 # --------------------------------------------------------------------------------------
 def build_snapshot(asof: str) -> pd.DataFrame:
     """Enumerate all 4 types at vintage T, compute features + leak-safe labels, return rows."""
+    coverage = history.training_window(asof, TRAINING_WINDOW_DAYS)
     recs: list[dict] = []
 
     # --- gather candidates per type ---
@@ -460,7 +524,11 @@ def build_snapshot(asof: str) -> pd.DataFrame:
 
     def base(cid: int, ttype: str) -> dict:
         return {
-            "vintage": asof, "task_type": ttype, "client_id": cid,
+            "vintage": coverage.as_of.isoformat(),
+            "source_history_start": coverage.source_history_start.isoformat(),
+            "effective_start": coverage.effective_start.isoformat(),
+            "history_complete": coverage.history_complete,
+            "task_type": ttype, "client_id": cid,
             "monetary": f(cid, "monetary"),
             "recency_days": f(cid, "recency_days", 9999),
             "order_count": int(f(cid, "order_count", 0)),
@@ -519,8 +587,16 @@ def build_snapshot(asof: str) -> pd.DataFrame:
 
 
 def build_dataset(snapshots: list[str]) -> pd.DataFrame:
+    canonical = [
+        history.training_window(snapshot, TRAINING_WINDOW_DAYS).as_of.isoformat()
+        for snapshot in snapshots
+    ]
+    if len(set(canonical)) != len(canonical):
+        raise ValueError("training snapshots must be unique")
+    if canonical != sorted(canonical):
+        raise ValueError("training snapshots must be sorted ascending")
     frames = []
-    for t in snapshots:
+    for t in canonical:
         df = build_snapshot(t)
         frames.append(df)
         by_type = df.groupby("task_type")["label"].agg(["size", "mean"]) if len(df) else None
@@ -585,12 +661,29 @@ def _live_row_from_task(doc: dict) -> dict | None:
     if not outcome or outcome.get("sold") is None:
         return None  # no recorded outcome -> not a label
     sig = doc.get("signals") or {}
+    source_start = history.source_history_start().isoformat()
+    signal_as_of = sig.get("as_of")
+    try:
+        coverage = history.training_window(signal_as_of, TRAINING_WINDOW_DAYS)
+    except (TypeError, ValueError):
+        return None
+    if (
+        sig.get("source_history_start") != source_start
+        or sig.get("history_complete") is not True
+        or sig.get("effective_start") != coverage.effective_start.isoformat()
+    ):
+        return None
     cid = doc.get("client_id")
     if cid is None:
         return None
 
     row: dict = {
-        "vintage": "live", "task_type": tt, "client_id": int(cid),
+        "vintage": coverage.as_of.isoformat(),
+        "source_history_start": source_start,
+        "effective_start": str(sig["effective_start"]),
+        "history_complete": True,
+        "task_type": tt,
+        "client_id": int(cid),
         "monetary": float(sig.get("monetary") or 0.0),
         "recency_days": float(sig.get("recency_days") if sig.get("recency_days") is not None else 9999),
         "order_count": int(sig.get("order_count") or 0),

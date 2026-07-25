@@ -26,6 +26,26 @@ def test_recommend_request_accepts_iso_date_and_omission():
     assert RecommendRequest(customer_id=1, as_of_date="2026-06-15").as_of_date == date(2026, 6, 15)
 
 
+def test_recommend_request_accepts_exact_source_history_boundary():
+    from datetime import date
+
+    assert RecommendRequest(customer_id=1, as_of_date="2025-01-01").as_of_date == date(
+        2025, 1, 1
+    )
+
+
+@pytest.mark.parametrize(
+    "request_factory",
+    [
+        lambda: RecommendRequest(customer_id=1, as_of_date="2024-12-31"),
+        lambda: BatchRequest(customer_ids=[1], as_of_date="2024-12-31"),
+    ],
+)
+def test_requests_reject_dates_before_source_history(request_factory):
+    with pytest.raises(ValidationError, match="source history start 2025-01-01"):
+        request_factory()
+
+
 def test_recommend_request_rejects_malformed_date():
     with pytest.raises(ValidationError):
         RecommendRequest(customer_id=1, as_of_date="not-a-date")
@@ -63,3 +83,18 @@ def test_recommend_endpoint_returns_422_for_malformed_date():
         headers=_auth_headers(),
     )
     assert resp.status_code == 422
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/recommend", {"customer_id": 123, "as_of_date": "2024-12-31"}),
+        ("/recommend/copurchase", {"customer_id": 123, "as_of_date": "2024-12-31"}),
+        ("/recommend/batch", {"customer_ids": [123], "as_of_date": "2024-12-31"}),
+    ],
+)
+def test_endpoints_return_422_before_source_history_floor(path, payload):
+    response = TestClient(app).post(path, json=payload, headers=_auth_headers())
+
+    assert response.status_code == 422
+    assert "source history start 2025-01-01" in response.text

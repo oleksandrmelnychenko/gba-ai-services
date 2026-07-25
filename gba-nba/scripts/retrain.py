@@ -4,7 +4,7 @@ Pipeline (reuses the existing build/train logic verbatim — no duplicated model
 
   1. BACK UP the current production artifacts to app/ml/artifacts/backup_<ts>/.
   2. REBUILD the vintaged backfill dataset, rolling the monthly snapshot window forward so the
-     newest vintage tracks "now" (default: last 9 month-starts up to the last fully-labelled
+     newest vintage tracks "now" (default: last 5 month-starts up to the last fully-labelled
      vintage, i.e. >= H_DAYS in the past so the (T, T+H] outcome window is complete).
   3. UNION LIVE LABELS: append manager-logged terminal-task outcomes from Mongo (live ground
      truth) onto the backfill. Live rows are upweighted (sample_weight) so a handful of real
@@ -39,6 +39,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from app.core import history  # noqa: E402
+
 ART = ROOT / "app" / "ml" / "artifacts"
 DATA = ROOT / "data"
 PARQUET = DATA / "nba_dataset.parquet"
@@ -48,8 +50,9 @@ PROD_ARTIFACTS = ["propensity_model.joblib", "model_meta.json", "metrics.json", 
 
 DEFAULT_AUC_FLOOR = 0.68
 DEFAULT_AUC_EPSILON = 0.01
-N_SNAPSHOTS = 9
+N_SNAPSHOTS = 5
 H_DAYS = 60  # outcome window; a vintage is only fully labelled once it is >= H_DAYS in the past
+TRAINING_WINDOW_DAYS = 365
 # Live (manager-logged) rows are ground truth; weight them up relative to the backfill proxy.
 LIVE_SAMPLE_WEIGHT = 5.0
 
@@ -75,13 +78,48 @@ def rolling_snapshots(today: dt.date, n: int = N_SNAPSHOTS, h_days: int = H_DAYS
     The latest usable vintage is the most recent month-start that is at least h_days before today
     (so every candidate has a complete outcome window). Then walk back n-1 more months.
     """
+    if n <= 0:
+        raise ValueError("n must be positive")
     latest = _month_start(today - dt.timedelta(days=h_days))
     out: list[dt.date] = []
     cur = latest
     for _ in range(n):
         out.append(cur)
         cur = _prev_month_start(cur)
-    return [d.isoformat() for d in reversed(out)]
+    snapshots = [d.isoformat() for d in reversed(out)]
+    for snapshot in snapshots:
+        history.training_window(snapshot, TRAINING_WINDOW_DAYS)
+    return snapshots
+
+
+def _model_history_errors(meta_path: Path) -> list[str]:
+    """Reject legacy models whose training boundary cannot be proven."""
+    if not meta_path.exists():
+        return [f"{meta_path.name} missing"]
+    try:
+        meta = json.loads(meta_path.read_text())
+    except (OSError, ValueError) as exc:
+        return [f"{meta_path.name} unreadable: {exc}"]
+    errors: list[str] = []
+    source_start = history.source_history_start().isoformat()
+    if meta.get("source_history_start") != source_start:
+        errors.append("source_history_start mismatch")
+    if meta.get("training_window_days") != TRAINING_WINDOW_DAYS:
+        errors.append("training_window_days mismatch")
+    vintages = meta.get("training_vintages")
+    if not isinstance(vintages, list) or not vintages:
+        errors.append("training_vintages missing")
+    else:
+        try:
+            canonical_vintages = [
+                history.training_window(vintage, TRAINING_WINDOW_DAYS).as_of.isoformat()
+                for vintage in vintages
+            ]
+            if canonical_vintages != sorted(set(canonical_vintages)):
+                errors.append("training_vintages must be sorted and unique")
+        except (TypeError, ValueError) as exc:
+            errors.append(f"incomplete training vintage: {exc}")
+    return errors
 
 
 def _pooled_oot_auc(metrics_path: Path) -> float:
@@ -214,7 +252,12 @@ def main() -> int:
         f"floor={args.auc_floor}  eps={args.auc_epsilon}  live={include_live}  dry_run={args.dry_run}")
 
     old_auc: float | None = None
-    if (ART / "metrics.json").exists():
+    old_history_errors = _model_history_errors(ART / "model_meta.json")
+    if old_history_errors:
+        print("current production model is history-incompatible; regression comparison disabled:")
+        for error in old_history_errors:
+            print(f"  - {error}")
+    elif (ART / "metrics.json").exists():
         try:
             old_auc = _pooled_oot_auc(ART / "metrics.json")
             print(f"current production pooled OOT AUC = {old_auc:.4f}")
@@ -252,12 +295,18 @@ def main() -> int:
     print(f"dataset: backfill={ds_summary['backfill_rows']} live={ds_summary['live_rows']}  "
           f"cross_sell n={ds_summary['cross_sell_n']} base={ds_summary['cross_sell_base_rate']:.1%}")
     card_errors = _model_card_consistency_errors(ART / "metrics.json", ART / "MODEL_CARD.md")
+    model_history_errors = _model_history_errors(ART / "model_meta.json")
     card_ok = not card_errors
     if card_errors:
         print("MODEL_CARD consistency gate FAILED:")
         for err in card_errors:
             print(f"  - {err}")
-    passed = passed and card_ok
+    if model_history_errors:
+        print("MODEL history compatibility gate FAILED:")
+        for err in model_history_errors:
+            print(f"  - {err}")
+    history_ok = not model_history_errors
+    passed = passed and card_ok and history_ok
 
     if args.dry_run:
         _restore(backup_dir)
@@ -273,6 +322,8 @@ def main() -> int:
             why.append(f"{new_auc:.4f} < old {old_auc:.4f} - eps {args.auc_epsilon}")
         if not card_ok:
             why.append("MODEL_CARD.md is stale or missing")
+        if not history_ok:
+            why.append("model history metadata is incompatible")
         print(f"\nGATE FAILED ({'; '.join(why)}) -> ABORTING swap.")
         _restore(backup_dir)
         _hr("RETRAIN ABORTED — old artifacts kept")

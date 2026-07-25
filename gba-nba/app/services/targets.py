@@ -14,6 +14,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
+from app.core import history
 from app.core.config import get_settings
 from app.core.money import cents, cents_decimal, decimal_value, tenths
 from app.data import signals_repository as sig
@@ -101,6 +102,7 @@ def compute_target(manager_id: int, as_of: str | None = None,
         since = (since - timedelta(days=1)).replace(day=1)
     since_str = since.isoformat()
     asof_excl = (today + timedelta(days=1)).isoformat()  # include today in MTD (queries use < :asof)
+    coverage = history.explicit_window(since_str, asof_excl)
 
     shipped = sig.monthly_shipped(manager_id, since_str, asof_excl)
     paid = sig.monthly_paid(manager_id, since_str, asof_excl)
@@ -114,6 +116,7 @@ def compute_target(manager_id: int, as_of: str | None = None,
         "as_of": today.isoformat(),
         "working_days": wd,
         "working_days_elapsed": wd_elapsed,
+        **coverage.metadata(),
         "shipped": _metric(shipped, current_month, shipped.get(current_month, 0.0),
                            wd, wd_elapsed, trailing_months),
         "paid": _metric(paid, current_month, paid.get(current_month, 0.0),

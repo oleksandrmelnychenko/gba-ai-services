@@ -32,6 +32,22 @@ _ASOF_FNS = (
     repo.open_unpaid_stats,
     repo.open_unpaid_aging_buckets,
 )
+_TRANSACTION_HISTORY_FNS = (
+    repo.payment_status_counts,
+    repo.open_unpaid_stats,
+    repo.open_unpaid_aging_buckets,
+    repo.total_sales_count,
+    repo.turnover_eur,
+    repo.turnover_eur_by_currency,
+    repo.activity_stats,
+    repo.return_qty_rate,
+    repo.monthly_turnover_series,
+    dataset.feat_debt_trajectory,
+    dataset.feat_rfm,
+    dataset.feat_returns,
+    dataset.features_one,
+    dataset.features_many,
+)
 
 
 def _sql_body(fn) -> str:
@@ -106,3 +122,13 @@ def test_all_return_feature_paths_sum_canonical_salereturnitem_qty():
             f"{fn.__name__} replaced partial/multiple returns with original sold quantity"
         )
         assert "oi.ReturnedQty" not in body, fn.__name__
+
+
+def test_every_transaction_history_path_uses_the_shared_source_floor():
+    for fn in _TRANSACTION_HISTORY_FNS:
+        body = _sql_body(fn)
+        assert ":history_start" in body, (
+            f"{fn.__name__} can read or fabricate behavior before SOURCE_HISTORY_START_DATE"
+        )
+        assert "2000-01-01" not in body, fn.__name__
+        assert "1980-01-01" not in body, fn.__name__

@@ -31,9 +31,10 @@ import time
 from pathlib import Path
 from typing import Any
 
+from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.risk import dataset as risk_dataset
-from app.risk.score_current import score_current
+from app.risk.score_current import current_model_readiness, score_current
 
 log = get_logger("solvency_monitor")
 
@@ -128,7 +129,13 @@ def _baseline_from_value_map(
     out: Path,
 ) -> dict[str, Any]:
     """Freeze (edges + expected proportions) for the score and each monitored feature."""
+    model = current_model_readiness()
+    if model["ready"] is not True:
+        raise RuntimeError(f"cannot build drift baseline: {model['reason']}")
     baseline: dict[str, Any] = {
+        "source_history_start": get_settings().source_history_start_date.isoformat(),
+        "current_model_run_id": model["training_run_id"],
+        "current_model_dataset_sha256": model["dataset_sha256"],
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "n_bins": _N_BINS,
         "n_rows": int(n_rows),
@@ -257,7 +264,29 @@ def _load_baseline() -> dict[str, Any] | None:
     if not _BASELINE_PATH.exists():
         return None
     try:
-        return json.loads(_BASELINE_PATH.read_text())
+        baseline = json.loads(_BASELINE_PATH.read_text())
+        expected = get_settings().source_history_start_date.isoformat()
+        if baseline.get("source_history_start") != expected:
+            log.warning(
+                "monitor_baseline_history_mismatch",
+                expected=expected,
+                actual=baseline.get("source_history_start"),
+            )
+            return None
+        model = current_model_readiness()
+        if (
+            model["ready"] is not True
+            or baseline.get("current_model_run_id") != model.get("training_run_id")
+            or baseline.get("current_model_dataset_sha256")
+            != model.get("dataset_sha256")
+        ):
+            log.warning(
+                "monitor_baseline_model_mismatch",
+                baseline_run=baseline.get("current_model_run_id"),
+                current_run=model.get("training_run_id"),
+            )
+            return None
+        return baseline
     except Exception as exc:  # noqa: BLE001
         log.warning("monitor_baseline_unreadable", error=str(exc))
         return None

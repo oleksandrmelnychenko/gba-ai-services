@@ -3,11 +3,17 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from app.core.history import require_supported_as_of
 from app.core.logging import get_logger
 from app.core.metrics import METRICS
 from app.data import cache
 from app.data import sales_repository as repo
-from app.domain.models import ProductRec, RecommendationResult, RecSource
+from app.domain.models import (
+    ProductRec,
+    RecommendationResult,
+    RecSource,
+    RecSourceDetail,
+)
 from app.services.recommendations import recommender
 
 log = get_logger("reco_service")
@@ -27,6 +33,7 @@ def get_recommendations(
 ) -> RecommendationResult:
     started = datetime.now()
     as_of = as_of_date or datetime.now().strftime("%Y-%m-%d")
+    require_supported_as_of(as_of)
     if not repo.client_exists(customer_id):
         raise UnknownCustomerError(f"customer {customer_id} was not found")
     key = cache.make_key(customer_id, as_of, top_n, include_discovery, region_scope)
@@ -39,6 +46,7 @@ def get_recommendations(
                 ProductRec(
                     product_id=r["product_id"], score=r["score"], rank=r["rank"],
                     segment=r["segment"], source=RecSource(r["source"]),
+                    source_detail=RecSourceDetail(r["source_detail"]),
                 )
                 for r in cached["recommendations"]
             ]

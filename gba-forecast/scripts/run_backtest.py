@@ -31,8 +31,11 @@ from app.services.forecast import history_labels, series_from
 from app.services.forecasting import backtest, classify, selection
 
 
-def _dense(history: dict[str, float], as_of, months: int) -> list[float]:
-    return series_from(history, history_labels(as_of, months))
+def _dense(history: dict[str, float], as_of, months: int, source_history_start) -> list[float]:
+    return series_from(
+        history,
+        history_labels(as_of, months, source_history_start),
+    )
 
 
 def _collect(args) -> backtest.BacktestResult:
@@ -46,11 +49,11 @@ def _collect(args) -> backtest.BacktestResult:
     if args.clients > 0:
         rows = sig.sample_client_monthly_series(as_of_str, months, args.clients)
         for hist in sig.group_series_by_entity(rows, "cid").values():
-            series_list.append(_dense(hist, as_of, months))
+            series_list.append(_dense(hist, as_of, months, cfg.source_history_start_date))
     if args.products > 0:
         rows = sig.sample_product_monthly_series(as_of_str, months, args.products)
         for hist in sig.group_series_by_entity(rows, "pid").values():
-            series_list.append(_dense(hist, as_of, months))
+            series_list.append(_dense(hist, as_of, months, cfg.source_history_start_date))
 
     for series in series_list:
         backtest.backtest_series(

@@ -186,11 +186,17 @@ def test_generate_echoes_canonical_identity_and_resolved_business_date(
         "skipped_capped",
         "refreshed",
         "crit_debt_reserved",
+        "source_history_start",
+        "effective_start",
+        "history_complete",
     }
     assert body["manager_id"] == 1
     assert body["manager_net_uid"] == MIXED_CASE_MGR_UID.lower()
     assert body["requested_as_of"] == requested_as_of
     assert body["as_of"] == expected_as_of
+    assert body["source_history_start"] == "2025-01-01"
+    assert body["effective_start"] == f"{int(expected_as_of[:4]) - 1}{expected_as_of[4:]}"
+    assert body["history_complete"] is True
 
 
 def test_generate_fails_closed_when_orchestrator_identity_drifts(client, monkeypatch):

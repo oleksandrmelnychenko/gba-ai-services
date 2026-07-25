@@ -6,9 +6,11 @@ Pipeline (each step reuses the existing build/train logic verbatim — no duplic
   2. REBUILD the as-of-today modeling dataset           (scripts/build_risk_dataset.main)
   3. REBUILD the 6-month forward vintage pool           (scripts/build_vintages.main)
   4. RETRAIN the current-state WOE scorecard + GBM      (scripts/train_current_state.main)
-  5. RETRAIN the 6-month forward scorecard + GBM        (scripts/train_forward_risk.main)
+  5. EVALUATE the 6-month forward scorecard. Publish it only if its independent-client event
+     support and validation gates pass; otherwise publish an explicit fail-closed status.
   6. VALIDATE: the current-state scorecard OOF AUC must be >= --auc-floor (default 0.90).
-       PASS  -> keep the freshly trained artifacts, refresh the drift baseline, print summary.
+       PASS  -> keep the freshly trained current artifact, refresh the drift baseline, and either
+                publish a validated forward artifact or its degraded/unavailable status.
        FAIL  -> RESTORE the backed-up artifacts (service is never left with a broken model).
 
 Because the training scripts write directly into app/risk/artifacts/, the "atomic swap" is:
@@ -41,6 +43,7 @@ DATA = ROOT / "data"
 PROD_ARTIFACTS = [
     "scorecard_coefficients.json",
     "forward_scorecard_coeffs.json",
+    "forward_model_status.json",
     "gbm_model.joblib",
     "forward_gbm.pkl",
     "cv_report.json",
@@ -69,7 +72,7 @@ def _forward_behavioral_auc() -> float | None:
         return None
     try:
         m = json.loads(p.read_text())
-        return float(m["oot"]["WITHOUT_aging"]["scorecard_oot"]["auc"])
+        return float(m["production_gate"]["oot_auc"])
     except Exception:  # noqa: BLE001
         return None
 
@@ -90,6 +93,8 @@ def _restore(backup_dir: Path) -> None:
         src = backup_dir / name
         if src.exists():
             shutil.copy2(src, ART / name)
+        elif (ART / name).exists():
+            (ART / name).unlink()
     print(f"RESTORED previous artifacts from {backup_dir}")
 
 
@@ -123,7 +128,7 @@ def _run_pipeline(feature_date: str, label_date: str) -> None:
     _load_script("train_current_state").main()
 
     _hr("STEP 4/4 — retrain 6-month forward scorecard + GBM")
-    sys.argv = ["train_forward_risk"]
+    sys.argv = ["train_forward_risk", "--commit"]
     _load_script("train_forward_risk").main()
 
 

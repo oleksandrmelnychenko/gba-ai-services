@@ -53,6 +53,10 @@ class Settings(BaseSettings):
     repurchase_count: int = 20
     discovery_count: int = 5
     max_per_group: int = 3
+    # Earliest complete transactional history imported from 1C. Every recommendation,
+    # training and evaluation query is bounded by this date; rolling windows are additionally
+    # clamped to it.
+    source_history_start_date: date = date(2025, 1, 1)
     # Health fails closed when the canonical valid-sales spine has not advanced for this long.
     max_source_lag_days: int = Field(default=31, gt=0)
     # Exclude products bought by more than this share of clients — universal staples / synthetic

@@ -64,7 +64,7 @@ def score_task_priority(task_type: str, signals: dict) -> tuple[float, float, fl
 
     Lazy import keeps the ML deps (joblib/sklearn) off the hot import path; score_task caches the
     loaded model. recency_days=None is mapped to 9999 — the dataset's missing-recency sentinel."""
-    from app.ml.score_task import score_task
+    from app.ml.score_task import IncompatibleModelArtifactError, expected_value, score_task
 
     feats: dict = {"task_type": task_type}
     for k, v in signals.items():
@@ -75,8 +75,49 @@ def score_task_priority(task_type: str, signals: dict) -> tuple[float, float, fl
                 feats[k] = float(v)
         elif k in _FEATURE_KEY_MAP and v is not None:
             feats[_FEATURE_KEY_MAP[k]] = float(v)
-    s = score_task(feats)
+    try:
+        s = score_task(feats)
+    except IncompatibleModelArtifactError:
+        p_outcome = _heuristic_probability(task_type, signals)
+        value = expected_value(feats)
+        return (
+            round(100.0 * p_outcome, 2),
+            round(p_outcome, 6),
+            round(value, 2),
+            round(p_outcome * value, 4),
+        )
     return s["priority"], s["p_outcome"], s["expected_value"], s["ev_score"]
+
+
+def _heuristic_probability(task_type: str, signals: dict) -> float:
+    """Deterministic fail-safe while an incompatible model artifact is being retrained."""
+    monetary = float(signals.get("monetary") or 0.0)
+    if task_type == "debt_followup":
+        urgency = debt_urgency(int(signals.get("days_past_terms") or 0))
+        value = value_from_monetary(float(signals.get("overdue_amount") or 0.0))
+        confidence = 1.0
+    elif task_type == "reorder_due":
+        urgency = reorder_urgency(
+            float(signals.get("elapsed_days") or 0.0),
+            float(signals.get("cycle_days") or 0.0),
+        )
+        value = value_from_monetary(monetary)
+        confidence = min(1.0, 0.4 + 0.1 * float(signals.get("n_orders") or 0.0))
+    elif task_type == "churn_winback":
+        urgency = churn_urgency(
+            float(signals.get("drop_ratio") or 0.0),
+            int(signals.get("silence_days") or 0),
+        )
+        value = value_from_monetary(monetary)
+        confidence = min(1.0, 0.5 + 0.05 * int(signals.get("prior_orders") or 0))
+    elif task_type == "cross_sell":
+        top_score = float(signals.get("top_score") or 0.0)
+        urgency = crosssell_urgency(top_score)
+        value = value_from_monetary(monetary)
+        confidence = max(0.0, min(1.0, top_score))
+    else:
+        return 0.0
+    return priority(urgency, value, confidence) / 100.0
 
 
 def _sat(x: float, k: float) -> float:

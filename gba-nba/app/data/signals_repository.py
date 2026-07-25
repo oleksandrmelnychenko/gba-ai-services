@@ -16,17 +16,24 @@ from decimal import Decimal
 from functools import lru_cache
 from typing import Any
 
+from app.core import history
 from app.core.config import get_settings
 from app.core.money import cents, cents_decimal, decimal_value
 from app.data.db import in_clause, query
 
 
-@lru_cache(maxsize=4)
-def ubiquitous_product_ids(pct: float) -> frozenset[int]:
-    """Products bought by more than `pct` of distinct clients (last 12mo) — synthetic accounting
+@lru_cache(maxsize=64)
+def ubiquitous_product_ids(pct: float, as_of: str) -> frozenset[int]:
+    """Products bought by more than `pct` of distinct clients in the deterministic trailing 12mo.
+
+    The rolling start is clamped to the canonical source-history boundary, and `as_of` is explicit
+    so historical generation/training never depends on wall-clock GETDATE().
+
+    Synthetic accounting
     lines / universal staples (e.g. "Ввід боргів"/debt-entry, ~75% of clients) that aren't real
     sellable products. Excluded from reorder/monetary signals so they don't generate nonsensical
-    'reorder the debt-entry' tasks or inflate a client's turnover. Cached per pct."""
+    'reorder the debt-entry' tasks or inflate a client's turnover. Cached per pct + as_of."""
+    window = history.rolling_months(as_of, 12)
     rows = query(
         """
         WITH base AS (
@@ -35,7 +42,7 @@ def ubiquitous_product_ids(pct: float) -> frozenset[int]:
             JOIN dbo.ClientAgreement ca ON ca.ID = o.ClientAgreementID
             JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
             WHERE oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
-                  AND o.Created >= DATEADD(month, -12, GETDATE())
+                  AND o.Created >= :start AND o.Created < :asof
         ),
         tot AS (SELECT COUNT(DISTINCT cid) AS n FROM base)
         SELECT b.pid AS pid
@@ -43,7 +50,11 @@ def ubiquitous_product_ids(pct: float) -> frozenset[int]:
         GROUP BY b.pid, tot.n
         HAVING COUNT(DISTINCT b.cid) * 1.0 / NULLIF(tot.n, 0) > :pct
         """,
-        {"pct": pct},
+        {
+            "pct": pct,
+            "start": window.effective_start.isoformat(),
+            "asof": window.as_of.isoformat(),
+        },
     )
     return frozenset(int(r["pid"]) for r in rows)
 
@@ -51,7 +62,12 @@ def ubiquitous_product_ids(pct: float) -> frozenset[int]:
 _SYNTHETIC_REFRESH_S = 3600.0
 _synthetic_state: dict = {"at": 0.0, "ids": frozenset()}
 _SOURCE_READINESS_TTL_S = 60.0
-_source_readiness_state: dict = {"at": 0.0, "max_lag_days": None, "value": None}
+_source_readiness_state: dict = {
+    "at": 0.0,
+    "max_lag_days": None,
+    "source_history_start": None,
+    "value": None,
+}
 
 
 def synthetic_product_ids() -> frozenset[int]:
@@ -78,15 +94,19 @@ def synthetic_product_ids() -> frozenset[int]:
 def source_readiness(max_lag_days: int) -> dict[str, Any]:
     """Business-aware SQL source probe, briefly cached for health polling."""
     now_mono = time.monotonic()
+    source_start = history.source_history_start().isoformat()
     cached = _source_readiness_state["value"]
     if (
         cached is not None
         and _source_readiness_state["max_lag_days"] == max_lag_days
+        and _source_readiness_state["source_history_start"] == source_start
         and now_mono - _source_readiness_state["at"] < _SOURCE_READINESS_TTL_S
     ):
         return dict(cached)
 
     synthetic_ids = synthetic_product_ids()
+    as_of_exclusive = (datetime.now().date() + timedelta(days=1)).isoformat()
+    coverage = history.factual_window(as_of_exclusive)
     rows = query(
         """
         SELECT
@@ -95,6 +115,7 @@ def source_readiness(max_lag_days: int) -> dict[str, Any]:
                 FROM dbo.[Order] o
                 JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
                 WHERE oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
+                      AND o.Created >= :source_start AND o.Created < :asof
                 ORDER BY o.Created DESC, o.ID DESC
             ) AS latest_sale_at,
             (
@@ -103,7 +124,11 @@ def source_readiness(max_lag_days: int) -> dict[str, Any]:
                 JOIN dbo.[User] u ON u.ID = c.MainManagerID AND u.Deleted = 0
                 WHERE c.Deleted = 0 AND c.MainManagerID IS NOT NULL
             ) AS manager_count
-        """
+        """,
+        {
+            "source_start": coverage.effective_start.isoformat(),
+            "asof": coverage.as_of.isoformat(),
+        },
     )
     row = rows[0] if rows else {}
     latest = row.get("latest_sale_at")
@@ -126,21 +151,27 @@ def source_readiness(max_lag_days: int) -> dict[str, Any]:
         "latest_sale_at": latest.isoformat() if isinstance(latest, datetime) else None,
         "manager_count": manager_count,
         "synthetic_product_count": len(synthetic_ids),
+        **coverage.metadata(),
     }
     _source_readiness_state.update(
-        {"at": time.monotonic(), "max_lag_days": max_lag_days, "value": dict(result)}
+        {
+            "at": time.monotonic(),
+            "max_lag_days": max_lag_days,
+            "source_history_start": source_start,
+            "value": dict(result),
+        }
     )
     return result
 
 
-def _excluded() -> frozenset[int]:
+def _excluded(as_of: str) -> frozenset[int]:
     """Products excluded from turnover/feature signals: the synthetic accounting ids (debt-entry
     «Ввід боргів», resolved live) UNION the data-driven ubiquity set. The synthetic ids are a HARD
     guard — excluded unconditionally, so the exclusion holds even if the debt-entry's rolling
     12-month ubiquity ever dips below ubiquity_exclude_pct. Mirrors gba-reco/gba-products. The
     ubiquity set still catches any OTHER future universal staple."""
     s = get_settings()
-    return synthetic_product_ids() | ubiquitous_product_ids(s.ubiquity_exclude_pct)
+    return synthetic_product_ids() | ubiquitous_product_ids(s.ubiquity_exclude_pct, as_of)
 
 
 def existing_client_ids(client_ids: list[int]) -> set[int]:
@@ -206,20 +237,23 @@ def manager_names(manager_ids: list[int]) -> dict[int, str]:
 
 def new_clients_for_manager(manager_id: int, as_of: str, recent_days: int = 90,
                             max_orders: int = 0) -> list[dict]:
-    """Recently-created clients of a manager with <= max_orders purchases — activation candidates."""
+    """Recently-created clients with factual order counts over all available source history."""
+    created_window = history.rolling_days(as_of, recent_days)
+    purchase_window = history.factual_window(as_of)
     return query(
         """
         WITH cand AS (
             SELECT c.ID, c.FullName, c.Name, c.MobileNumber, c.EmailAddress, c.Created
             FROM dbo.Client c
             WHERE c.Deleted = 0 AND c.MainManagerID = :mid
-                  AND c.Created >= DATEADD(day, -:recent, :asof)
+                  AND c.Created >= :created_start AND c.Created < :asof
         ),
         oc AS (
             SELECT ca.ClientID AS cid, COUNT(DISTINCT oi.OrderID) AS n
             FROM dbo.ClientAgreement ca
             JOIN cand ON cand.ID = ca.ClientID
-            LEFT JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID AND o.Created < :asof
+            LEFT JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
+                 AND o.Created >= :source_start AND o.Created < :asof
             LEFT JOIN dbo.OrderItem oi ON oi.OrderID = o.ID AND oi.IsValidForCurrentSale = 1
             GROUP BY ca.ClientID
         )
@@ -230,7 +264,13 @@ def new_clients_for_manager(manager_id: int, as_of: str, recent_days: int = 90,
         FROM cand LEFT JOIN oc ON oc.cid = cand.ID
         WHERE ISNULL(oc.n, 0) <= :maxord
         """,
-        {"mid": manager_id, "asof": as_of, "recent": recent_days, "maxord": max_orders},
+        {
+            "mid": manager_id,
+            "asof": created_window.as_of.isoformat(),
+            "created_start": created_window.effective_start.isoformat(),
+            "source_start": purchase_window.effective_start.isoformat(),
+            "maxord": max_orders,
+        },
     )
 
 
@@ -265,13 +305,14 @@ def active_clients_for_manager(manager_id: int, as_of: str, recent_days: int = 1
     """Clients with >= min_orders distinct orders in the last recent_days — the only clients worth
     a cross-sell reco call (reco needs purchase history; cold clients return no discovery). On real
     data this is ~20% of a manager's book, so it cuts reco HTTP calls 4-5x vs. all clients."""
+    window = history.rolling_days(as_of, recent_days)
     return query(
         """
         WITH act AS (
             SELECT ca.ClientID AS cid
             FROM dbo.ClientAgreement ca
             JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
-                 AND o.Created >= DATEADD(day, -:recent, :asof) AND o.Created < :asof
+                 AND o.Created >= :start AND o.Created < :asof
             JOIN dbo.OrderItem oi ON oi.OrderID = o.ID AND oi.IsValidForCurrentSale = 1
             JOIN dbo.Client c ON c.ID = ca.ClientID AND c.Deleted = 0 AND c.MainManagerID = :mid
             GROUP BY ca.ClientID
@@ -281,7 +322,12 @@ def active_clients_for_manager(manager_id: int, as_of: str, recent_days: int = 1
                c.MobileNumber AS phone, c.EmailAddress AS email
         FROM act JOIN dbo.Client c ON c.ID = act.cid
         """,
-        {"mid": manager_id, "asof": as_of, "recent": recent_days, "minord": min_orders},
+        {
+            "mid": manager_id,
+            "asof": window.as_of.isoformat(),
+            "start": window.effective_start.isoformat(),
+            "minord": min_orders,
+        },
     )
 
 
@@ -351,6 +397,7 @@ _EUR_VALUE_CTE = """
         WHERE cid.Deleted = 0
               {manager_filter}
               AND d.Total > 0
+              AND d.Created >= :start AND d.Created < :asof
               AND DATEDIFF(day, d.Created, :asof) > ISNULL(a.NumberDaysDebt, 0)
               AND DATEDIFF(day, d.Created, :asof) <= :maxage
     )
@@ -372,6 +419,7 @@ def overdue_debts_for_manager(manager_id: int, as_of: str, max_age_days: int = 3
     invoices that are not actionable follow-ups). min_amount drops settled/rounding sub-threshold
     overdues (on real data ~25% of debt clients owe < €10 — not worth a collection call).
     """
+    window = history.rolling_days(as_of, max_age_days)
     return query(
         _EUR_VALUE_CTE.format(extra_select="", manager_filter="AND c.MainManagerID = :mid")
         + """
@@ -384,7 +432,13 @@ def overdue_debts_for_manager(manager_id: int, as_of: str, max_age_days: int = 3
         GROUP BY client_id
         HAVING SUM(eur_value) >= :minamt
         """,
-        {"mid": manager_id, "asof": as_of, "maxage": max_age_days, "minamt": min_amount},
+        {
+            "mid": manager_id,
+            "asof": window.as_of.isoformat(),
+            "start": window.effective_start.isoformat(),
+            "maxage": max_age_days,
+            "minamt": min_amount,
+        },
     )
 
 
@@ -393,6 +447,7 @@ def overdue_debts_all_managers(as_of: str, max_age_days: int = 365,
     """overdue_debts_for_manager for EVERY manager in a single set-based pass (per-client rows tagged
     with c.MainManagerID). Identical per-client EUR math, filters and HAVING; only the manager
     scoping moves into the GROUP BY so the head/team dashboard needs one query, not one per manager."""
+    window = history.rolling_days(as_of, max_age_days)
     return query(
         _EUR_VALUE_CTE.format(extra_select="c.MainManagerID AS manager_id, ",
                               manager_filter="AND c.MainManagerID IS NOT NULL")
@@ -406,7 +461,12 @@ def overdue_debts_all_managers(as_of: str, max_age_days: int = 365,
         GROUP BY manager_id, client_id
         HAVING SUM(eur_value) >= :minamt
         """,
-        {"asof": as_of, "maxage": max_age_days, "minamt": min_amount},
+        {
+            "asof": window.as_of.isoformat(),
+            "start": window.effective_start.isoformat(),
+            "maxage": max_age_days,
+            "minamt": min_amount,
+        },
     )
 
 
@@ -487,6 +547,7 @@ def reorder_candidates_for_manager(manager_id: int, as_of: str, min_purchases: i
     data the mean overdue ratio is ~11x, i.e. products a client stopped buying long ago — those
     are churn, not a reorder nudge, so they're excluded here (and the urgency band stays meaningful).
     """
+    window = history.factual_window(as_of)
     return query(
         """
         WITH per_product AS (
@@ -498,7 +559,9 @@ def reorder_candidates_for_manager(manager_id: int, as_of: str, min_purchases: i
             JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
             JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
             JOIN dbo.Client c ON c.ID = ca.ClientID
-            WHERE oi.IsValidForCurrentSale = 1 AND o.Created < :asof AND oi.ProductID IS NOT NULL
+            WHERE oi.IsValidForCurrentSale = 1
+                  AND o.Created >= :source_start AND o.Created < :asof
+                  AND oi.ProductID IS NOT NULL
                   AND c.Deleted = 0 AND c.MainManagerID = :mid
             GROUP BY ca.ClientID, oi.ProductID
             HAVING COUNT(DISTINCT o.ID) >= :minp
@@ -518,8 +581,14 @@ def reorder_candidates_for_manager(manager_id: int, as_of: str, min_purchases: i
         WHERE elapsed_days >= cycle_days
               AND elapsed_days <= cycle_days * :maxmult
         """,
-        {"mid": manager_id, "asof": as_of, "minp": min_purchases, "mincyc": min_cycle_days,
-         "maxmult": max_overdue_mult},
+        {
+            "mid": manager_id,
+            "asof": window.as_of.isoformat(),
+            "source_start": window.effective_start.isoformat(),
+            "minp": min_purchases,
+            "mincyc": min_cycle_days,
+            "maxmult": max_overdue_mult,
+        },
     )
 
 
@@ -545,6 +614,12 @@ def churn_candidates_for_manager(manager_id: int, as_of: str,
     last :recent days; baseline = the :base..:recent days before that) so a steady buyer is NOT
     flagged just because the recent window is shorter than the baseline window.
     """
+    baseline = history.rolling_days(as_of, baseline_days)
+    recent = history.rolling_days(as_of, recent_days)
+    recent_span_days = (recent.as_of - recent.effective_start).days
+    prior_span_days = (recent.effective_start - baseline.effective_start).days
+    if recent_span_days <= 0 or prior_span_days <= 0:
+        return []
     return query(
         """
         WITH client_orders AS (
@@ -553,14 +628,14 @@ def churn_candidates_for_manager(manager_id: int, as_of: str,
             JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
             JOIN dbo.OrderItem oi ON oi.OrderID = o.ID AND oi.IsValidForCurrentSale = 1
             JOIN dbo.Client c ON c.ID = ca.ClientID
-            WHERE o.Created < :asof
+            WHERE o.Created >= :start AND o.Created < :asof
                   AND c.Deleted = 0 AND c.MainManagerID = :mid
         ),
         agg AS (
             SELECT client_id,
-                   SUM(CASE WHEN dt >= DATEADD(day, -:recent, :asof) THEN 1 ELSE 0 END) AS recent_orders,
-                   SUM(CASE WHEN dt >= DATEADD(day, -:base, :asof)
-                            AND dt < DATEADD(day, -:recent, :asof) THEN 1 ELSE 0 END) AS prior_orders,
+                   SUM(CASE WHEN dt >= :recent_start THEN 1 ELSE 0 END) AS recent_orders,
+                   SUM(CASE WHEN dt >= :start
+                            AND dt < :recent_start THEN 1 ELSE 0 END) AS prior_orders,
                    MAX(dt) AS last_order
             FROM client_orders
             GROUP BY client_id
@@ -569,9 +644,17 @@ def churn_candidates_for_manager(manager_id: int, as_of: str,
                DATEDIFF(day, last_order, :asof) AS silence_days
         FROM agg
         WHERE prior_orders >= 2
-              AND (recent_orders * 1.0 / :recent) < 0.5 * (prior_orders * 1.0 / (:base - :recent))
+              AND (recent_orders * 1.0 / :recent_span)
+                  < 0.5 * (prior_orders * 1.0 / :prior_span)
         """,
-        {"mid": manager_id, "asof": as_of, "recent": recent_days, "base": baseline_days},
+        {
+            "mid": manager_id,
+            "asof": baseline.as_of.isoformat(),
+            "start": baseline.effective_start.isoformat(),
+            "recent_start": recent.effective_start.isoformat(),
+            "recent_span": recent_span_days,
+            "prior_span": prior_span_days,
+        },
     )
 
 
@@ -579,8 +662,9 @@ def client_monetary(client_ids: list[int], as_of: str, window_days: int = 365) -
     """Recent revenue per client (for the 'value' term in scoring). Best-effort via OrderItem totals."""
     if not client_ids:
         return {}
+    window = history.rolling_days(as_of, window_days)
     ph, params = in_clause("c", client_ids)
-    excl = _excluded()
+    excl = _excluded(window.as_of.isoformat())
     not_in = ""
     if excl:
         eph, eparams = in_clause("x", sorted(excl))
@@ -592,11 +676,15 @@ def client_monetary(client_ids: list[int], as_of: str, window_days: int = 365) -
         FROM dbo.ClientAgreement ca
         JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
         JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-        WHERE oi.IsValidForCurrentSale = 1 AND o.Created >= DATEADD(day, -:win, :asof) AND o.Created < :asof
+        WHERE oi.IsValidForCurrentSale = 1 AND o.Created >= :start AND o.Created < :asof
               AND oi.ProductID IS NOT NULL AND ca.ClientID IN {ph}{not_in}
         GROUP BY ca.ClientID
         """,
-        {"asof": as_of, "win": window_days, **params},
+        {
+            "asof": window.as_of.isoformat(),
+            "start": window.effective_start.isoformat(),
+            **params,
+        },
     )
     return {int(r["client_id"]): float(r["monetary"] or 0) for r in rows}
 
@@ -610,10 +698,11 @@ def client_features(client_ids: list[int], as_of: str, window_days: int = 365) -
     order in the window (callers map None -> 9999, the dataset's missing-recency sentinel)."""
     if not client_ids:
         return {}
+    window = history.rolling_days(as_of, window_days)
     out: dict[int, dict] = {cid: {"monetary": 0.0, "recency_days": None, "order_count": 0}
                             for cid in client_ids}
     ph, params = in_clause("c", client_ids)
-    excl = _excluded()
+    excl = _excluded(window.as_of.isoformat())
     not_in = ""
     if excl:
         eph, eparams = in_clause("x", sorted(excl))
@@ -628,11 +717,15 @@ def client_features(client_ids: list[int], as_of: str, window_days: int = 365) -
         FROM dbo.ClientAgreement ca
         JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
         JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-        WHERE oi.IsValidForCurrentSale = 1 AND o.Created >= DATEADD(day, -:win, :asof) AND o.Created < :asof
+        WHERE oi.IsValidForCurrentSale = 1 AND o.Created >= :start AND o.Created < :asof
               AND oi.ProductID IS NOT NULL AND ca.ClientID IN {ph}{not_in}
         GROUP BY ca.ClientID
         """,
-        {"asof": as_of, "win": window_days, **params},
+        {
+            "asof": window.as_of.isoformat(),
+            "start": window.effective_start.isoformat(),
+            **params,
+        },
     )
     for r in rows:
         cid = int(r["client_id"])
@@ -649,8 +742,13 @@ def client_features(client_ids: list[int], as_of: str, window_days: int = 365) -
 def monthly_shipped(manager_id: int, since: str, as_of: str) -> dict[str, Decimal]:
     """Per-month SHIPPED revenue (EUR) for a manager: SUM(OrderItem.Qty*PricePerItem) by Order month,
     synthetic lines excluded. since/as_of are 'YYYY-MM-DD'. Returns {'YYYY-MM': amount}."""
-    excl = _excluded()
-    params = {"mid": manager_id, "since": since, "asof": as_of}
+    window = history.explicit_window(since, as_of)
+    excl = _excluded(window.as_of.isoformat())
+    params = {
+        "mid": manager_id,
+        "since": window.effective_start.isoformat(),
+        "asof": window.as_of.isoformat(),
+    }
     not_in = ""
     if excl:
         eph, eparams = in_clause("x", sorted(excl))
@@ -680,6 +778,7 @@ def monthly_paid(manager_id: int, since: str, as_of: str) -> dict[str, Decimal]:
     have EuroAmount ≈ the local amount, ~16-23× too high), so convert the local Amount to EUR with
     dbo.GetExchangedToEuroValue(Amount, CurrencyID, FromDate) — IncomePaymentOrder carries both.
     """
+    window = history.explicit_window(since, as_of)
     rows = query(
         """
         SELECT FORMAT(p.FromDate, 'yyyy-MM') AS ym,
@@ -689,6 +788,10 @@ def monthly_paid(manager_id: int, since: str, as_of: str) -> dict[str, Decimal]:
         WHERE p.Deleted = 0 AND p.FromDate >= :since AND p.FromDate < :asof
         GROUP BY FORMAT(p.FromDate, 'yyyy-MM')
         """,
-        {"mid": manager_id, "since": since, "asof": as_of},
+        {
+            "mid": manager_id,
+            "since": window.effective_start.isoformat(),
+            "asof": window.as_of.isoformat(),
+        },
     )
     return {r["ym"]: decimal_value(r["amt"]) for r in rows}

@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import sys
+
+import pytest
+
 from app.services.health_backtest import evaluate_health_snapshot, spearman
 from scripts.product_health_backtest import _check_regression
+from scripts.product_health_backtest import main as backtest_main
 
 
 def test_spearman_handles_ties_and_monotonicity():
@@ -94,3 +99,16 @@ def test_regression_gate_fails_on_new_metric_regression_and_action_shape():
 
     assert any("spearman_margin_score_to_future_margin regressed" in f for f in failures)
     assert any("current by_action count mismatch" in f for f in failures)
+
+
+def test_backtest_cli_rejects_snapshot_before_source_history(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["product_health_backtest.py", "--as-of", "2024-12-31"],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        backtest_main()
+
+    assert exc.value.code == 2

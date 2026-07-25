@@ -5,17 +5,20 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from app.core.config import get_settings
+from app.core.history import coverage, require_supported_as_of
 from app.core.logging import get_logger
 from app.core.metrics import METRICS
 from app.data import cache
 from app.data import solvency_repository as repo
 from app.domain.models import (
+    CapType,
     ClientIdentityMismatchError,
     Contribution,
     CurrencyExposure,
     DataSufficiency,
     ForwardRisk,
     ForwardRiskBand,
+    ForwardRiskStatus,
     GaugeChart,
     Rating,
     SolvencyCharts,
@@ -24,8 +27,7 @@ from app.domain.models import (
 from app.domain.money import round_cent
 from app.risk import dataset as risk_dataset
 from app.risk.score_current import score_current
-from app.risk.score_forward import _load as _forward_card
-from app.risk.score_forward import score_forward
+from app.risk.score_forward import ForwardModelUnavailableError, score_forward
 from app.services.solvency import charts as charts_builder
 
 log = get_logger("solvency_service")
@@ -34,11 +36,6 @@ log = get_logger("solvency_service")
 _BAND_TO_RATING = {"A": Rating.A, "B": Rating.B, "C": Rating.C, "D": Rating.D}
 
 _NO_SALES_24MO_DAYS = 730.0
-_INSUFFICIENT_REASON = (
-    "no sales in the last 24 months, no debt history, no credit-terms signal"
-)
-
-
 def _data_sufficiency(features: dict[str, float]) -> tuple[DataSufficiency, str | None]:
     """Feature-coverage flag: with no sales in 24mo (never-bought recency sentinel included),
     no live debt lines and no credit-terms signal, every feature sits in the safest WOE bin and
@@ -50,13 +47,20 @@ def _data_sufficiency(features: dict[str, float]) -> tuple[DataSufficiency, str 
         and float(features.get("months_with_debt_last12", 0.0)) == 0.0
         and float(features.get("new_debt_eur_3mo", 0.0)) == 0.0
     )
+    # A freshly synchronized agreement may enable the technical control flags while both
+    # controlled values remain zero.  The flag alone is not evidence about the buyer's
+    # creditworthiness: without a positive limit or grace period it carries no usable terms.
     no_credit_terms = (
-        float(features.get("credit_limit_eur", 0.0)) == 0.0
-        and float(features.get("grace_days", 0.0)) == 0.0
-        and float(features.get("has_credit_control", 0.0)) == 0.0
+        float(features.get("credit_limit_eur", 0.0)) <= 0.0
+        and float(features.get("grace_days", 0.0)) <= 0.0
     )
     if no_sales_24mo and no_debt_history and no_credit_terms:
-        return DataSufficiency.INSUFFICIENT, _INSUFFICIENT_REASON
+        history_start = get_settings().source_history_start_date.isoformat()
+        return (
+            DataSufficiency.INSUFFICIENT,
+            f"no sales, debt history or non-zero credit terms in available data since "
+            f"{history_start}",
+        )
     return DataSufficiency.OK, None
 
 
@@ -80,7 +84,8 @@ def _resolve_client_id(client_id: int | None, client_net_uid: str | None) -> int
 
 
 def _as_of(as_of_date: str | None) -> str:
-    return as_of_date or datetime.now().strftime("%Y-%m-%d")
+    resolved = as_of_date or datetime.now().strftime("%Y-%m-%d")
+    return require_supported_as_of(resolved).isoformat()
 
 
 def _hydrate_score(data: dict, expected_client_id: int) -> SolvencyScore | None:
@@ -89,33 +94,94 @@ def _hydrate_score(data: dict, expected_client_id: int) -> SolvencyScore | None:
     Entries cached before the data_sufficiency fields existed are treated as a miss (returns
     None) so a dormant client can't serve a stale ok-by-default flag until the TTL expires.
     """
-    if "data_sufficiency" not in data:
+    required_metadata = {
+        "data_sufficiency",
+        "forward_risk_status",
+        "current_model_run_id",
+        "source_history_start",
+        "effective_start",
+        "history_complete",
+    }
+    if not required_metadata.issubset(data):
         return None
     result = SolvencyScore.model_validate(data)
-    if result.client_id != expected_client_id:
+    if result.client_id != expected_client_id or result.as_of_date is None:
+        return None
+    expected_history = coverage(result.as_of_date, result.window_months)
+    if (
+        result.source_history_start != expected_history.source_history_start.isoformat()
+        or result.effective_start != expected_history.effective_start.isoformat()
+        or result.history_complete != expected_history.history_complete
+    ):
         return None
     return result
 
 
-def _forward_risk(features: dict[str, float]) -> ForwardRisk | None:
+def _hydrate_charts(
+    data: dict,
+    expected_client_id: int,
+    as_of: str,
+    window_months: int,
+) -> SolvencyCharts | None:
+    required_metadata = {
+        "source_history_start",
+        "effective_start",
+        "history_complete",
+    }
+    if not required_metadata.issubset(data):
+        return None
+    result = SolvencyCharts.model_validate(data)
+    expected_history = coverage(as_of, window_months)
+    if (
+        result.client_id != expected_client_id
+        or result.as_of_date != as_of
+        or result.window_months != window_months
+        or result.source_history_start
+        != expected_history.source_history_start.isoformat()
+        or result.effective_start != expected_history.effective_start.isoformat()
+        or result.history_complete != expected_history.history_complete
+    ):
+        return None
+    return result
+
+
+def _forward_risk(
+    features: dict[str, float],
+) -> tuple[ForwardRisk | None, ForwardRiskStatus, str | None]:
     """Map score_forward()'s 6mo early-warning output to the v3 ForwardRisk{band, pd}.
 
     The forward model's declared population is ``total_debt_eur > 0`` and *not already SEV180*.
     An already-defaulted buyer is outside that population: returning the behavioral model's
     usually-low PD would be actively misleading, so the forward signal is absent while the
-    current-state score continues to carry the C/D risk. Buyers with no debt surface as low with
-    the forward population base rate. At-risk-with-debt buyers carry the behavioral band + PD.
+    current-state score continues to carry the C/D risk. Buyers with no debt are outside the
+    model's declared population too, so they have no forward signal. At-risk-with-debt buyers
+    carry the behavioral band + PD.
     """
-    if (
-        float(features.get("overdue_eur_180plus", 0.0) or 0.0)
-        >= risk_dataset.SEV180_MIN_EUR
-    ):
-        return None
-    fwd = score_forward(features)
+    total_debt = float(features.get("total_debt_eur", 0.0) or 0.0)
+    severe_overdue = float(features.get("overdue_eur_180plus", 0.0) or 0.0)
+    if total_debt <= 0.0:
+        return (
+            None,
+            ForwardRiskStatus.NOT_APPLICABLE,
+            "no current debt: outside forward model population",
+        )
+    if severe_overdue >= risk_dataset.SEV180_MIN_EUR:
+        return (
+            None,
+            ForwardRiskStatus.NOT_APPLICABLE,
+            "already SEV180: outside forward model population",
+        )
+    try:
+        fwd = score_forward(features)
+    except ForwardModelUnavailableError as exc:
+        return None, ForwardRiskStatus.MODEL_UNAVAILABLE, str(exc)
     if fwd["band"] == "none":
-        base = float(_forward_card().get("base_rate", 0.0) or 0.0)
-        return ForwardRisk(band=ForwardRiskBand.LOW, pd=round(base, 4))
-    return ForwardRisk(band=ForwardRiskBand(fwd["band"]), pd=float(fwd["pd_behavioral"]))
+        return None, ForwardRiskStatus.NOT_APPLICABLE, "outside forward model population"
+    return (
+        ForwardRisk(band=ForwardRiskBand(fwd["band"]), pd=float(fwd["pd_behavioral"])),
+        ForwardRiskStatus.AVAILABLE,
+        None,
+    )
 
 
 def _currency_breakdown(
@@ -142,6 +208,7 @@ def _not_applicable(
     settings,
 ) -> SolvencyScore:
     """The non-buyer gate result: applicable=false, everything below null."""
+    history = coverage(as_of, window_months)
     return SolvencyScore(
         client_id=cid,
         client_net_uid=client_net_uid,
@@ -151,6 +218,8 @@ def _not_applicable(
         pd=None,
         contributions=None,
         forward_risk=None,
+        forward_risk_status=ForwardRiskStatus.NOT_APPLICABLE,
+        forward_risk_reason="client has no buyer role",
         sub_factors=None,
         caps_applied=[],
         debt_load_source=None,
@@ -158,9 +227,13 @@ def _not_applicable(
         currency_breakdown=None,
         data_sufficiency=DataSufficiency.INSUFFICIENT,
         data_sufficiency_reason="client has no buyer role (score not applicable)",
+        source_history_start=history.source_history_start.isoformat(),
+        effective_start=history.effective_start.isoformat(),
+        history_complete=history.history_complete,
         as_of_date=as_of,
         window_months=window_months,
         model_version=settings.model_version,
+        current_model_run_id=None,
     )
 
 
@@ -171,6 +244,7 @@ def _not_applicable_charts(cid: int, as_of: str, window_months: int) -> Solvency
     the charts (score sparkline, discipline donut, aging) would be built from no-data fallbacks and
     render a misleading flat-100 trajectory. Return empty series instead of a fabricated one.
     """
+    history = coverage(as_of, window_months)
     return SolvencyCharts(
         client_id=cid,
         applicable=False,
@@ -181,6 +255,9 @@ def _not_applicable_charts(cid: int, as_of: str, window_months: int) -> Solvency
         score_sparkline=[],
         turnover_trend=[],
         aging_over_time_heatmap="not_applicable",
+        source_history_start=history.source_history_start.isoformat(),
+        effective_start=history.effective_start.isoformat(),
+        history_complete=history.history_complete,
         as_of_date=as_of,
         window_months=window_months,
     )
@@ -201,9 +278,38 @@ def _build_score(
     set-based batch (/score/batch) routes are guaranteed bit-identical: same score_current,
     same forward scorecard, same rounding.
     """
-    current = score_current(features)
-    forward = _forward_risk(features)
+    history = coverage(as_of, window_months)
     sufficiency, sufficiency_reason = _data_sufficiency(features)
+    if sufficiency == DataSufficiency.INSUFFICIENT:
+        return SolvencyScore(
+            client_id=cid,
+            client_net_uid=client_net_uid,
+            applicable=True,
+            score=None,
+            rating=None,
+            pd=None,
+            contributions=None,
+            forward_risk=None,
+            forward_risk_status=ForwardRiskStatus.NOT_APPLICABLE,
+            forward_risk_reason=sufficiency_reason,
+            sub_factors=None,
+            caps_applied=[],
+            debt_load_source=None,
+            raw_score=None,
+            currency_breakdown=None,
+            data_sufficiency=sufficiency,
+            data_sufficiency_reason=sufficiency_reason,
+            source_history_start=history.source_history_start.isoformat(),
+            effective_start=history.effective_start.isoformat(),
+            history_complete=history.history_complete,
+            as_of_date=as_of,
+            window_months=window_months,
+            model_version=settings.model_version,
+            current_model_run_id=None,
+        )
+
+    current = score_current(features)
+    forward, forward_status, forward_reason = _forward_risk(features)
     return SolvencyScore(
         client_id=cid,
         client_net_uid=client_net_uid,
@@ -216,16 +322,24 @@ def _build_score(
             for c in current["contributions"]
         ],
         forward_risk=forward,
+        forward_risk_status=forward_status,
+        forward_risk_reason=forward_reason,
         sub_factors=None,
-        caps_applied=[],
+        caps_applied=[
+            CapType(value) for value in current.get("policy_overrides", [])
+        ],
         debt_load_source=None,
         raw_score=None,
         currency_breakdown=currency,
         data_sufficiency=sufficiency,
         data_sufficiency_reason=sufficiency_reason,
+        source_history_start=history.source_history_start.isoformat(),
+        effective_start=history.effective_start.isoformat(),
+        history_complete=history.history_complete,
         as_of_date=as_of,
         window_months=window_months,
         model_version=settings.model_version,
+        current_model_run_id=current["model_version"],
     )
 
 
@@ -245,8 +359,8 @@ def score_client(
     creditscore-v3 namespace, so old v1/v2 cache entries never collide.
     """
     started = datetime.now()
-    cid = _resolve_client_id(client_id, client_net_uid)
     as_of = _as_of(as_of_date)
+    cid = _resolve_client_id(client_id, client_net_uid)
     settings = get_settings()
 
     if not repo.has_buyer_role(cid):
@@ -307,6 +421,7 @@ def score_client(
         pd=result.pd,
         rating=result.rating.value if result.rating else None,
         forward_band=result.forward_risk.band.value if result.forward_risk else None,
+        forward_status=result.forward_risk_status.value,
         data_sufficiency=result.data_sufficiency.value,
         latency_ms=round(latency, 2),
     )
@@ -431,9 +546,9 @@ def build_charts(
     window_months: int,
 ) -> SolvencyCharts:
     started = datetime.now()
+    as_of = _as_of(as_of_date)
     if not repo.client_exists(client_id):
         raise LookupError(f"client_id not found: {client_id}")
-    as_of = _as_of(as_of_date)
 
     if not repo.has_buyer_role(client_id):
         result = _not_applicable_charts(client_id, as_of, window_months)
@@ -445,9 +560,10 @@ def build_charts(
 
     cached = cache.get(key)
     if cached is not None:
-        result = SolvencyCharts(**cached)
-        METRICS.record_request((datetime.now() - started).total_seconds() * 1000)
-        return result
+        result = _hydrate_charts(cached, client_id, as_of, window_months)
+        if result is not None:
+            METRICS.record_request((datetime.now() - started).total_seconds() * 1000)
+            return result
 
     result = charts_builder.build_charts(client_id, as_of, window_months)
     cache.set(key, result.model_dump(mode="json"))

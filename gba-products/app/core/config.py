@@ -11,9 +11,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    # Shared AI-fleet source contract. All business history is tracked from this date.
-    source_history_start_date: date = date(2025, 1, 1)
-
     db_host: str = "127.0.0.1"
     db_port: int = 1433
     db_name: str = "ConcordDb_V5"
@@ -48,8 +45,12 @@ class Settings(BaseSettings):
     # bump on any scoring/classification change so outcomes can be sliced/A-B'd by version
     # Stock semantics changed from the now-empty ReSaleAvailability cost layer to operational
     # ProductAvailability, and v4 makes all currency/quantity boundaries Decimal + HALF_UP.
-    # Bump the cache namespace so a deploy cannot serve either all-zero or binary-float snapshots.
-    model_version: str = "products-v4-exact-decimal"
+    # v5 adds the factual source-history floor and invalidates every pre-floor dense/cache outcome.
+    model_version: str = "products-v5-source-history-floor"
+
+    # Earliest factually available historical source date. All rolling SQL, dense grids,
+    # denominators, producer lookups, API metadata, and cache epochs are clamped to this floor.
+    source_history_start_date: date = date(2025, 1, 1)
 
     # Optional override for the synthetic «Ввід боргів» debt-entry ProductID. 0 = resolve it
     # dynamically from dbo.Product (the 1С sync re-mints the row, so a pinned ID goes stale).

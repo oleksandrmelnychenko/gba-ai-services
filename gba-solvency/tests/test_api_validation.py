@@ -29,6 +29,17 @@ def test_score_malformed_as_of_date_returns_422():
     assert resp.status_code == 422
 
 
+def test_score_as_of_before_source_history_returns_422_without_db():
+    client = TestClient(main.app)
+    resp = client.post(
+        "/score",
+        json={"client_id": 7, "as_of_date": "2024-12-31"},
+        headers=_headers(),
+    )
+    assert resp.status_code == 422
+    assert "2025-01-01" in resp.json()["detail"]
+
+
 def test_score_requires_positive_client_id():
     client = TestClient(main.app)
     resp = client.post("/score", json={"client_id": 0}, headers=_headers())
@@ -65,6 +76,17 @@ def test_batch_malformed_as_of_date_returns_422():
     assert resp.status_code == 422
 
 
+def test_batch_as_of_before_source_history_returns_422_without_db():
+    client = TestClient(main.app)
+    resp = client.post(
+        "/score/batch",
+        json={"client_ids": [1, 2], "as_of_date": "2024-12-31"},
+        headers=_headers(),
+    )
+    assert resp.status_code == 422
+    assert "2025-01-01" in resp.json()["detail"]
+
+
 def test_charts_months_out_of_range_returns_422():
     client = TestClient(main.app)
     for months in (0, -5, 61):
@@ -76,3 +98,13 @@ def test_charts_malformed_as_of_date_returns_422():
     client = TestClient(main.app)
     resp = client.get("/charts/123?as_of_date=garbage", headers=_headers())
     assert resp.status_code == 422
+
+
+def test_charts_as_of_before_source_history_returns_422_without_db():
+    client = TestClient(main.app)
+    resp = client.get(
+        "/charts/123?as_of_date=2024-12-31",
+        headers=_headers(),
+    )
+    assert resp.status_code == 422
+    assert "2025-01-01" in resp.json()["detail"]

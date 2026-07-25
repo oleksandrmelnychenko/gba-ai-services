@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 
 from app.core import exact_numbers as exact
 from app.core.config import get_settings
+from app.core.history import combined_history_metadata, day_history_window
 from app.core.logging import get_logger
 from app.core.metrics import METRICS
 from app.data import cache
@@ -26,7 +27,14 @@ from app.domain.models import (
     ProductAnalyticsResponse,
     XyzClass,
 )
-from app.services import margin_returns, portfolio, product_analytics, stock_health, substitution
+from app.services import (
+    history_policy,
+    margin_returns,
+    portfolio,
+    product_analytics,
+    stock_health,
+    substitution,
+)
 
 log = get_logger("api")
 settings = get_settings()
@@ -92,12 +100,47 @@ def _today() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%d")
 
 
+def _resolve_as_of(as_of_date: date | None) -> str:
+    as_of = as_of_date or date.fromisoformat(_today())
+    if as_of < settings.source_history_start_date:
+        raise HTTPException(status_code=422, detail="as_of_date_before_source_history_start")
+    return as_of.isoformat()
+
+
+_HISTORY_RESPONSE_FIELDS = (
+    "source_history_start",
+    "requested_start",
+    "effective_start",
+    "history_complete",
+    "history_fingerprint",
+    "history_windows",
+)
+
+
+def _history_response_fields(source: dict) -> dict:
+    return {field: source[field] for field in _HISTORY_RESPONSE_FIELDS}
+
+
+def _day_history_metadata(as_of: str, days: int, name: str) -> dict:
+    return combined_history_metadata(
+        {
+            name: day_history_window(
+                as_of,
+                days,
+                settings.source_history_start_date,
+            )
+        }
+    )
+
+
 @app.get("/health")
 def health() -> dict:
     return _service_health()
 
 
 def _service_health() -> dict:
+    as_of = _resolve_as_of(None)
+    history_metadata = history_policy.portfolio_metadata(as_of, settings)
     db_ok = True
     try:
         with get_engine().connect() as c:
@@ -110,7 +153,10 @@ def _service_health() -> dict:
     business_reason = "database_unavailable" if not db_ok else None
     if db_ok:
         try:
-            source_readiness = sig.stock_source_readiness()
+            source_readiness = {
+                **sig.stock_source_readiness(),
+                **history_metadata,
+            }
             business_ready = source_readiness.get("ready") is True
             business_reason = source_readiness.get("reason")
         except Exception as exc:  # noqa: BLE001
@@ -141,6 +187,7 @@ def _service_health() -> dict:
         "source_history_contract_ready": source_history_contract_ready,
         "version": "0.1.0",
         "model_version": settings.model_version,
+        **history_metadata,
     }
 
 
@@ -165,7 +212,7 @@ def assortment_stock(as_of_date: date | None = None, limit: int = 100) -> dict:
     """Portfolio inventory-health snapshot: on-hand stock bucketed into days-of-cover bands,
     with EUR value per band and the top SKUs by frozen capital. Internal-key gated."""
     started = time.time()
-    as_of = as_of_date.isoformat() if as_of_date else _today()
+    as_of = _resolve_as_of(as_of_date)
     try:
         snap = cache.get(cache.make_key("assortment", "stock", as_of))
         if snap is None or not _stock_cache_compatible(snap):
@@ -223,6 +270,8 @@ def _build_and_cache_stock(as_of: str) -> dict:
 def _stock_cache_compatible(snapshot: object) -> bool:
     if not isinstance(snapshot, dict) or snapshot.get("model_version") != settings.model_version:
         return False
+    if not _history_cache_compatible(snapshot, stock=True):
+        return False
     try:
         stock_health._validate_snapshot(snapshot)
     except (KeyError, TypeError, ValueError):
@@ -250,8 +299,8 @@ async def _portfolio(as_of: str) -> dict:
     return build
 
 
-def _attach_meta(rows: list[dict]) -> list[dict]:
-    meta = sig.product_meta([r["product_id"] for r in rows])
+def _attach_meta(rows: list[dict], as_of: str) -> list[dict]:
+    meta = sig.product_meta([r["product_id"] for r in rows], as_of)
     output: list[dict] = []
     for row in rows:
         pid = exact.positive_int(row.get("product_id"), "portfolio product_id")
@@ -418,6 +467,8 @@ def _portfolio_cache_compatible(build: dict) -> bool:
         return False
     if build.get("model_version") != settings.model_version:
         return False
+    if not _history_cache_compatible(build):
+        return False
     rows = build.get("rows")
     if not isinstance(rows, list):
         return False
@@ -433,16 +484,32 @@ def _portfolio_cache_compatible(build: dict) -> bool:
     return True
 
 
+def _history_cache_compatible(payload: dict, *, stock: bool = False) -> bool:
+    try:
+        if stock:
+            expected = history_policy.stock_metadata(str(payload["as_of"]), settings)
+        else:
+            expected = history_policy.portfolio_metadata(str(payload["as_of"]), settings)
+    except (KeyError, TypeError, ValueError):
+        return False
+    return all(payload.get(field) == expected[field] for field in _HISTORY_RESPONSE_FIELDS)
+
+
 @app.get("/assortment/overview")
 async def assortment_overview(as_of_date: date | None = None) -> dict:
     """Portfolio summary: counts by band / lifecycle / ABC / XYZ + totals + avg health. Internal-key gated."""
     started = time.time()
-    as_of = as_of_date.isoformat() if as_of_date else _today()
+    as_of = _resolve_as_of(as_of_date)
     try:
         build = await _portfolio(as_of)
         METRICS.record_request((time.time() - started) * 1000)
-        return {"as_of": as_of, "model_version": build["model_version"],
-                "count": build["count"], "overview": build["overview"]}
+        return {
+            "as_of": as_of,
+            "model_version": build["model_version"],
+            **_history_response_fields(build),
+            "count": build["count"],
+            "overview": build["overview"],
+        }
     except Exception as exc:  # noqa: BLE001
         METRICS.record_request((time.time() - started) * 1000, error=True)
         log.error("assortment_overview_failed", error=str(exc))
@@ -458,7 +525,7 @@ async def assortment_health(as_of_date: date | None = None, band: str | None = N
     on-hand-stocked subset (the actual inventory-health decisions); stocked_only=false includes the
     order-to-demand active catalog. Internal-key gated."""
     started = time.time()
-    as_of = as_of_date.isoformat() if as_of_date else _today()
+    as_of = _resolve_as_of(as_of_date)
     resolved_sort = _SORT_ALIASES.get(sort, sort)
     if resolved_sort not in _SORTS:
         allowed = sorted([*_SORTS, *_SORT_ALIASES])
@@ -469,7 +536,9 @@ async def assortment_health(as_of_date: date | None = None, band: str | None = N
                for field, val in (("band", band), ("abc", abc), ("xyz", xyz), ("lifecycle", lifecycle))
                if val}
     try:
-        rows = (await _portfolio(as_of))["rows"]
+        build = await _portfolio(as_of)
+        rows = build["rows"]
+        response_history = _history_response_fields(build)
         if stocked_only:
             rows = [r for r in rows if r["band"] != "order_to_demand"]
         for field, val in filters.items():
@@ -479,12 +548,20 @@ async def assortment_health(as_of_date: date | None = None, band: str | None = N
             win = _region_window(region_window_days)
             regional_rows = await asyncio.to_thread(_regional_sales, as_of, win, region_id)
             rows = _attach_regional_sales(rows, regional_rows)
+            windows = history_policy.portfolio_windows(as_of, settings)
+            windows["regional"] = day_history_window(
+                as_of,
+                win,
+                settings.source_history_start_date,
+            )
+            response_history = combined_history_metadata(windows)
         keyfn, rev = _SORTS[resolved_sort]
         rows = sorted(rows, key=keyfn, reverse=rev)[:max(0, limit)]
-        tasks = await asyncio.to_thread(_attach_meta, rows)
+        tasks = await asyncio.to_thread(_attach_meta, rows, as_of)
         METRICS.record_request((time.time() - started) * 1000)
         return {
             "as_of": as_of,
+            **response_history,
             "sort": resolved_sort,
             "region_id": region_id,
             "region_window_days": win,
@@ -502,8 +579,9 @@ def assortment_regions(as_of_date: date | None = None, window_days: int | None =
                        limit: int = 50) -> dict:
     """Regional portfolio demand summary by Client.RegionID. Internal-key gated."""
     started = time.time()
-    as_of = as_of_date.isoformat() if as_of_date else _today()
+    as_of = _resolve_as_of(as_of_date)
     win = _region_window(window_days)
+    history_metadata = _day_history_metadata(as_of, win, "regional")
     try:
         key = cache.make_key("assortment", f"regions:{win}", as_of)
         cached = cache.get(key)
@@ -517,7 +595,13 @@ def assortment_regions(as_of_date: date | None = None, window_days: int | None =
             rows = _normalize_region_summary_rows(rows)
         rows = rows[:max(0, limit)]
         METRICS.record_request((time.time() - started) * 1000)
-        return {"as_of": as_of, "window_days": win, "count": len(rows), "regions": rows}
+        return {
+            "as_of": as_of,
+            **history_metadata,
+            "window_days": win,
+            "count": len(rows),
+            "regions": rows,
+        }
     except Exception as exc:  # noqa: BLE001
         METRICS.record_request((time.time() - started) * 1000, error=True)
         log.error("assortment_regions_failed", error=str(exc))
@@ -531,22 +615,27 @@ async def product_profile(
 ) -> dict:
     """Full per-SKU 360 profile (the product card). Internal-key gated."""
     started = time.time()
-    as_of = as_of_date.isoformat() if as_of_date else _today()
+    as_of = _resolve_as_of(as_of_date)
     try:
-        snapshot = await asyncio.to_thread(_product_snapshot, await _portfolio(as_of), product_id)
+        build = await _portfolio(as_of)
+        snapshot = await asyncio.to_thread(_product_snapshot, build, product_id, as_of)
         METRICS.record_request((time.time() - started) * 1000)
-        return {"as_of": as_of, **snapshot}
+        return {
+            "as_of": as_of,
+            **_history_response_fields(build),
+            **snapshot,
+        }
     except Exception as exc:  # noqa: BLE001
         METRICS.record_request((time.time() - started) * 1000, error=True)
         log.error("product_profile_failed", product_id=product_id, error=str(exc))
         raise HTTPException(status_code=500, detail="product_profile_failed") from exc
 
 
-def _product_snapshot(build: dict, product_id: int) -> dict:
+def _product_snapshot(build: dict, product_id: int, as_of: str) -> dict:
     """Existing product-profile fields without the top-level as-of wrapper."""
     product_id = exact.positive_int(product_id, "product_id")
     row = next((r for r in build["rows"] if int(r["product_id"]) == product_id), None)
-    meta = sig.product_meta([product_id]).get(product_id, {})
+    meta = sig.product_meta([product_id], as_of).get(product_id, {})
     if meta and exact.positive_int(
         meta.get("product_id"),
         "product_meta.product_id",
@@ -573,12 +662,21 @@ async def product_sales_analytics(
     explicitly discloses that no stock history exists.
     """
     started = time.time()
-    as_of = as_of_date.isoformat() if as_of_date else _today()
+    as_of = _resolve_as_of(as_of_date)
     try:
         build = await _portfolio(as_of)
-        snapshot = await asyncio.to_thread(_product_snapshot, build, product_id)
-        window_start = product_analytics.sales_window_start(as_of, months)
-        monthly_rows = await asyncio.to_thread(sig.monthly_product_sales, product_id, window_start, as_of)
+        snapshot = await asyncio.to_thread(_product_snapshot, build, product_id, as_of)
+        window = product_analytics.sales_history_window(
+            as_of,
+            months,
+            settings.source_history_start_date,
+        )
+        monthly_rows = await asyncio.to_thread(
+            sig.monthly_product_sales,
+            product_id,
+            window.requested_start.isoformat(),
+            as_of,
+        )
         response = product_analytics.build_product_analytics(
             product_id=product_id,
             as_of=as_of,
@@ -586,6 +684,7 @@ async def product_sales_analytics(
             model_version=str(build["model_version"]),
             snapshot=snapshot,
             monthly_rows=monthly_rows,
+            source_history_start=settings.source_history_start_date,
         )
         METRICS.record_request((time.time() - started) * 1000)
         return response
@@ -604,8 +703,9 @@ def product_regions(
 ) -> dict:
     """Per-product demand split by Client.RegionID. Internal-key gated."""
     started = time.time()
-    as_of = as_of_date.isoformat() if as_of_date else _today()
+    as_of = _resolve_as_of(as_of_date)
     win = _region_window(window_days)
+    history_metadata = _day_history_metadata(as_of, win, "regional")
     try:
         rows = _normalize_product_region_rows(
             sig.regional_product_sales(as_of, win, product_ids=[product_id])
@@ -623,6 +723,7 @@ def product_regions(
         METRICS.record_request((time.time() - started) * 1000)
         return {
             "as_of": as_of,
+            **history_metadata,
             "window_days": win,
             "product_id": product_id,
             "count": len(rows[:max(0, limit)]),
@@ -642,12 +743,17 @@ async def product_substitutes(
 ) -> dict:
     """Ranked interchangeable replacements (ProductAnalogue + OE fallback), in-stock + healthy first."""
     started = time.time()
-    as_of = as_of_date.isoformat() if as_of_date else _today()
+    as_of = _resolve_as_of(as_of_date)
     try:
-        lookup = {r["product_id"]: r for r in (await _portfolio(as_of))["rows"]}
+        build = await _portfolio(as_of)
+        lookup = {r["product_id"]: r for r in build["rows"]}
         result = await asyncio.to_thread(substitution.substitutes, product_id, lookup, limit)
         METRICS.record_request((time.time() - started) * 1000)
-        return {"as_of": as_of, **result}
+        return {
+            "as_of": as_of,
+            **_history_response_fields(build),
+            **result,
+        }
     except Exception as exc:  # noqa: BLE001
         METRICS.record_request((time.time() - started) * 1000, error=True)
         log.error("substitutes_failed", product_id=product_id, error=str(exc))
@@ -658,11 +764,12 @@ async def product_substitutes(
 async def assortment_margin(as_of_date: date | None = None, limit: int = 20) -> dict:
     """Margin leaders / laggards / below-cost alerts + portfolio margin summary. Internal-key gated."""
     started = time.time()
-    as_of = as_of_date.isoformat() if as_of_date else _today()
+    as_of = _resolve_as_of(as_of_date)
     try:
-        rows = (await _portfolio(as_of))["rows"]
+        build = await _portfolio(as_of)
+        rows = build["rows"]
         METRICS.record_request((time.time() - started) * 1000)
-        return {"as_of": as_of,
+        return {"as_of": as_of, **_history_response_fields(build),
                 "leaders": margin_returns.margin_leaders(rows, limit),
                 "laggards": margin_returns.margin_laggards(rows, limit),
                 "negative": margin_returns.negative_margin(rows),
@@ -678,12 +785,13 @@ async def assortment_returns(as_of_date: date | None = None, min_rate: float | N
                              limit: int = 20) -> dict:
     """High-return SKUs + returns summary. Internal-key gated."""
     started = time.time()
-    as_of = as_of_date.isoformat() if as_of_date else _today()
+    as_of = _resolve_as_of(as_of_date)
     rate = settings.returns_high_min_rate if min_rate is None else min_rate
     try:
-        rows = (await _portfolio(as_of))["rows"]
+        build = await _portfolio(as_of)
+        rows = build["rows"]
         METRICS.record_request((time.time() - started) * 1000)
-        return {"as_of": as_of, "min_rate": rate,
+        return {"as_of": as_of, **_history_response_fields(build), "min_rate": rate,
                 "high_returns": margin_returns.high_returns(rows, rate, limit),
                 "summary": margin_returns.margin_returns_summary(rows)}
     except Exception as exc:  # noqa: BLE001

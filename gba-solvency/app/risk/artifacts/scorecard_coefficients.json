@@ -1,5 +1,6 @@
 {
   "model": "woe_logistic_scorecard_current_state",
+  "source_history_start": "2025-01-01",
   "target": "label_sev180",
   "features": [
     "overdue_eur_91_180",
@@ -97,27 +98,24 @@
         0.0
       ],
       "woe": [
-        -4.0,
-        2.628018743624442
+        -3.871145881491572,
+        3.1973509225146195
       ]
     },
     "debt_growth_3mo": {
       "splits": [
-        1.041899,
         10.0
       ],
       "woe": [
-        -0.40229254572894746,
-        2.5786529771015663
+        0.0
       ]
     },
     "months_with_debt_last12": {
       "splits": [
-        0.0
+        1.0
       ],
       "woe": [
-        -2.2828074989468785,
-        2.9386298640735875
+        0.0
       ]
     },
     "new_debt_eur_3mo": {
@@ -127,12 +125,9 @@
       ]
     },
     "credit_limit_eur": {
-      "splits": [
-        0.0
-      ],
+      "splits": [],
       "woe": [
-        0.07249026746269796,
-        -1.1281667462598284
+        0.0
       ]
     },
     "limit_utilization": {
@@ -142,9 +137,16 @@
       ]
     },
     "grace_days": {
-      "splits": [],
+      "splits": [
+        0.0,
+        7.0,
+        10.0
+      ],
       "woe": [
-        0.0
+        -1.6018506226219411,
+        0.234714161563672,
+        1.1598168559859237,
+        1.9699113011548564
       ]
     },
     "has_credit_control": {
@@ -156,31 +158,47 @@
       ]
     },
     "turnover_eur_12mo": {
-      "splits": [],
+      "splits": [
+        641.75511,
+        3064.894385
+      ],
       "woe": [
-        0.0
+        0.06515476015960023,
+        -0.9342877613279961,
+        -0.9342877613279961
       ]
     },
     "order_count_12mo": {
-      "splits": [],
+      "splits": [
+        0.0,
+        9.0,
+        33.0
+      ],
       "woe": [
-        0.0
+        0.07703030760425886,
+        -0.0622812857427975,
+        -0.88888641322197,
+        -0.9487546625645565
       ]
     },
     "recency_days": {
       "splits": [
-        445.0
+        381.0,
+        474.0
       ],
       "woe": [
-        0.0
+        -0.696868896843298,
+        0.11871563300741075
       ]
     },
     "tenure_months": {
       "splits": [
-        14.0
+        14.0,
+        15.0
       ],
       "woe": [
-        0.0
+        0.07420578627260692,
+        -1.5050658691327827
       ]
     },
     "return_rate_12mo": {
@@ -199,25 +217,30 @@
       "current_debt_eur": 0.0,
       "total_debt_eur": 0.0,
       "max_overdue_days": 0.0,
-      "n_open_debt_lines": 1.4682854759521293,
-      "debt_growth_3mo": -0.2273280168311036,
-      "months_with_debt_last12": 0.2921115315798901,
+      "n_open_debt_lines": 1.5665115227398136,
+      "debt_growth_3mo": 0.0,
+      "months_with_debt_last12": 0.0,
       "new_debt_eur_3mo": 0.0,
-      "credit_limit_eur": 0.8013033116747581,
+      "credit_limit_eur": 0.0,
       "limit_utilization": 0.0,
-      "grace_days": 0.0,
+      "grace_days": 0.532435948822708,
       "has_credit_control": 0.0,
-      "turnover_eur_12mo": 0.0,
-      "order_count_12mo": 0.0,
-      "recency_days": 0.0,
-      "tenure_months": 0.0,
+      "turnover_eur_12mo": 0.8351538874231125,
+      "order_count_12mo": 0.8809270193284152,
+      "recency_days": 1.7676545972263444,
+      "tenure_months": 1.8693173383362836,
       "return_rate_12mo": 0.0
     },
-    "intercept": -1.6027097305393296
+    "intercept": -2.2732891806441033
   },
   "calibration": {
-    "a": 1.0885298563346388,
-    "b": -3.2371675081813445
+    "a": 0.8164069430009224,
+    "b": -4.48881831673985
+  },
+  "current_state_policy": {
+    "sev180_threshold_eur": 100.0,
+    "minimum_pd": 0.16,
+    "effect": "current open SEV180 exposure cannot be rated above D"
   },
   "score_mapping": {
     "type": "log_odds_points",
@@ -231,7 +254,57 @@
     "B": 0.05,
     "C": 0.15
   },
-  "trained_at": "2026-06-26 12:31:28",
-  "n_rows": 2951,
-  "n_pos": 138
+  "trained_at": "2026-07-25T13:16:04+00:00",
+  "n_rows": 4180,
+  "n_pos": 24,
+  "training_lineage": {
+    "lineage_schema_version": 1,
+    "artifact_role": "current_state_scorecard",
+    "training_run_id": "current-20260725T131604+0000-bee58752534e",
+    "trained_at": "2026-07-25T13:16:04+00:00",
+    "source_history_start": "2025-01-01",
+    "training_code": "scripts/train_current_state.py",
+    "dataset": {
+      "lineage_schema_version": 1,
+      "dataset_role": "current_state_training",
+      "builder": "scripts/build_risk_dataset.py",
+      "built_at": "2026-07-25T13:05:48+00:00",
+      "source_history_start": "2025-01-01",
+      "transactional_history_policy": "clamped_to_source_history_start",
+      "current_state_exceptions": [
+        "open_debt_balances_as_of_feature_date",
+        "current_credit_terms_as_of_feature_date"
+      ],
+      "window_months": 12,
+      "date_coverage": [
+        {
+          "feature_date": "2026-04-26",
+          "label_date": "2026-07-25",
+          "requested_start": "2025-04-26",
+          "effective_start": "2025-04-26",
+          "history_complete": true
+        }
+      ],
+      "rows": 4180,
+      "positives": 24,
+      "unique_clients": 4180,
+      "unique_positive_clients": 24,
+      "target_column": "label_sev180",
+      "parquet_sha256": "bee58752534eaf4fe227e41f0bf5ad6e6d458e57d63cbb1d8ae05d57f3503f5a"
+    },
+    "validation": {
+      "gate": "current_state_production_v1",
+      "passed": true,
+      "minimum_rows": 1000,
+      "observed_rows": 4180,
+      "minimum_positives": 20,
+      "observed_positives": 24,
+      "minimum_oof_auc": 0.9,
+      "oof_auc": 0.9861495428296438,
+      "folds": 5,
+      "sev180_policy_passed": true,
+      "sev180_policy_rows": 24
+    },
+    "model_payload_sha256": "1416a10586e3e04efe548a925cbc6a3b168846f84c4547c94e7008ef4551b82e"
+  }
 }

@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import json
 import sys
-import time
 from pathlib import Path
 
 import numpy as np
@@ -33,6 +32,22 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import brier_score_loss, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
+
+from app.core.config import get_settings
+from app.risk.lineage import (
+    CURRENT_ARTIFACT_ROLE,
+    CURRENT_DATASET_ROLE,
+    CURRENT_MIN_OOF_AUC,
+    CURRENT_MIN_POSITIVES,
+    CURRENT_MIN_ROWS,
+    CURRENT_SEV180_MIN_EUR,
+    CURRENT_SEV180_PD_FLOOR,
+    LineageError,
+    attach_training_lineage,
+    utc_now,
+    validate_dataset_manifest,
+    write_json_atomic,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 ART = ROOT / "app" / "risk" / "artifacts"
@@ -310,10 +325,23 @@ def band_from_pd(p: float) -> str:
 
 
 def main() -> None:
-    df = pd.read_parquet(DATA / "risk_dataset_v3.parquet")
+    dataset_path = DATA / "risk_dataset_v3.parquet"
+    df = pd.read_parquet(dataset_path)
+    dataset_lineage = validate_dataset_manifest(
+        dataset_path,
+        df,
+        dataset_role=CURRENT_DATASET_ROLE,
+        target_column="label_sev180",
+    )
     y = df["label_sev180"].values.astype(int)
     n_pos = int(y.sum())
     print(f"rows={len(df)} pos={n_pos} ({n_pos/len(df):.2%})")
+    if len(df) < CURRENT_MIN_ROWS or n_pos < CURRENT_MIN_POSITIVES:
+        raise LineageError(
+            "current-state event support gate failed: "
+            f"rows={len(df)} (minimum {CURRENT_MIN_ROWS}), "
+            f"positives={n_pos} (minimum {CURRENT_MIN_POSITIVES})"
+        )
 
     X_all = df[TAUTOLOGICAL + PRIMARY_FEATURES].copy()
     X_primary = df[PRIMARY_FEATURES].copy()
@@ -323,7 +351,9 @@ def main() -> None:
     RISK_DIRECTION.setdefault("pct_debt_180plus", "up")
 
     report: dict = {
+        "source_history_start": get_settings().source_history_start_date.isoformat(),
         "dataset": {"rows": len(df), "positives": n_pos, "prevalence": float(y.mean())},
+        "dataset_lineage": dataset_lineage,
         "primary_features": PRIMARY_FEATURES,
         "tautological_excluded": TAUTOLOGICAL,
     }
@@ -382,6 +412,24 @@ def main() -> None:
         "ablation_auc_delta_woe": round(woe_with["auc_mean"] - woe_primary["auc_mean"], 4),
         "ablation_auc_delta_gbm": round(gbm_with["auc_mean"] - gbm_primary["auc_mean"], 4),
     }
+    oof_auc = float(woe_primary["oof_auc"])
+    validation = {
+        "gate": "current_state_production_v1",
+        "passed": oof_auc >= CURRENT_MIN_OOF_AUC,
+        "minimum_rows": CURRENT_MIN_ROWS,
+        "observed_rows": int(len(df)),
+        "minimum_positives": CURRENT_MIN_POSITIVES,
+        "observed_positives": n_pos,
+        "minimum_oof_auc": CURRENT_MIN_OOF_AUC,
+        "oof_auc": oof_auc,
+        "folds": N_FOLDS,
+    }
+    report["production_gate"] = validation
+    if not validation["passed"]:
+        raise LineageError(
+            f"current-state validation gate failed: OOF AUC {oof_auc:.4f} "
+            f"< {CURRENT_MIN_OOF_AUC:.2f}"
+        )
 
     # ---- FINAL FIT (PRIMARY) -----------------------------------------------------------------
     binmap = fit_binmap(X_primary, y, PRIMARY_FEATURES)
@@ -393,12 +441,26 @@ def main() -> None:
     calib = LogisticRegression(C=1e6, max_iter=2000, solver="lbfgs")
     calib.fit(lin.reshape(-1, 1), y)
     pd_full = calib.predict_proba(lin.reshape(-1, 1))[:, 1]
-    score_full = pd_to_score(pd_full)
+    severe_current = (
+        df["overdue_eur_180plus"].to_numpy(dtype=float) >= CURRENT_SEV180_MIN_EUR
+    )
+    pd_serving = np.where(
+        severe_current,
+        np.maximum(pd_full, CURRENT_SEV180_PD_FLOOR),
+        pd_full,
+    )
+    score_full = pd_to_score(pd_serving)
+    validation["sev180_policy_passed"] = bool(
+        np.all(pd_serving[severe_current] >= CURRENT_SEV180_PD_FLOOR)
+    )
+    validation["sev180_policy_rows"] = int(severe_current.sum())
+    if not validation["sev180_policy_passed"]:
+        raise LineageError("current-state SEV180 policy validation failed")
 
     df_out = df[["client_id"]].copy()
-    df_out["pd"] = pd_full
+    df_out["pd"] = pd_serving
     df_out["score"] = score_full
-    df_out["band"] = [band_from_pd(p) for p in pd_full]
+    df_out["band"] = [band_from_pd(p) for p in pd_serving]
     df_out["label"] = y
     df_out.to_parquet(DATA / "current_state_scores.parquet")
 
@@ -421,10 +483,14 @@ def main() -> None:
                                               l2_regularization=1.0, class_weight="balanced",
                                               random_state=RANDOM_STATE)
     gbm_final.fit(X_primary, y)
-    joblib.dump({"model": gbm_final, "features": PRIMARY_FEATURES}, ART / "gbm_model.joblib")
-
-    scorecard = {
+    trained_at = utc_now()
+    training_run_id = (
+        f"current-{trained_at.replace(':', '').replace('-', '')}-"
+        f"{dataset_lineage['parquet_sha256'][:12]}"
+    )
+    scorecard_payload = {
         "model": "woe_logistic_scorecard_current_state",
+        "source_history_start": get_settings().source_history_start_date.isoformat(),
         "target": "label_sev180",
         "features": PRIMARY_FEATURES,
         "tautological_excluded": TAUTOLOGICAL,
@@ -438,13 +504,38 @@ def main() -> None:
             "intercept": float(final_lr.intercept_[0]),
         },
         "calibration": {"a": float(calib.coef_[0][0]), "b": float(calib.intercept_[0])},
+        "current_state_policy": {
+            "sev180_threshold_eur": CURRENT_SEV180_MIN_EUR,
+            "minimum_pd": CURRENT_SEV180_PD_FLOOR,
+            "effect": "current open SEV180 exposure cannot be rated above D",
+        },
         "score_mapping": {"type": "log_odds_points", "pdo": 20.0, "anchor_offset": 600.0,
                           "score_range_lo": 400.0, "score_range_hi": 800.0},
         "bands": {"A": 0.02, "B": 0.05, "C": 0.15},
-        "trained_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "trained_at": trained_at,
         "n_rows": len(df), "n_pos": n_pos,
     }
-    (ART / "scorecard_coefficients.json").write_text(json.dumps(scorecard, indent=2))
+    scorecard = attach_training_lineage(
+        scorecard_payload,
+        artifact_role=CURRENT_ARTIFACT_ROLE,
+        dataset_manifest=dataset_lineage,
+        validation=validation,
+        training_run_id=training_run_id,
+        trained_at=trained_at,
+    )
+    report["training_lineage"] = scorecard["training_lineage"]
+
+    gbm_tmp = ART / "gbm_model.joblib.tmp"
+    joblib.dump(
+        {
+            "model": gbm_final,
+            "features": PRIMARY_FEATURES,
+            "training_lineage": scorecard["training_lineage"],
+        },
+        gbm_tmp,
+    )
+    gbm_tmp.replace(ART / "gbm_model.joblib")
+    write_json_atomic(ART / "scorecard_coefficients.json", scorecard)
 
     try:
         import matplotlib
@@ -465,7 +556,7 @@ def main() -> None:
     except Exception as e:  # noqa: BLE001
         report["calibration_plot_error"] = str(e)
 
-    (ART / "cv_report.json").write_text(json.dumps(report, indent=2, default=float))
+    write_json_atomic(ART / "cv_report.json", report)
     print("\nartifacts written to", ART)
     print(json.dumps(report["cv"], indent=2, default=float))
     print("bands:", json.dumps(band_stats, indent=2, default=float))

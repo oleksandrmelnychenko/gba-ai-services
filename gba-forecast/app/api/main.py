@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.core.config import get_settings
+from app.core.history import resolve_history_window
 from app.core.logging import get_logger
 from app.core.metrics import METRICS
 from app.data import cache
@@ -81,6 +82,28 @@ def _today(now: datetime | None = None) -> str:
     return current.astimezone(KYIV).date().isoformat()
 
 
+def _history_metadata(as_of: date | str) -> dict[str, str | bool]:
+    """Stable public metadata for the effective factual history window."""
+    as_of_date = date.fromisoformat(as_of) if isinstance(as_of, str) else as_of
+    try:
+        window = resolve_history_window(
+            as_of_date,
+            settings.history_months,
+            settings.source_history_start_date,
+        )
+    except ValueError:
+        return {
+            "source_history_start": settings.source_history_start_date.isoformat(),
+            "effective_start": settings.source_history_start_date.isoformat(),
+            "history_complete": False,
+        }
+    return {
+        "source_history_start": window.source_history_start.isoformat(),
+        "effective_start": window.effective_start.isoformat(),
+        "history_complete": window.history_complete,
+    }
+
+
 @app.get("/health")
 def health() -> dict:
     return _health_snapshot()
@@ -108,7 +131,11 @@ def _health_snapshot(now: datetime | None = None) -> dict[str, Any]:
     now = now or datetime.now(UTC)
     _, db_ok = _database_health()
     cache_ok = cache.health()
-    data = _sales_data_health(now) if db_ok else _empty_sales_data_health("database_unavailable")
+    data = (
+        _sales_data_health(now)
+        if db_ok
+        else _empty_sales_data_health("database_unavailable", now.date())
+    )
     source_history_start = settings.source_history_start_date.isoformat()
     source_history_contract_ready = (
         source_history_start == _EXPECTED_SOURCE_HISTORY_START
@@ -134,11 +161,12 @@ def _health_snapshot(now: datetime | None = None) -> dict[str, Any]:
 
 def _sales_data_health(now: datetime) -> dict[str, Any]:
     as_of = datetime.combine(now.date(), datetime.min.time(), tzinfo=UTC)
+    history_metadata = _history_metadata(now.date())
     try:
         snapshot = sig.sales_source_status(as_of, settings.history_months)
     except Exception as exc:  # noqa: BLE001
         log.warning("sales_source_health_failed", error=str(exc))
-        return _empty_sales_data_health("source_query_failed")
+        return _empty_sales_data_health("source_query_failed", now.date())
 
     latest_raw = snapshot.get("latest_sale_at")
     latest = _as_utc(latest_raw)
@@ -187,6 +215,7 @@ def _sales_data_health(now: datetime) -> dict[str, Any]:
         "source_age_hours": round(age_hours, 2) if age_hours is not None else None,
         "canonical_row_count": snapshot["canonical_row_count"],
         "history_window_months": settings.history_months,
+        **history_metadata,
         "history_row_count": snapshot["history_row_count"],
         "history_product_count": snapshot["history_product_count"],
         "history_client_count": snapshot["history_client_count"],
@@ -197,7 +226,8 @@ def _sales_data_health(now: datetime) -> dict[str, Any]:
     }
 
 
-def _empty_sales_data_health(reason: str) -> dict[str, Any]:
+def _empty_sales_data_health(reason: str, as_of: date | None = None) -> dict[str, Any]:
+    history_metadata = _history_metadata(as_of or datetime.now(UTC).date())
     return {
         "source": "dbo.OrderItem.IsValidForCurrentSale + dbo.Order.Created",
         "source_ready": False,
@@ -210,6 +240,7 @@ def _empty_sales_data_health(reason: str) -> dict[str, Any]:
         "source_age_hours": None,
         "canonical_row_count": 0,
         "history_window_months": settings.history_months,
+        **history_metadata,
         "history_row_count": 0,
         "history_product_count": 0,
         "history_client_count": 0,
@@ -253,11 +284,17 @@ def forecast_sales(
     started = time.time()
     horizon = _resolve_horizon(months)
     current_as_of = _today()
+    current_as_of_date = date.fromisoformat(current_as_of)
     requested_as_of = as_of_date.isoformat() if as_of_date is not None else None
+    if as_of_date is not None and as_of_date < settings.source_history_start_date:
+        raise HTTPException(status_code=422, detail="as_of_date_before_source_history_start")
+    if current_as_of_date < settings.source_history_start_date:
+        raise HTTPException(status_code=422, detail="as_of_date_before_source_history_start")
     if requested_as_of is not None and requested_as_of != current_as_of:
         raise HTTPException(status_code=422, detail="historical_as_of_not_supported")
     as_of_str = current_as_of
-    as_of = datetime.fromisoformat(as_of_str).date()
+    as_of = current_as_of_date
+    history_metadata = _history_metadata(as_of)
     client_id: int | None = None
     product_id: int | None = None
     try:
@@ -368,6 +405,7 @@ def forecast_sales(
             "currency": "EUR",
             "model_version": settings.model_version,
             "source_fingerprint": source_fingerprint,
+            **history_metadata,
             "requested": {
                 "client_net_id": _uuid_text(client_net_id),
                 "product_net_id": _uuid_text(product_net_id),
@@ -427,7 +465,15 @@ def forecast_sales(
 
 
 def _forecast_with_history(rows: list[dict], as_of: date, horizon: int) -> tuple[list[dict], dict[str, Any]]:
-    summary = sig.history_summary(rows, max_months=settings.history_months)
+    labels = fc.history_labels(
+        as_of,
+        settings.history_months,
+        settings.source_history_start_date,
+    )
+    allowed_months = set(labels)
+    if any(row.get("ym") and str(row["ym"]) not in allowed_months for row in rows):
+        raise ValueError("sales history contains a month outside the effective source window")
+    summary = sig.history_summary(rows, max_months=len(labels))
     points = fc.forecast_points(sig.to_series(rows), as_of, settings, horizon)
     sufficient = summary["non_zero_month_count"] >= settings.min_history_months
     status = "sufficient" if sufficient else "insufficient_history"
@@ -505,6 +551,7 @@ def _sales_cache_key(
     client_part = str(client_net_id).lower() if client_net_id else "none"
     product_part = str(product_net_id).lower() if product_net_id else "none"
     entity = f"{client_part}:{product_part}"
+    history_metadata = _history_metadata(as_of)
     return cache.make_key(
         "sales",
         entity,
@@ -513,6 +560,9 @@ def _sales_cache_key(
         settings.forecast_method,
         settings.history_months,
         settings.min_history_months,
+        history_metadata["source_history_start"],
+        history_metadata["effective_start"],
+        history_metadata["history_complete"],
         client_id or "unknown-client",
         product_id or "unknown-product",
         synthetic_id,
@@ -544,6 +594,7 @@ def _is_valid_cached_response(
     meta = payload.get("meta")
     if not isinstance(meta, dict):
         return False
+    history_metadata = _history_metadata(as_of)
     if (
         meta.get("as_of") != as_of
         or meta.get("requested_as_of") != requested_as_of
@@ -551,6 +602,9 @@ def _is_valid_cached_response(
         or meta.get("currency") != "EUR"
         or meta.get("model_version") != settings.model_version
         or meta.get("source_fingerprint") != source_fingerprint
+        or meta.get("source_history_start") != history_metadata["source_history_start"]
+        or meta.get("effective_start") != history_metadata["effective_start"]
+        or meta.get("history_complete") is not history_metadata["history_complete"]
     ):
         return False
     if meta.get("status") not in {
@@ -608,9 +662,19 @@ def _is_valid_cached_response(
     if set(history) != set(series_keys):
         return False
 
+    effective_month_count = len(
+        fc.history_labels(
+            date.fromisoformat(as_of),
+            settings.history_months,
+            settings.source_history_start_date,
+        )
+    )
     for key in series_keys:
         history_item = history[key]
-        if not isinstance(history_item, dict) or not _valid_history_item(history_item):
+        if not isinstance(history_item, dict) or not _valid_history_item(
+            history_item,
+            max_months=effective_month_count,
+        ):
             return False
         points = payload[key]
         if history_item["status"] == "sufficient":
@@ -648,7 +712,7 @@ def _valid_resolved_identity(
     return True
 
 
-def _valid_history_item(item: dict[str, Any]) -> bool:
+def _valid_history_item(item: dict[str, Any], *, max_months: int | None = None) -> bool:
     if set(item) != {
         "status",
         "month_count",
@@ -667,11 +731,12 @@ def _valid_history_item(item: dict[str, Any]) -> bool:
         return False
     month_count = item["month_count"]
     non_zero = item["non_zero_month_count"]
+    month_limit = settings.history_months if max_months is None else max_months
     if (
         not isinstance(month_count, int)
         or isinstance(month_count, bool)
         or month_count < 0
-        or month_count > settings.history_months
+        or month_count > month_limit
         or not isinstance(non_zero, int)
         or isinstance(non_zero, bool)
         or not 0 <= non_zero <= month_count

@@ -11,9 +11,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    # Shared AI-fleet source contract. All business history is tracked from this date.
-    source_history_start_date: date = date(2025, 1, 1)
-
     # Database — read-only login required
     db_host: str = "127.0.0.1"
     db_port: int = 1433
@@ -56,7 +53,11 @@ class Settings(BaseSettings):
     max_source_lag_days: int = 31
     # Margin floor: recommended price never below unit_cost_eur*(1+target_margin_pct/100).
     target_margin_pct: float = 12.0
-    # Peer band + cost lots are sampled over a trailing window by Sale.Created.
+    # The restored factual sales source starts here. Behavioral queries must never infer data
+    # before this boundary; current engine prices, current discounts and on-hand stock remain
+    # explicit point-in-time snapshots and are intentionally not date-clamped.
+    source_history_start_date: date = date(2025, 1, 1)
+    # Peer band and elasticity signals are sampled over a trailing window by Sale.Created.
     trailing_window_months: int = 12
 
     # FX snapshot date — GetExchangedToEuroValue revalues at call time, so a run MUST pin a

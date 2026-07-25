@@ -129,6 +129,30 @@ class PriceRecommendation(BaseModel):
         description="cost*e/(e-1) markup-rule price (e>1); SECONDARY/advisory only. recommended_"
         "price stays the A+B value -- the elastic price is held until validated to win.",
     )
+    source_history_start: str | None = Field(
+        default=None,
+        description="first factual Sale.Created date available to behavioral pricing signals",
+    )
+    requested_start: str | None = Field(
+        default=None,
+        description="unclamped start of the configured trailing behavioral window",
+    )
+    effective_start: str | None = Field(
+        default=None,
+        description="actual behavioral window start after the factual-source floor is applied",
+    )
+    history_complete: bool | None = Field(
+        default=None,
+        description="true when the full requested trailing window exists in the source",
+    )
+    history_fingerprint: str | None = Field(
+        default=None,
+        description="stable namespace for the factual-history contract",
+    )
+    model_fingerprint: str | None = Field(
+        default=None,
+        description="serving model namespace including version, window and history floor",
+    )
     as_of_date: str | None = None
     model_version: str = "pricing-ab-v2"
 

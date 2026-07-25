@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from app.domain.models import (
+    MODEL_VERSION,
     DemandForecast,
     InventoryPosition,
     ProducerPurchasePlan,
@@ -53,7 +54,11 @@ def test_build_cart_plan_flattens_sorts_and_filters(monkeypatch):
     assert [i.product_id for i in plan.items] == [4, 3, 1]
     assert all(i.suggested_qty > 0 for i in plan.items)
     assert plan.as_of_date == "2026-06-15"
-    assert plan.model_version == "procure-hist120-v1"
+    assert plan.model_version == MODEL_VERSION
+    assert plan.source_history_start == "2025-01-01"
+    assert plan.effective_start == "2026-02-15"
+    assert plan.effective_history_days == 120
+    assert plan.history_complete is True
 
 
 def test_build_cart_plan_budget_knapsack(monkeypatch):

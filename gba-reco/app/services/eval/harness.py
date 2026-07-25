@@ -24,6 +24,7 @@ import argparse
 from dataclasses import dataclass, field
 
 from app.core.config import get_settings
+from app.core.history import require_supported_as_of, source_history_start_iso
 from app.data import sales_repository
 from app.data.db import query
 from app.services.recommendations import recommender
@@ -87,7 +88,8 @@ def build_cases(min_orders: int = 2, limit: int | None = None) -> list[EvalCase]
                    ROW_NUMBER() OVER (PARTITION BY ca.ClientID ORDER BY o.Created DESC, o.ID DESC) AS rn
             FROM dbo.[Order] o
             JOIN dbo.ClientAgreement ca ON ca.ID = o.ClientAgreementID
-            WHERE EXISTS (
+            WHERE o.Created >= :history_start
+              AND EXISTS (
                 SELECT 1 FROM dbo.OrderItem oi
                 WHERE oi.OrderID = o.ID AND oi.IsValidForCurrentSale = 1
             )
@@ -101,7 +103,10 @@ def build_cases(min_orders: int = 2, limit: int | None = None) -> list[EvalCase]
         WHERE co.rn = 1 AND c.norders >= :minord
         ORDER BY co.cid
         """,
-        {"minord": min_orders},
+        {
+            "minord": min_orders,
+            "history_start": source_history_start_iso(),
+        },
     )
     cases: list[EvalCase] = []
     for row in last_orders:
@@ -214,6 +219,7 @@ def compare_fold(fold_as_of: str, k: int = 10, min_orders: int = 2) -> dict[str,
     from app.services.eval import baselines
     from app.services.recommendations import als, copurchase
 
+    require_supported_as_of(fold_as_of)
     all_cases = build_cases(min_orders=min_orders)
     cases = [c for c in all_cases if c.as_of > fold_as_of]
     if not cases:

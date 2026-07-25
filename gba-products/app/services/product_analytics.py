@@ -11,6 +11,12 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from app.core import exact_numbers as exact
+from app.core.config import get_settings
+from app.core.history import (
+    HistoryWindow,
+    history_contract_fingerprint,
+    month_history_window,
+)
 from app.domain.models import (
     MonthlySalesPoint,
     ProductAnalyticsDataQuality,
@@ -49,11 +55,25 @@ def _order_count(value: Any) -> int:
     return int(number)
 
 
-def sales_window_start(as_of: str, months: int) -> str:
-    """First calendar day included in a trailing dense monthly window."""
+def sales_history_window(
+    as_of: str,
+    months: int,
+    source_history_start: date | None = None,
+) -> HistoryWindow:
+    """Resolve the requested calendar-month window against factual source history."""
     if not 1 <= months <= 24:
         raise ValueError("months must be between 1 and 24")
-    return _first_of_month(month_labels(as_of, months)[0]).isoformat()
+    floor = source_history_start or get_settings().source_history_start_date
+    return month_history_window(as_of, months, floor)
+
+
+def sales_window_start(
+    as_of: str,
+    months: int,
+    source_history_start: date | None = None,
+) -> str:
+    """First factual calendar day included in a trailing dense monthly window."""
+    return sales_history_window(as_of, months, source_history_start).effective_start.isoformat()
 
 
 def build_product_analytics(
@@ -64,6 +84,7 @@ def build_product_analytics(
     model_version: str,
     snapshot: dict[str, Any],
     monthly_rows: list[dict[str, Any]],
+    source_history_start: date | None = None,
 ) -> ProductAnalyticsResponse:
     """Build a validated dense analytics response from sparse repository aggregates."""
     if product_id <= 0:
@@ -71,8 +92,9 @@ def build_product_analytics(
     if not 1 <= months <= 24:
         raise ValueError("months must be between 1 and 24")
 
-    as_of_date = date.fromisoformat(as_of)
-    labels = month_labels(as_of, months)
+    window = sales_history_window(as_of, months, source_history_start)
+    as_of_date = window.as_of
+    labels = month_labels(as_of, months, window.source_history_start)
     buckets = {
         label: {"units": Decimal(0), "order_count": 0, "revenue_eur": Decimal(0)}
         for label in labels
@@ -131,12 +153,27 @@ def build_product_analytics(
         product_id=product_id,
         as_of=as_of,
         model_version=model_version,
+        source_history_start=window.source_history_start,
+        requested_start=window.requested_start,
+        effective_start=window.effective_start,
+        history_complete=window.history_complete,
+        history_fingerprint=history_contract_fingerprint(window.source_history_start),
         window=ProductAnalyticsWindow(
             months=months,
-            start=sales_window_start(as_of, months),
+            source_history_start=window.source_history_start,
+            requested_start=window.requested_start,
+            effective_start=window.effective_start,
+            start=window.effective_start,
             end_exclusive=as_of,
+            history_complete=window.history_complete,
+            effective_days=window.effective_days,
         ),
         snapshot=snapshot,
         sales_series=series,
-        data_quality=ProductAnalyticsDataQuality(),
+        data_quality=ProductAnalyticsDataQuality(
+            source_history_start=window.source_history_start,
+            requested_start=window.requested_start,
+            effective_start=window.effective_start,
+            history_complete=window.history_complete,
+        ),
     )

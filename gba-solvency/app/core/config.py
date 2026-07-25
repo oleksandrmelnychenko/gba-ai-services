@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     # Solvency model
     model_version: str = "creditscore-v3"
     window_months: int = 12
+    # Earliest complete transactional history imported from 1C. Historical features must never
+    # infer behavior from rows before this boundary; current master data and open balances remain
+    # point-in-time state and are intentionally not discarded by it.
+    source_history_start_date: date = date(2025, 1, 1)
     # A healthy service must see a current canonical sales spine, not just an open DB socket.
     max_source_lag_days: int = 31
 

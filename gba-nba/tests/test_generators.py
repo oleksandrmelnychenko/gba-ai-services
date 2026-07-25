@@ -47,7 +47,11 @@ def test_reorder_due_bundles_per_client(monkeypatch):
     ]
     monkeypatch.setattr(reorder_due.sig, "reorder_candidates_for_manager",
                         lambda mid, as_of, min_cycle_days, max_overdue_mult: rows)
-    monkeypatch.setattr(reorder_due.sig, "ubiquitous_product_ids", lambda pct: frozenset())
+    monkeypatch.setattr(
+        reorder_due.sig,
+        "ubiquitous_product_ids",
+        lambda pct, as_of: frozenset(),
+    )
     monkeypatch.setattr(reorder_due.sig, "contacts_for_clients",
                         lambda ids: {10: {"name": "Acme", "phone": "+1"}})
     monkeypatch.setattr(reorder_due.sig, "client_features",

@@ -5,7 +5,7 @@ from decimal import Decimal
 from fastapi.testclient import TestClient
 
 from app.api import main
-from app.services import product_analytics
+from app.services import history_policy, product_analytics
 
 client = TestClient(main.app)
 _headers = {"X-Internal-Api-Key": main.settings.internal_api_key} if main.settings.internal_api_key else {}
@@ -13,10 +13,15 @@ _headers = {"X-Internal-Api-Key": main.settings.internal_api_key} if main.settin
 
 def _stub_profile(monkeypatch, *, rows: list[dict] | None = None, meta: dict | None = None) -> None:
     async def _fake_portfolio(as_of):
-        return {"as_of": as_of, "model_version": "products-test-v1", "rows": rows or []}
+        return {
+            "as_of": as_of,
+            "model_version": "products-test-v1",
+            **history_policy.portfolio_metadata(as_of, main.settings),
+            "rows": rows or [],
+        }
 
     monkeypatch.setattr(main, "_portfolio", _fake_portfolio)
-    monkeypatch.setattr(main.sig, "product_meta", lambda product_ids: meta or {})
+    monkeypatch.setattr(main.sig, "product_meta", lambda product_ids, as_of: meta or {})
 
 
 def test_route_returns_dense_sales_series_and_marks_partial_current_month(monkeypatch):
@@ -60,10 +65,19 @@ def test_route_returns_dense_sales_series_and_marks_partial_current_month(monkey
     assert body["product_id"] == 42
     assert body["as_of"] == "2026-07-10"
     assert body["model_version"] == "products-test-v1"
+    assert body["source_history_start"] == "2025-01-01"
+    assert body["requested_start"] == "2026-05-01"
+    assert body["effective_start"] == "2026-05-01"
+    assert body["history_complete"] is True
     assert body["window"] == {
         "months": 3,
+        "source_history_start": "2025-01-01",
+        "requested_start": "2026-05-01",
+        "effective_start": "2026-05-01",
         "start": "2026-05-01",
         "end_exclusive": "2026-07-10",
+        "history_complete": True,
+        "effective_days": 70,
         "includes_partial_current_month": True,
     }
     assert body["snapshot"]["found"] is True
@@ -103,6 +117,8 @@ def test_route_returns_dense_sales_series_and_marks_partial_current_month(monkey
     assert body["data_quality"]["stock_is_current"] is True
     assert body["data_quality"]["stock_history_available"] is False
     assert body["data_quality"]["sales_date_field"] == "Order.Created"
+    assert body["data_quality"]["effective_start"] == "2026-05-01"
+    assert body["data_quality"]["zero_fill_begins_at"] == "effective_start"
 
 
 def test_route_returns_zero_months_for_product_without_sales(monkeypatch):
@@ -143,9 +159,30 @@ def test_route_validates_date_product_id_and_month_bounds_before_query(monkeypat
         ("/product/42/analytics", {"months": "twelve"}),
         ("/product/not-an-id/analytics", {}),
         ("/product/42/analytics", {"as_of_date": "not-a-date"}),
+        ("/product/42/analytics", {"as_of_date": "2024-12-31"}),
     ]
     for path, params in requests:
         assert client.get(path, params=params, headers=_headers).status_code == 422
+
+
+def test_route_does_not_zero_fill_months_before_source_history(monkeypatch):
+    _stub_profile(monkeypatch)
+    monkeypatch.setattr(main.sig, "monthly_product_sales", lambda *args: [])
+
+    response = client.get(
+        "/product/42/analytics",
+        params={"as_of_date": "2026-07-10", "months": 24},
+        headers=_headers,
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["requested_start"] == "2024-08-01"
+    assert body["effective_start"] == "2025-01-01"
+    assert body["history_complete"] is False
+    assert body["sales_series"][0]["month"] == "2025-01"
+    assert body["sales_series"][-1]["month"] == "2026-07"
+    assert len(body["sales_series"]) == 19
 
 
 def test_malformed_repository_bucket_is_reported_as_generic_endpoint_failure(monkeypatch):

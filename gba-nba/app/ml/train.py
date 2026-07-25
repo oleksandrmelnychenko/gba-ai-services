@@ -24,6 +24,8 @@ from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+from app.core import history
+
 HERE = Path(__file__).resolve().parent
 ART = HERE / "artifacts"
 ART.mkdir(parents=True, exist_ok=True)
@@ -47,6 +49,7 @@ FEATURES = SHARED + SIGNALS + ONEHOT
 OOT_TRAIN_MAX = "2026-01-01"   # train vintages <= this
 OOT_TEST_LO = "2026-02-01"
 OOT_TEST_HI = "2026-04-01"
+TRAINING_WINDOW_DAYS = 365
 
 
 def ks(y_true: np.ndarray, p: np.ndarray) -> float:
@@ -130,6 +133,40 @@ def expected_value_row(r: pd.Series) -> float:
     if tt == "churn_winback":
         return monetary
     return monetary
+
+
+def validate_dataset_history(df: pd.DataFrame) -> list[str]:
+    """Fail closed unless every training row proves the active source-history contract."""
+    required = {
+        "vintage",
+        "source_history_start",
+        "effective_start",
+        "history_complete",
+    }
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise ValueError(f"dataset history metadata missing: {', '.join(missing)}")
+    if df.empty:
+        raise ValueError("dataset is empty")
+
+    source_start = history.source_history_start().isoformat()
+    if set(df["source_history_start"].astype(str)) != {source_start}:
+        raise ValueError("dataset source_history_start is incompatible")
+    complete = df["history_complete"].map(
+        lambda value: isinstance(value, (bool, np.bool_)) and bool(value)
+    )
+    if not complete.all():
+        raise ValueError("dataset contains partial-history rows")
+
+    vintages = sorted(set(df["vintage"].astype(str)))
+    for vintage in vintages:
+        coverage = history.training_window(vintage, TRAINING_WINDOW_DAYS)
+        effective_values = set(
+            df.loc[df["vintage"].astype(str) == vintage, "effective_start"].astype(str)
+        )
+        if effective_values != {coverage.effective_start.isoformat()}:
+            raise ValueError(f"dataset effective_start mismatch for {vintage}")
+    return vintages
 
 
 def _fmt_metric(value: float | int | None, digits: int = 3) -> str:
@@ -219,6 +256,9 @@ Current artifact metrics:
 - Base rate: {float(report["base_rate"]) * 100:.1f}%.
 - Features: {len(report["features"])} shared/type-signal/one-hot columns.
 - Production model: calibrated {prod.upper()}.
+- Source history starts at `{report["source_history_start"]}`; every training vintage has a
+  complete {int(report["training_window_days"])}-day feature window.
+- Training vintages: `{report["training_vintages"][0]}..{report["training_vintages"][-1]}`.
 - Temporal OOT split: train vintages `<= {OOT_TRAIN_MAX}`, test `{OOT_TEST_LO}..{OOT_TEST_HI}`.
 
 ## Model
@@ -299,13 +339,21 @@ Operational contract:
 
 def main() -> None:
     df = pd.read_parquet(DATA)
+    training_vintages = validate_dataset_history(df)
     df["vd"] = pd.to_datetime(df["vintage"])
     X = df[FEATURES].astype(float)
     y = df["label"].to_numpy().astype(int)
     groups = df["client_id"].to_numpy()
 
-    report: dict = {"n_rows": int(len(df)), "n_clients": int(df["client_id"].nunique()),
-                    "features": FEATURES, "base_rate": float(y.mean())}
+    report: dict = {
+        "n_rows": int(len(df)),
+        "n_clients": int(df["client_id"].nunique()),
+        "features": FEATURES,
+        "base_rate": float(y.mean()),
+        "source_history_start": history.source_history_start().isoformat(),
+        "training_window_days": TRAINING_WINDOW_DAYS,
+        "training_vintages": training_vintages,
+    }
 
     # ----------------------------------------------------------------- grouped CV (model select)
     print("=== Stratified Group CV (group=client) ===")
@@ -429,6 +477,9 @@ def main() -> None:
         "oot_split": {"train_max": OOT_TRAIN_MAX, "test": [OOT_TEST_LO, OOT_TEST_HI]},
         "value_head": "see expected_value_row in train.py / score_task.py",
         "priority_formula": "priority = 100 * p_outcome_normalized; rank by p_outcome * expected_value",
+        "source_history_start": history.source_history_start().isoformat(),
+        "training_window_days": TRAINING_WINDOW_DAYS,
+        "training_vintages": training_vintages,
     }
     (ART / "model_meta.json").write_text(json.dumps(meta, indent=2))
     (ART / "metrics.json").write_text(json.dumps(report, indent=2, default=float))

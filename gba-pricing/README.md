@@ -33,14 +33,14 @@ baseline_price = marked_up * (1 - DiscountRate/100) * (1 - OneTimeDiscount/100)
 
 ```
 unit_cost_eur  = robust per-product cost = MEDIAN of ConsignmentItem.AccountingPrice over on-hand
-                 lots (Deleted=0, AccountingPrice>0, RemainingQty>0, ProductID<>25422404);
+                 non-debt lots (Deleted=0, AccountingPrice>0, RemainingQty>0,
+                 ProductID<>the dynamically resolved «Ввід боргів» row);
                  fallback = latest-lot TOP 1 AccountingPrice ORDER BY ID DESC. AccountingPrice is
                  EUR-base. No cost lot -> unit_cost_eur=null, confidence low, skip the floor.
 price_floor    = unit_cost_eur * (1 + target_margin_pct/100)   # config default 12; never below
 peer_band      = P25/P50/P75 + n of realized EUR unit price over distinct client-agreements for p
-                 in the trailing window (EUR_price = Agreement.CurrencyID=2 ? OrderItem.PricePerItem
-                 : GetExchangedToEuroValue(PricePerItem, Agreement.CurrencyID, Sale.Created); UoM
-                 outliers decile-trimmed).
+                 in the trailing window (OrderItem.PricePerItem is already EUR; UoM outliers are
+                 rejected with a per-product median/MAD filter).
 recommended_price = clamp( max(price_floor, peer_P50), lower=price_floor, upper=baseline_price )
                  # never above the engine's current price; if floor>baseline -> LOSS FLAG
                  #   (recommended=price_floor, rationale='below-margin-loss-flag').
@@ -64,12 +64,35 @@ discount_band  = { min_pct: floor-implied discount, target_pct: suggested, max_p
 The optimizer emits its result as an **adjustment to the engine's DiscountRate lever**, so the live
 `GetCalculatedProductPriceWithSharesAndVat` remains the single source of truth.
 
+### Factual-history contract
+
+`SOURCE_HISTORY_START_DATE=2025-01-01` is the first factual date restored from 1C. Every
+behavioral query (`client_world_fallback_baseline`, peer band, elasticity line counts and panels,
+including the pooled-panel ranking, plus the offline backtest) applies both its requested trailing
+window and `Sale.Created >= SOURCE_HISTORY_START_DATE`. A request whose `as_of_date` is before the
+floor is rejected with HTTP 422 and `detail=as_of_date_before_source_history_start`.
+
+Every recommendation and readiness response exposes `source_history_start`, `requested_start`,
+`effective_start`, `history_complete`, `history_fingerprint`, and `model_fingerprint`.
+`history_complete=false` means the requested trailing window started before factual data exists;
+the model used the clamped `effective_start` and does not pretend the missing period was observed.
+
+The live engine baseline, current price-book/discount rows, product/agreement identity and on-hand
+cost are explicit current-state snapshots. They are intentionally not clamped by the sales-history
+floor, so current price and cent rounding are unchanged.
+
+There is no persisted trained-model artifact in the A+B serving path: it is deterministic SQL plus
+Decimal math, and elasticity is fitted in-process only when explicitly enabled. A deployment does
+not need retraining for this floor change. Redis recommendation artifacts are namespaced by the
+model/history fingerprint and hydration rejects entries with missing or mismatching
+`source_history_start`/fingerprints; legacy artifacts are misses, never stamped as compliant.
+
 ## Critical data traps (honored in `pricing_repository.py`)
 
 - **NEVER** filter `Deleted=0` on `Sale`/`Order`/`OrderItem` (=1 on 100% of rows). Validity comes
   from `OrderItem.IsValidForCurrentSale=1`.
-- Exclude `ProductID 25422404` ('Ввід боргів з 1С' synthetic line) from cost lots, peer band and
-  the discount distribution — it contaminates cost and realized price.
+- Exclude the dynamically resolved live `'Ввід боргів'` synthetic Product ID from cost lots,
+  peer band and behavioral panels — it contaminates cost and realized price.
 - Cost via `ConsignmentItem.AccountingPrice` (Deleted=0, AccountingPrice>0, RemainingQty>0) using
   **MEDIAN** to guard against debt/correction lots (~800-1160 on cheap SKUs); fallback = latest lot.
   `AccountingPrice` is **EUR-base** (FX baked in at income) — no `GetExchangedToEuroValue` applied.
@@ -78,8 +101,8 @@ The optimizer emits its result as an **adjustment to the engine's DiscountRate l
 - `OrderItem.DiscountAmount` is a **line-total** money figure (not per-unit) → not used; discount
   discipline comes from `ProductGroupDiscount.DiscountRate` (the engine-native lever).
 - `ProductPricing` has 23x soft-deleted bloat → always filter `Deleted=0` on `ProductPricing`.
-- UoM piece-vs-box outliers → peer percentiles decile-trim.
-- **No win/loss / offer-conversion data** (offers empty) → NO elasticity / win-rate in A+B.
+- UoM piece-vs-box outliers → peer percentiles use the per-product median/MAD reject.
+- Elasticity remains a gated secondary signal and never replaces the A+B recommendation.
 
 ## Run
 
@@ -95,13 +118,15 @@ cp .env.example .env   # fill DB_PASSWORD with the read-only login
   with_vat?=true, target_margin_pct?}` → `PriceRecommendation`.
 - `POST /price/batch` — `{items:[{product_net_uid, client_agreement_net_uid}], ...}` → list of
   `PriceRecommendation` (errors isolated).
-- `GET /health`, `GET /metrics`.
+- `GET /health`, `GET /ready`, `GET /metrics`.
 - `DELETE /cache/{product}/{client_agreement_net_uid}`.
 
 `PriceRecommendation` = `{product_id, client_agreement_netuid, currency:'EUR', baseline_price,
 recommended_price, price_floor, unit_cost_eur, suggested_discount_pct,
 discount_band:{min_pct,target_pct,max_pct}, peer_band:{p25,p50,p75,n}, confidence,
 margin_pct_at_recommended, rationale, as_of_date, model_version:'pricing-ab-v2'}`.
+The response also includes the factual-history fields documented above; `model_version` remains
+`pricing-ab-v2`, while `model_fingerprint` changes whenever its history contract changes.
 
 ## Security
 
@@ -111,6 +136,7 @@ margin_pct_at_recommended, rationale, as_of_date, model_version:'pricing-ab-v2'}
 
 ## Status
 
-Implemented: config (port 8004, Redis db 3, `pricing-ab-v2`, target_margin_pct=12), pooled
-read-only DB layer, parameterized pricing repository, A+B optimizer, optional gated elasticity
-signal, domain models, FastAPI shell, tests.
+Implemented: config (port 8004, Redis db 3, `pricing-ab-v2`, target_margin_pct=12,
+`SOURCE_HISTORY_START_DATE=2025-01-01`), pooled read-only DB layer, parameterized and
+history-clamped behavioral repository, A+B optimizer, optional gated elasticity signal, domain
+models, FastAPI shell, tests.

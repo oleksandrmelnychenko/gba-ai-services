@@ -11,9 +11,11 @@ import time
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
+from app.core.config import get_settings
+from app.core.history import rolling_coverage
 from app.core.logging import get_logger
 from app.data import cache, masters
-from app.domain.models import CartReplenishmentPlan
+from app.domain.models import MODEL_VERSION, CartReplenishmentPlan
 from app.services.replenishment import policy
 
 log = get_logger("procure_worker")
@@ -79,6 +81,20 @@ def canonical_cart_payload_is_ready(
         and len(items) == item_count
     )
     if not structurally_valid or payload.get("total_item_count") != item_count:
+        return False
+    try:
+        as_of = payload.get("as_of_date")
+        if not isinstance(as_of, str):
+            return False
+        coverage = rolling_coverage(as_of, get_settings().history_days)
+    except (TypeError, ValueError):
+        return False
+    expected_history = coverage.as_metadata()
+    if any(payload.get(key) != value for key, value in expected_history.items()):
+        return False
+    if payload.get("history_not_applicable") != ["inventory", "reservations"]:
+        return False
+    if payload.get("model_version") != MODEL_VERSION:
         return False
     if payload.get("is_truncated") is not False:
         return False
@@ -163,7 +179,6 @@ def canonical_cart_payload_is_ready(
 
 def get_source_readiness(as_of: str, *, force: bool = False) -> dict:
     """Return a short-lived snapshot of the factual inputs required by the policy."""
-    from app.core.config import get_settings
     from app.data import supply_repository as repo
 
     key = cache.make_key("readiness", "source", as_of)

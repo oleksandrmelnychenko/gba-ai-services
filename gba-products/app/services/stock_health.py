@@ -11,6 +11,7 @@ from app.core import exact_numbers as exact
 from app.core.config import Settings, get_settings
 from app.data import signals_repository as sig
 from app.domain.models import InventoryBand
+from app.services import history_policy
 
 
 def classify_band(qty_on_hand: float, daily_rate: float, sold_in_dead_window: bool,
@@ -35,6 +36,8 @@ def classify_band(qty_on_hand: float, daily_rate: float, sold_in_dead_window: bo
 def snapshot(as_of: str) -> dict:
     """Portfolio inventory-health snapshot over all on-hand sellable stock."""
     cfg = get_settings()
+    windows = history_policy.stock_windows(as_of, cfg)
+    velocity_days = windows["velocity"].effective_days
     stock = sig.on_hand_stock()
     velocity: dict[int, Decimal] = {}
     for row in sig.sales_velocity(as_of, cfg.velocity_window_days):
@@ -78,7 +81,10 @@ def snapshot(as_of: str) -> dict:
             raise ValueError(f"stock valuation fields disagree for product {pid}")
         if not valuation_available:
             unvalued_skus += 1
-        daily_rate = velocity.get(pid, Decimal("0")) / Decimal(cfg.velocity_window_days)
+        sold_qty = velocity.get(pid, Decimal("0"))
+        if velocity_days == 0 and sold_qty > 0:
+            raise ValueError("sales velocity has demand outside the effective history window")
+        daily_rate = sold_qty / Decimal(velocity_days) if velocity_days > 0 else Decimal("0")
         band = classify_band(float(qty), float(daily_rate), pid in sold_recently, cfg)
         cover = (qty / daily_rate) if daily_rate > 0 else None
         row_qty = exact.quantity(qty, "qty_on_hand")
@@ -120,6 +126,7 @@ def snapshot(as_of: str) -> dict:
         "unvalued_skus": unvalued_skus,
         "bands": bands,
         "model_version": cfg.model_version,
+        **history_policy.stock_metadata(as_of, cfg),
         "rows": rows,
     }
     _validate_snapshot(result)

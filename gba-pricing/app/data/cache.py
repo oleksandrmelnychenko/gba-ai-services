@@ -1,11 +1,11 @@
 """Redis cache — ONE documented key scheme.
 
 Key scheme (single source of truth):
-    price:{model_version}:{product}:{agreement}:{asof}:{margin}:{vat}:{culture}
+    price:{model_fingerprint}:{product}:{agreement}:{asof}:{margin}:{vat}:{culture}
 where {product} is the product id, {agreement} is the client-agreement NetUID, and the pricing
 params (target margin, VAT flag, culture) are folded in so a cached result is only reused for the
-exact params it was computed with. The model version is embedded so a model bump auto-invalidates
-old entries.
+exact params it was computed with. The model fingerprint includes model version, trailing-window
+length and source-history floor, so changing any history contract auto-invalidates old entries.
 
 Graceful degradation: if Redis is down, every call is a no-op miss — the service still works
 (just uncached). Never let cache failure break a recommendation.
@@ -19,6 +19,7 @@ from typing import Any
 import redis
 
 from app.core.config import get_settings
+from app.core.history import model_contract_fingerprint
 from app.core.logging import get_logger
 from app.core.metrics import METRICS
 
@@ -29,8 +30,13 @@ _client: redis.Redis | None = None
 _unavailable_until = 0.0
 
 
-def _model_version() -> str:
-    return get_settings().model_version
+def _model_fingerprint() -> str:
+    settings = get_settings()
+    return model_contract_fingerprint(
+        settings.model_version,
+        settings.source_history_start_date,
+        settings.trailing_window_months,
+    )
 
 
 def _get_client() -> redis.Redis | None:
@@ -59,7 +65,7 @@ def _get_client() -> redis.Redis | None:
 def make_key(product: int | str, agreement: str, as_of: str,
              target_margin_pct: float, with_vat: bool, culture: str) -> str:
     return (
-        f"price:{_model_version()}:{product}:{agreement.lower()}:{as_of}"
+        f"price:{_model_fingerprint()}:{product}:{agreement.lower()}:{as_of}"
         f":{target_margin_pct}:{int(with_vat)}:{culture}"
     )
 
@@ -99,7 +105,7 @@ def invalidate(product: int | str, agreement: str) -> int:
     client = _get_client()
     if client is None:
         return 0
-    pattern = f"price:{_model_version()}:{product}:{str(agreement).lower()}:*"
+    pattern = f"price:{_model_fingerprint()}:{product}:{str(agreement).lower()}:*"
     try:
         keys = list(client.scan_iter(match=pattern, count=200))
         return client.delete(*keys) if keys else 0

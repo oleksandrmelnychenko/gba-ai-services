@@ -31,6 +31,9 @@ def test_compute_target_shape_and_pace(monkeypatch):
     assert out["month"] == "2026-06"
     assert out["working_days"] == 26
     assert out["working_days_elapsed"] == 7
+    assert out["source_history_start"] == "2025-01-01"
+    assert out["effective_start"] == "2026-02-01"
+    assert out["history_complete"] is True
     sh = out["shipped"]
     assert sh["target"] == round((120 + 222 + 246) / 3, 2)   # 196.0
     assert sh["mtd"] == 40.0

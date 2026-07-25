@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import pytest
 
-from app.domain.models import ClientIdentityMismatchError, ForwardRiskBand, Rating
+from app.domain.models import (
+    ClientIdentityMismatchError,
+    DataSufficiency,
+    ForwardRiskBand,
+    ForwardRiskStatus,
+    Rating,
+)
 from app.services.solvency import service
 
 
@@ -54,8 +60,13 @@ def _has_buyer_role(monkeypatch):
     monkeypatch.setattr(service.repo, "has_buyer_role", lambda cid: True)
 
 
-def _wire_v3(monkeypatch, *, current=None, forward=None, currency=None):
-    monkeypatch.setattr(service.risk_dataset, "features_one", lambda *a, **k: _stub_features())
+def _wire_v3(monkeypatch, *, current=None, forward=None, currency=None, features=None):
+    feature_values = _stub_features() if features is None else features
+    monkeypatch.setattr(
+        service.risk_dataset,
+        "features_one",
+        lambda *a, **k: feature_values,
+    )
     monkeypatch.setattr(service, "score_current", lambda f: current or _stub_current())
     monkeypatch.setattr(service, "score_forward", lambda f: forward or _stub_forward())
     monkeypatch.setattr(
@@ -116,8 +127,10 @@ def test_build_charts_nonexistent_client_id_raises_lookup(monkeypatch):
 
 def test_score_client_v3_shape_applicable_buyer(monkeypatch):
     """v3 shape: score/pd/rating/contributions/forward_risk populated; sub_factors null."""
+    features = _stub_features()
+    features["total_debt_eur"] = 100.0
     _wire_v3(monkeypatch, current=_stub_current(band="D", score=46.0, pd=0.65),
-             forward=_stub_forward(band="very_high", pd_beh=0.99))
+             forward=_stub_forward(band="very_high", pd_beh=0.99), features=features)
     out = service.score_client(5, None, "2026-06-01", 12, use_cache=False)
     assert out.applicable is True
     assert out.score == 46
@@ -133,14 +146,77 @@ def test_score_client_v3_shape_applicable_buyer(monkeypatch):
     assert out.model_version == "creditscore-v3"
 
 
-def test_score_client_no_debt_forward_low_band(monkeypatch):
-    """A buyer with no debt -> forward score_forward returns 'none' -> mapped to band 'low'."""
-    _wire_v3(monkeypatch, current=_stub_current(band="A", score=100.0),
-             forward=_stub_forward(band="none"))
+def test_score_client_no_debt_has_no_out_of_population_forward_risk(monkeypatch):
+    """A buyer with no debt is outside the forward model's declared population."""
+    _wire_v3(monkeypatch, current=_stub_current(band="A", score=100.0))
+    monkeypatch.setattr(
+        service,
+        "score_forward",
+        lambda _features: (_ for _ in ()).throw(
+            AssertionError("zero-debt buyers are outside the forward model population")
+        ),
+    )
     out = service.score_client(5, None, "2026-06-01", 12, use_cache=False)
-    assert out.forward_risk is not None
-    assert out.forward_risk.band == ForwardRiskBand.LOW
-    assert out.forward_risk.pd > 0  # ~ forward base rate
+    assert out.forward_risk is None
+    assert out.forward_risk_status == ForwardRiskStatus.NOT_APPLICABLE
+
+
+def test_forward_model_unavailable_retains_valid_current_score(monkeypatch):
+    features = _stub_features()
+    features["total_debt_eur"] = 100.0
+    _wire_v3(monkeypatch, current=_stub_current(score=82.0, pd=0.01), features=features)
+    monkeypatch.setattr(
+        service,
+        "score_forward",
+        lambda _features: (_ for _ in ()).throw(
+            service.ForwardModelUnavailableError(
+                "forward model unavailable: insufficient_unique_positive_clients (3 < 30)"
+            )
+        ),
+    )
+
+    out = service.score_client(5, None, "2026-06-01", 12, use_cache=False)
+
+    assert out.score == 82
+    assert out.pd == 0.01
+    assert out.forward_risk is None
+    assert out.forward_risk_status == ForwardRiskStatus.MODEL_UNAVAILABLE
+    assert "3 < 30" in out.forward_risk_reason
+
+
+def test_score_client_empty_zero_terms_is_insufficient_with_control_flag(monkeypatch):
+    """A sync-created zero agreement must not manufacture enough evidence for an A rating."""
+    features = _stub_features()
+    features["recency_days"] = 3000.0
+    features["has_credit_control"] = 1.0
+    _wire_v3(
+        monkeypatch,
+        current=_stub_current(band="A", score=100.0),
+        forward=_stub_forward(band="none"),
+        features=features,
+    )
+
+    out = service.score_client(5, None, "2026-06-01", 12, use_cache=False)
+
+    assert out.data_sufficiency == DataSufficiency.INSUFFICIENT
+    assert out.data_sufficiency_reason
+    assert out.score is None
+    assert out.rating is None
+    assert out.pd is None
+    assert out.contributions is None
+    assert out.forward_risk is None
+
+
+def test_score_client_positive_credit_terms_are_a_real_sufficiency_signal(monkeypatch):
+    features = _stub_features()
+    features["recency_days"] = 3000.0
+    features["credit_limit_eur"] = 1000.0
+    features["has_credit_control"] = 1.0
+    _wire_v3(monkeypatch, features=features)
+
+    out = service.score_client(5, None, "2026-06-01", 12, use_cache=False)
+
+    assert out.data_sufficiency == DataSufficiency.OK
 
 
 def test_score_client_already_sev180_has_no_out_of_population_forward_risk(monkeypatch):
@@ -228,6 +304,8 @@ def test_score_client_cache_hit_hydrates(monkeypatch):
         contributions=[Contribution(feature="n_open_debt_lines", value=2.0, points=3.7)],
         forward_risk=ForwardRisk(band=ForwardRiskBand.HIGH, pd=0.8),
         sub_factors=None, as_of_date="2026-06-01", window_months=12,
+        source_history_start="2025-01-01", effective_start="2025-06-01",
+        history_complete=True,
     ).model_dump(mode="json")
     monkeypatch.setattr(service.cache, "get", lambda *a, **k: cached_obj)
 
@@ -251,6 +329,8 @@ def test_score_client_ignores_cache_entry_for_another_client(monkeypatch):
         contributions=[Contribution(feature="n_open_debt_lines", value=2.0, points=3.7)],
         forward_risk=ForwardRisk(band=ForwardRiskBand.HIGH, pd=0.8),
         sub_factors=None, as_of_date="2026-06-01", window_months=12,
+        source_history_start="2025-01-01", effective_start="2025-06-01",
+        history_complete=True,
     ).model_dump(mode="json")
     monkeypatch.setattr(service.cache, "get", lambda *a, **k: cached_obj)
     _wire_v3(monkeypatch)
@@ -334,3 +414,27 @@ def test_score_sparkline_uses_v3_score_current_not_legacy(monkeypatch):
     # emitted point, which pool.map keeps in input order.)
     assert as_of in seen_as_of
     assert points[-1].score == int(round(fake_score_current({"as_of": as_of})["score"]))
+
+
+def test_score_sparkline_does_not_fabricate_pre_source_months(monkeypatch):
+    from app.services.solvency import charts as charts_builder
+
+    seen_as_of: list[str] = []
+    monkeypatch.setattr(
+        charts_builder.risk_dataset,
+        "features_one",
+        lambda _client_id, as_of, _window: seen_as_of.append(as_of) or {},
+    )
+    monkeypatch.setattr(charts_builder, "score_current", lambda _features: {"score": 50.0})
+
+    points = charts_builder._score_sparkline(411780, "2025-06-30", 12)
+
+    assert [point.period for point in points] == [
+        "2025-01",
+        "2025-02",
+        "2025-03",
+        "2025-04",
+        "2025-05",
+        "2025-06",
+    ]
+    assert all(as_of >= "2025-01-01" for as_of in seen_as_of)

@@ -11,6 +11,8 @@ hardened — read-only DB login, parameterized SQL, env-only secrets, typed cont
 - **Discovery**: collaborative filtering (Jaccard-similar clients) for new products.
 - **Mix**: 20 repurchase + 5 discovery (configurable), max 3 per product group.
 - **Segments**: HEAVY (≥500 orders) / REGULAR-CONSISTENT / REGULAR-EXPLORATORY (100–500) / LIGHT (<100).
+- **History contract**: transactional signals start at `SOURCE_HISTORY_START_DATE`
+  (`2025-01-01`); earlier `as_of_date` requests are rejected.
 
 ## Data
 Read-only over ConcordDb_V5: `ClientAgreement → Order → OrderItem`, groups via `ProductProductGroup`.
@@ -28,6 +30,7 @@ cp .env.example .env   # fill DB_PASSWORD with the read-only login
 
 ## API
 - `POST /recommend` — `{customer_id, top_n, as_of_date?, include_discovery}` → recommendations.
+  Responses expose `source_history_start`, `effective_start`, and `history_complete`.
 - `GET /health`.
 
 ## Security

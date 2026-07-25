@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from app.core import history
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.core.metrics import METRICS
@@ -46,12 +47,24 @@ def _current_task_as_of(value: date | None) -> str:
     """Task state has no historical event snapshot, so mixed historical/current dashboards
     are forbidden. Accept only today's Kyiv business date and fail closed otherwise."""
     today = _kyiv_today()
-    if value is not None and value != today:
+    requested = value or today
+    _require_source_as_of(requested)
+    if value is not None and requested != today:
         raise HTTPException(
             status_code=422,
             detail="historical_as_of_not_supported_for_current_task_state",
         )
     return today.isoformat()
+
+
+def _require_source_as_of(value: date) -> date:
+    try:
+        return history.require_as_of(value)
+    except history.SourceHistoryBoundaryError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="as_of_before_source_history_start",
+        ) from exc
 
 
 def _debt_dash_warmer() -> None:
@@ -160,12 +173,12 @@ def _canonical_net_uid(manager_net_uid: str) -> str:
 
 
 def _as_of(as_of_date: date | None) -> str | None:
-    return as_of_date.isoformat() if as_of_date else None
+    return _require_source_as_of(as_of_date).isoformat() if as_of_date else None
 
 
 def _resolved_as_of(as_of_date: date | None) -> str:
     """Resolve an optional API business date in the configured Kyiv calendar."""
-    return _as_of(as_of_date) or _kyiv_today().isoformat()
+    return _as_of(as_of_date) or _require_source_as_of(_kyiv_today()).isoformat()
 
 
 def _guard_generation(stats: dict) -> None:
@@ -189,6 +202,9 @@ def health() -> dict:
         "latest_sale_at": None,
         "manager_count": 0,
         "synthetic_product_count": 0,
+        "source_history_start": history.source_history_start().isoformat(),
+        "effective_start": history.source_history_start().isoformat(),
+        "history_complete": True,
     }
     generation = {
         "generation_ready": False,
@@ -203,7 +219,7 @@ def health() -> dict:
     }
     if db_ok:
         try:
-            source = signals_repository.source_readiness(settings.max_source_lag_days)
+            source.update(signals_repository.source_readiness(settings.max_source_lag_days))
         except Exception as exc:  # noqa: BLE001
             log.error("nba_source_readiness_failed", error=str(exc))
             source["source_reasons"] = ["source_readiness_failed"]
@@ -224,7 +240,24 @@ def health() -> dict:
             *list(source.get("source_reasons") or []),
             "source_history_start_mismatch",
         ]
-    business_ready = bool(source["source_ready"]) and bool(generation["generation_ready"])
+    try:
+        from app.ml.score_task import model_compatibility
+
+        model = model_compatibility()
+    except Exception as exc:  # noqa: BLE001
+        log.error("nba_model_readiness_failed", error=str(exc))
+        model = {
+            "model_compatible": False,
+            "model_reasons": ["model_readiness_failed"],
+            "model_source_history_start": None,
+            "model_training_window_days": None,
+            "model_training_vintages": [],
+        }
+    business_ready = (
+        bool(source["source_ready"])
+        and bool(generation["generation_ready"])
+        and bool(model["model_compatible"])
+    )
     healthy = db_ok and mongo_ok and business_ready
     return {
         "status": "healthy" if healthy else "degraded",
@@ -233,6 +266,7 @@ def health() -> dict:
         "business_ready": business_ready,
         **source,
         **generation,
+        **model,
         "source_history_contract_ready": source_history_contract_ready,
         "version": "0.1.0",
         "model_version": settings.model_version,
@@ -308,9 +342,13 @@ def generate(
     as_of_date: date | None = None,
 ) -> dict:
     from app.services import orchestrator
+
+    # Resolve and validate outside the broad generation error boundary: a caller asking for a
+    # date before the declared source history must receive the canonical 422, not a wrapped 500.
+    resolved_as_of = _resolved_as_of(as_of_date)
     started = time.time()
     try:
-        stats = orchestrator.generate_for_manager(manager_id, _as_of(as_of_date))
+        stats = orchestrator.generate_for_manager(manager_id, resolved_as_of)
         METRICS.record_request((time.time() - started) * 1000)
     except Exception as exc:  # noqa: BLE001
         METRICS.record_request((time.time() - started) * 1000, error=True)
@@ -393,6 +431,7 @@ def cockpit_generate(manager_net_uid: str, as_of_date: date | None = None) -> di
     manager_id = _resolve_manager(manager_net_uid)
     requested_as_of = _as_of(as_of_date)
     resolved_as_of = _resolved_as_of(as_of_date)
+    coverage = history.rolling_days(resolved_as_of, 365)
     stats = orchestrator.generate_for_manager(manager_id, resolved_as_of)
     if stats.get("manager_id") != manager_id or stats.get("as_of") != resolved_as_of:
         log.error(
@@ -408,6 +447,7 @@ def cockpit_generate(manager_net_uid: str, as_of_date: date | None = None) -> di
         **stats,
         "manager_net_uid": _canonical_net_uid(manager_net_uid),
         "requested_as_of": requested_as_of,
+        **coverage.metadata(),
     }
 
 
@@ -429,7 +469,12 @@ def cockpit_target(manager_net_uid: str, as_of_date: date | None = None) -> dict
 # concurrent misses wait for one build instead of stacking 44s queries.
 _DEBT_DASH_TTL_S = 600.0
 _debt_dash_lock = threading.Lock()
-_debt_dash_state: dict = {"at": 0.0, "as_of": None, "values": {}}
+_debt_dash_state: dict = {
+    "at": 0.0,
+    "as_of": None,
+    "source_history_start": None,
+    "values": {},
+}
 
 _EMPTY_DEBT_DASH = {
     "value_at_risk_eur": 0.0,
@@ -449,21 +494,35 @@ def _debt_dashboards_cached(as_of: str, *, allow_stale: bool = True) -> dict[int
     """Stale-while-revalidate: requests use cached data for the same as_of (the
     background warmer refreshes every ~9 min) and NEVER wait out the ~44-70s
     recompute. Inline compute happens only when that as_of has no cached value."""
+    source_start = history.source_history_start().isoformat()
     with _debt_dash_lock:
-        same_as_of = _debt_dash_state["as_of"] == as_of
+        same_as_of = (
+            _debt_dash_state["as_of"] == as_of
+            and _debt_dash_state.get("source_history_start") == source_start
+        )
         fresh = same_as_of and time.monotonic() - _debt_dash_state["at"] < _DEBT_DASH_TTL_S
         values = _debt_dash_state["values"]
         if fresh or (allow_stale and same_as_of and values):
             return values
     with _debt_dash_compute_lock:
         with _debt_dash_lock:
-            same_as_of = _debt_dash_state["as_of"] == as_of
+            same_as_of = (
+                _debt_dash_state["as_of"] == as_of
+                and _debt_dash_state.get("source_history_start") == source_start
+            )
             fresh = same_as_of and time.monotonic() - _debt_dash_state["at"] < _DEBT_DASH_TTL_S
             if _debt_dash_state["values"] and (fresh or (allow_stale and same_as_of)):
                 return _debt_dash_state["values"]
         computed = signals_repository.debt_dashboards_for_all_managers(as_of)
         with _debt_dash_lock:
-            _debt_dash_state.update({"at": time.monotonic(), "as_of": as_of, "values": computed})
+            _debt_dash_state.update(
+                {
+                    "at": time.monotonic(),
+                    "as_of": as_of,
+                    "source_history_start": source_start,
+                    "values": computed,
+                }
+            )
         return computed
 
 
@@ -474,6 +533,7 @@ def cockpit_dashboard(manager_net_uid: str, as_of_date: date | None = None) -> d
     aggregation (value_at_risk + aging). No scores are recomputed. Internal-key gated."""
     manager_id = _resolve_manager(manager_net_uid)
     as_of = _current_task_as_of(as_of_date)
+    coverage = history.rolling_days(as_of, settings.debt_max_age_days)
     try:
         counts = lifecycle.dashboard_counts(manager_id, as_of)
         debt = _debt_dashboards_cached(as_of).get(manager_id) or _EMPTY_DEBT_DASH
@@ -485,6 +545,7 @@ def cockpit_dashboard(manager_net_uid: str, as_of_date: date | None = None) -> d
         "manager_id": manager_id,
         "manager_net_uid": _canonical_net_uid(manager_net_uid),
         "as_of": as_of,
+        **coverage.metadata(),
         "task_type_mix": counts["task_type_mix"],
         "urgency_mix": counts["urgency_mix"],
         "value_at_risk_eur": debt["value_at_risk_eur"],
@@ -506,6 +567,7 @@ def cockpit_head_dashboard(manager_net_uid: str, as_of_date: date | None = None)
                 "as_of": None, "teams": [],
                 "escalated_count": 0, "total_value_at_risk_eur": 0.0}
     as_of = _current_task_as_of(as_of_date)
+    coverage = history.rolling_days(as_of, settings.debt_max_age_days)
     teams = []
     total_var = Decimal("0")
     debt_by_manager = _debt_dashboards_cached(as_of)
@@ -517,7 +579,7 @@ def cockpit_head_dashboard(manager_net_uid: str, as_of_date: date | None = None)
                       "critical": lifecycle.critical_active_count(mid),
                       "value_at_risk_eur": var})
     return {"is_head": True, "requested_manager_net_uid": requested_net_uid,
-            "as_of": as_of, "teams": teams,
+            "as_of": as_of, **coverage.metadata(), "teams": teams,
             "escalated_count": lifecycle.escalated_count(),
             "total_value_at_risk_eur": cents(total_var)}
 
@@ -583,7 +645,12 @@ def _guard_team_stats(manager_id: int, stats: dict) -> None:
 _TEAM_SNAP_TTL_S = 90.0
 _team_snap_lock = threading.Lock()
 _team_snap_compute_lock = threading.Lock()
-_team_snap_state: dict = {"at": 0.0, "as_of": None, "value": None}
+_team_snap_state: dict = {
+    "at": 0.0,
+    "as_of": None,
+    "source_history_start": None,
+    "value": None,
+}
 
 
 def _build_team_snapshot(as_of_str: str) -> dict:
@@ -595,6 +662,7 @@ def _build_team_snapshot(as_of_str: str) -> dict:
               "generated_month": 0, "done_month": 0, "sold_month": 0, "dismissed_month": 0,
               "revenue_month": Decimal("0")}
     as_of = as_of_str
+    coverage = history.rolling_days(as_of, 365)
     mids = signals_repository.all_managers()
     names = signals_repository.manager_names(mids)
     for mid in mids:
@@ -636,11 +704,13 @@ def _build_team_snapshot(as_of_str: str) -> dict:
             "count": len(overview_rows),
             "expected_manager_count": expected_count,
             "returned_manager_count": len(overview_rows),
+            **coverage.metadata(),
             "managers": overview_rows,
         },
         "team": {
             "is_head": True,
             "as_of": as_of,
+            **coverage.metadata(),
             "expected_manager_count": expected_count,
             "returned_manager_count": len(team),
             "team": team,
@@ -653,21 +723,35 @@ def _team_snapshot_cached(as_of: str | None = None, *, allow_stale: bool = True)
     """Stale-while-revalidate snapshot for the DEFAULT (as_of=today) head views; the background
     warmer refreshes every ~80s so requests virtually never pay the compute."""
     key = as_of or _kyiv_today().isoformat()
+    source_start = history.source_history_start().isoformat()
     with _team_snap_lock:
-        same = _team_snap_state["as_of"] == key
+        same = (
+            _team_snap_state["as_of"] == key
+            and _team_snap_state.get("source_history_start") == source_start
+        )
         fresh = same and time.monotonic() - _team_snap_state["at"] < _TEAM_SNAP_TTL_S
         value = _team_snap_state["value"]
         if value is not None and (fresh or (allow_stale and same)):
             return value
     with _team_snap_compute_lock:
         with _team_snap_lock:
-            same = _team_snap_state["as_of"] == key
+            same = (
+                _team_snap_state["as_of"] == key
+                and _team_snap_state.get("source_history_start") == source_start
+            )
             fresh = same and time.monotonic() - _team_snap_state["at"] < _TEAM_SNAP_TTL_S
             if _team_snap_state["value"] is not None and (fresh or (allow_stale and same)):
                 return _team_snap_state["value"]
         computed = _build_team_snapshot(key)
         with _team_snap_lock:
-            _team_snap_state.update({"at": time.monotonic(), "as_of": key, "value": computed})
+            _team_snap_state.update(
+                {
+                    "at": time.monotonic(),
+                    "as_of": key,
+                    "source_history_start": source_start,
+                    "value": computed,
+                }
+            )
         return computed
 
 
