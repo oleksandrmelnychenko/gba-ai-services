@@ -175,5 +175,6 @@ def build_product_analytics(
             requested_start=window.requested_start,
             effective_start=window.effective_start,
             history_complete=window.history_complete,
+            zero_fill_begins_at=window.effective_start,
         ),
     )

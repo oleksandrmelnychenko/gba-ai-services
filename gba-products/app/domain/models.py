@@ -87,7 +87,7 @@ class ProductAnalyticsDataQuality(BaseModel):
     requested_start: date
     effective_start: date
     history_complete: bool
-    zero_fill_begins_at: Literal["effective_start"] = "effective_start"
+    zero_fill_begins_at: date
     stock_is_current: Literal[True] = True
     stock_history_available: Literal[False] = False
     stock_note: str = (

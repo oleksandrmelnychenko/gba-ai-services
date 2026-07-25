@@ -118,7 +118,7 @@ def test_route_returns_dense_sales_series_and_marks_partial_current_month(monkey
     assert body["data_quality"]["stock_history_available"] is False
     assert body["data_quality"]["sales_date_field"] == "Order.Created"
     assert body["data_quality"]["effective_start"] == "2026-05-01"
-    assert body["data_quality"]["zero_fill_begins_at"] == "effective_start"
+    assert body["data_quality"]["zero_fill_begins_at"] == "2026-05-01"
 
 
 def test_route_returns_zero_months_for_product_without_sales(monkeypatch):
