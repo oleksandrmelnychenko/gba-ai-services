@@ -10,8 +10,10 @@ from app.core.metrics import METRICS
 from app.data import cache
 from app.data import solvency_repository as repo
 from app.domain.models import (
+    ClientIdentityMismatchError,
     Contribution,
     CurrencyExposure,
+    DataSufficiency,
     ForwardRisk,
     ForwardRiskBand,
     GaugeChart,
@@ -19,6 +21,7 @@ from app.domain.models import (
     SolvencyCharts,
     SolvencyScore,
 )
+from app.domain.money import round_cent
 from app.risk import dataset as risk_dataset
 from app.risk.score_current import score_current
 from app.risk.score_forward import _load as _forward_card
@@ -30,11 +33,43 @@ log = get_logger("solvency_service")
 # The current-state scorecard band (A/B/C/D) maps 1:1 to the Rating enum.
 _BAND_TO_RATING = {"A": Rating.A, "B": Rating.B, "C": Rating.C, "D": Rating.D}
 
+_NO_SALES_24MO_DAYS = 730.0
+_INSUFFICIENT_REASON = (
+    "no sales in the last 24 months, no debt history, no credit-terms signal"
+)
+
+
+def _data_sufficiency(features: dict[str, float]) -> tuple[DataSufficiency, str | None]:
+    """Feature-coverage flag: with no sales in 24mo (never-bought recency sentinel included),
+    no live debt lines and no credit-terms signal, every feature sits in the safest WOE bin and
+    the scorecard emits 100/A by construction — flag it, never touch the score math."""
+    no_sales_24mo = float(features.get("recency_days", 0.0)) > _NO_SALES_24MO_DAYS
+    no_debt_history = (
+        float(features.get("n_open_debt_lines", 0.0)) == 0.0
+        and float(features.get("total_debt_eur", 0.0)) == 0.0
+        and float(features.get("months_with_debt_last12", 0.0)) == 0.0
+        and float(features.get("new_debt_eur_3mo", 0.0)) == 0.0
+    )
+    no_credit_terms = (
+        float(features.get("credit_limit_eur", 0.0)) == 0.0
+        and float(features.get("grace_days", 0.0)) == 0.0
+        and float(features.get("has_credit_control", 0.0)) == 0.0
+    )
+    if no_sales_24mo and no_debt_history and no_credit_terms:
+        return DataSufficiency.INSUFFICIENT, _INSUFFICIENT_REASON
+    return DataSufficiency.OK, None
+
 
 def _resolve_client_id(client_id: int | None, client_net_uid: str | None) -> int:
     if client_id is not None:
         if not repo.client_exists(client_id):
             raise LookupError(f"client_id not found: {client_id}")
+        if client_net_uid is not None:
+            resolved = repo.resolve_client_id(client_net_uid)
+            if resolved is None:
+                raise LookupError(f"client_net_uid not found: {client_net_uid}")
+            if resolved != client_id:
+                raise ClientIdentityMismatchError("client_id and client_net_uid do not match")
         return client_id
     if client_net_uid is None:
         raise ValueError("client_id or client_net_uid required")
@@ -48,18 +83,34 @@ def _as_of(as_of_date: str | None) -> str:
     return as_of_date or datetime.now().strftime("%Y-%m-%d")
 
 
-def _hydrate_score(data: dict) -> SolvencyScore:
-    """Rebuild a v3 SolvencyScore from a cached JSON dict (pydantic validates the shape)."""
-    return SolvencyScore.model_validate(data)
+def _hydrate_score(data: dict, expected_client_id: int) -> SolvencyScore | None:
+    """Rebuild a v3 SolvencyScore from a cached JSON dict (pydantic validates the shape).
+
+    Entries cached before the data_sufficiency fields existed are treated as a miss (returns
+    None) so a dormant client can't serve a stale ok-by-default flag until the TTL expires.
+    """
+    if "data_sufficiency" not in data:
+        return None
+    result = SolvencyScore.model_validate(data)
+    if result.client_id != expected_client_id:
+        return None
+    return result
 
 
-def _forward_risk(features: dict[str, float]) -> ForwardRisk:
+def _forward_risk(features: dict[str, float]) -> ForwardRisk | None:
     """Map score_forward()'s 6mo early-warning output to the v3 ForwardRisk{band, pd}.
 
-    score_forward returns band "none"/pd 0 for buyers with no debt; per the v3 contract those
-    are surfaced as band "low" with pd ~= the forward population base rate (genuinely low risk on
-    a 6mo horizon). At-risk-with-debt buyers carry the behavioral-only band + PD verbatim.
+    The forward model's declared population is ``total_debt_eur > 0`` and *not already SEV180*.
+    An already-defaulted buyer is outside that population: returning the behavioral model's
+    usually-low PD would be actively misleading, so the forward signal is absent while the
+    current-state score continues to carry the C/D risk. Buyers with no debt surface as low with
+    the forward population base rate. At-risk-with-debt buyers carry the behavioral band + PD.
     """
+    if (
+        float(features.get("overdue_eur_180plus", 0.0) or 0.0)
+        >= risk_dataset.SEV180_MIN_EUR
+    ):
+        return None
     fwd = score_forward(features)
     if fwd["band"] == "none":
         base = float(_forward_card().get("base_rate", 0.0) or 0.0)
@@ -76,17 +127,24 @@ def _currency_breakdown(
     return [
         CurrencyExposure(
             currency_id=r["currency_id"] if r["currency_id"] is not None else 0,
-            turnover_eur=round(float(r["turnover_eur"]), 2),
+            turnover_eur=round_cent(r["turnover_eur"]),
             exposure_eur=0.0,
         )
         for r in rows
     ]
 
 
-def _not_applicable(cid: int, as_of: str, window_months: int, settings) -> SolvencyScore:
+def _not_applicable(
+    cid: int,
+    client_net_uid: str | None,
+    as_of: str,
+    window_months: int,
+    settings,
+) -> SolvencyScore:
     """The non-buyer gate result: applicable=false, everything below null."""
     return SolvencyScore(
         client_id=cid,
+        client_net_uid=client_net_uid,
         applicable=False,
         score=None,
         rating=None,
@@ -98,6 +156,8 @@ def _not_applicable(cid: int, as_of: str, window_months: int, settings) -> Solve
         debt_load_source=None,
         raw_score=None,
         currency_breakdown=None,
+        data_sufficiency=DataSufficiency.INSUFFICIENT,
+        data_sufficiency_reason="client has no buyer role (score not applicable)",
         as_of_date=as_of,
         window_months=window_months,
         model_version=settings.model_version,
@@ -128,6 +188,7 @@ def _not_applicable_charts(cid: int, as_of: str, window_months: int) -> Solvency
 
 def _build_score(
     cid: int,
+    client_net_uid: str | None,
     features: dict[str, float],
     currency: list[CurrencyExposure] | None,
     as_of: str,
@@ -142,8 +203,10 @@ def _build_score(
     """
     current = score_current(features)
     forward = _forward_risk(features)
+    sufficiency, sufficiency_reason = _data_sufficiency(features)
     return SolvencyScore(
         client_id=cid,
+        client_net_uid=client_net_uid,
         applicable=True,
         score=int(round(current["score"])),
         rating=_BAND_TO_RATING[current["band"]],
@@ -158,6 +221,8 @@ def _build_score(
         debt_load_source=None,
         raw_score=None,
         currency_breakdown=currency,
+        data_sufficiency=sufficiency,
+        data_sufficiency_reason=sufficiency_reason,
         as_of_date=as_of,
         window_months=window_months,
         model_version=settings.model_version,
@@ -185,7 +250,13 @@ def score_client(
     settings = get_settings()
 
     if not repo.has_buyer_role(cid):
-        result = _not_applicable(cid, as_of, window_months, settings)
+        result = _not_applicable(
+            cid,
+            client_net_uid.lower() if client_net_uid is not None else None,
+            as_of,
+            window_months,
+            settings,
+        )
         latency = (datetime.now() - started).total_seconds() * 1000
         METRICS.record_request(latency)
         log.info("score_not_applicable", client_id=cid, latency_ms=round(latency, 2))
@@ -196,16 +267,29 @@ def score_client(
     if use_cache:
         cached = cache.get(key)
         if cached is not None:
-            result = _hydrate_score(cached)
-            METRICS.record_request((datetime.now() - started).total_seconds() * 1000)
-            return result
+            result = _hydrate_score(cached, cid)
+            if result is not None:
+                if client_net_uid is not None:
+                    result = result.model_copy(
+                        update={"client_net_uid": client_net_uid.lower()}
+                    )
+                METRICS.record_request((datetime.now() - started).total_seconds() * 1000)
+                return result
 
     error = False
     try:
         features = risk_dataset.features_one(cid, as_of, window_months)
         fx_date = settings.resolve_fx_date(as_of_date)
         currency = _currency_breakdown(cid, as_of, window_months, fx_date)
-        result = _build_score(cid, features, currency, as_of, window_months, settings)
+        result = _build_score(
+            cid,
+            client_net_uid.lower() if client_net_uid is not None else None,
+            features,
+            currency,
+            as_of,
+            window_months,
+            settings,
+        )
     except Exception:
         error = True
         METRICS.record_request((datetime.now() - started).total_seconds() * 1000, error=True)
@@ -223,6 +307,7 @@ def score_client(
         pd=result.pd,
         rating=result.rating.value if result.rating else None,
         forward_band=result.forward_risk.band.value if result.forward_risk else None,
+        data_sufficiency=result.data_sufficiency.value,
         latency_ms=round(latency, 2),
     )
     return result
@@ -269,13 +354,17 @@ def score_batch(
             if not repo.client_exists(cid):
                 raise LookupError(f"client_id not found: {cid}")
             if not repo.has_buyer_role(cid):
-                resolved[cid] = _not_applicable(cid, as_of, window_months, settings)
+                resolved[cid] = _not_applicable(
+                    cid, None, as_of, window_months, settings
+                )
                 continue
             if use_cache:
                 cached = cache.get(cache.make_key(cid, as_of, window_months))
                 if cached is not None:
-                    resolved[cid] = _hydrate_score(cached)
-                    continue
+                    hydrated = _hydrate_score(cached, cid)
+                    if hydrated is not None:
+                        resolved[cid] = hydrated
+                        continue
             pending.append(cid)
         except LookupError as exc:
             errors.append({"client_id": cid, "error": str(exc)})
@@ -303,7 +392,7 @@ def score_batch(
         for cid in pending:
             try:
                 result = _build_score(
-                    cid, features_by_cid[cid], currency_by_cid[cid],
+                    cid, None, features_by_cid[cid], currency_by_cid[cid],
                     as_of, window_months, settings,
                 )
                 if use_cache:

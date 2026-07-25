@@ -1,5 +1,5 @@
 {
-  "production_model": "hgb",
+  "production_model": "logit",
   "features": [
     "monetary",
     "recency_days",

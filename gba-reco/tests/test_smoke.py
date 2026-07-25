@@ -1,6 +1,9 @@
 """Fast unit tests — no DB/Redis required (those are integration, run separately)."""
 from __future__ import annotations
 
+import pytest
+from pydantic import ValidationError
+
 from app.data.db import in_clause
 from app.domain.models import ProductRec, RecommendationResult, RecSource, Segment
 
@@ -37,6 +40,72 @@ def test_result_contract_shape():
                   "precision_estimate", "latency_ms", "cached"):
         assert field in dumped
     assert dumped["recommendations"][0]["source"] == "repurchase"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"count": 2},
+        {"discovery_count": 1},
+        {
+            "recommendations": [
+                ProductRec(
+                    product_id=5,
+                    score=0.9,
+                    rank=1,
+                    segment="LIGHT",
+                    source=RecSource.REPURCHASE,
+                ),
+                ProductRec(
+                    product_id=5,
+                    score=0.8,
+                    rank=2,
+                    segment="LIGHT",
+                    source=RecSource.REPURCHASE,
+                ),
+            ],
+            "count": 2,
+        },
+    ],
+)
+def test_result_contract_rejects_mismatched_counts_and_duplicate_products(overrides):
+    payload = {
+        "customer_id": 1,
+        "recommendations": [
+            ProductRec(
+                product_id=5,
+                score=0.9,
+                rank=1,
+                segment="LIGHT",
+                source=RecSource.REPURCHASE,
+            )
+        ],
+        "count": 1,
+        "discovery_count": 0,
+        "segment": "LIGHT",
+        **overrides,
+    }
+    with pytest.raises(ValidationError):
+        RecommendationResult(**payload)
+
+
+def test_result_contract_rejects_row_segment_drift():
+    with pytest.raises(ValidationError, match="response segment"):
+        RecommendationResult(
+            customer_id=1,
+            recommendations=[
+                ProductRec(
+                    product_id=5,
+                    score=0.9,
+                    rank=1,
+                    segment="HEAVY",
+                    source=RecSource.REPURCHASE,
+                )
+            ],
+            count=1,
+            discovery_count=0,
+            segment="LIGHT",
+        )
 
 
 def test_cache_key_stable_and_versioned():

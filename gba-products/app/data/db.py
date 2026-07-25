@@ -25,10 +25,6 @@ def get_engine() -> Engine:
             max_overflow=s.db_max_overflow,
             pool_pre_ping=True,
             pool_recycle=3600,
-            connect_args={
-                "login_timeout": s.db_login_timeout_seconds,
-                "timeout": s.db_query_timeout_seconds,
-            },
             echo=False,
         )
     return _engine

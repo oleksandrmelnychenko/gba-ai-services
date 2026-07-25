@@ -6,10 +6,15 @@ from datetime import datetime
 from app.core.logging import get_logger
 from app.core.metrics import METRICS
 from app.data import cache
+from app.data import sales_repository as repo
 from app.domain.models import ProductRec, RecommendationResult, RecSource
 from app.services.recommendations import recommender
 
 log = get_logger("reco_service")
+
+
+class UnknownCustomerError(ValueError):
+    """The requested current client identity does not exist."""
 
 
 def get_recommendations(
@@ -22,6 +27,8 @@ def get_recommendations(
 ) -> RecommendationResult:
     started = datetime.now()
     as_of = as_of_date or datetime.now().strftime("%Y-%m-%d")
+    if not repo.client_exists(customer_id):
+        raise UnknownCustomerError(f"customer {customer_id} was not found")
     key = cache.make_key(customer_id, as_of, top_n, include_discovery, region_scope)
 
     if use_cache:
@@ -36,6 +43,8 @@ def get_recommendations(
                 for r in cached["recommendations"]
             ]
             result = RecommendationResult(**cached)
+            if result.customer_id != customer_id or result.as_of_date != as_of:
+                raise ValueError("cached recommendation identity mismatch")
             METRICS.record_request((datetime.now() - started).total_seconds() * 1000)
             return result
 

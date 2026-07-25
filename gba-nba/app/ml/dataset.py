@@ -19,8 +19,8 @@ Data traps honored (ConcordDb_V5), identical to the generators:
   * Payments: IncomePaymentOrder.Amount -> EUR via GetExchangedToEuroValue(Amount,CurrencyID,FromDate);
     payment event time is FromDate (NOT the bulk-sync Created).
   * Synthetic/ubiquitous SKUs (e.g. debt-entry) excluded from reorder + monetary.
-  * Hard-exclude the configured synthetic ids (settings.synthetic_product_ids, default {25422404})
-    everywhere — unconditional, independent of the data-driven ubiquity threshold.
+  * Hard-exclude the synthetic debt-entry ids (resolved live; settings.synthetic_product_ids as an
+    env override) everywhere — unconditional, independent of the data-driven ubiquity threshold.
 The four types: reorder_due, debt_followup, churn_winback, cross_sell.
 new_client_activation is intentionally dropped (Client.Created is a 1C sync stamp, not a real signal).
 """
@@ -45,13 +45,14 @@ def _t_plus_h(asof: str, h: int = H_DAYS) -> str:
 
 
 def _excluded_pids() -> set[int]:
-    """The configured synthetic accounting ids (HARD guard, pinned in settings.synthetic_product_ids
-    — e.g. debt-entry 25422404) UNION the data-driven ubiquity set (generator-calibrated pct). The
-    synthetic ids are excluded unconditionally so the guard holds even if 25422404's rolling ubiquity
-    ever dips below ubiquity_exclude_pct. Identical exclusion semantics to
-    app.data.signals_repository._excluded so the live feature row matches the training distribution."""
+    """The synthetic accounting ids (HARD guard — debt-entry «Ввід боргів», resolved live via
+    sig.synthetic_product_ids so re-mints can't stale the pin) UNION the data-driven ubiquity set
+    (generator-calibrated pct). The synthetic ids are excluded unconditionally so the guard holds
+    even if the debt-entry's rolling ubiquity ever dips below ubiquity_exclude_pct. Identical
+    exclusion semantics to app.data.signals_repository._excluded so the live feature row matches
+    the training distribution."""
     s = get_settings()
-    return set(s.synthetic_product_ids) | set(sig.ubiquitous_product_ids(s.ubiquity_exclude_pct))
+    return set(sig.synthetic_product_ids()) | set(sig.ubiquitous_product_ids(s.ubiquity_exclude_pct))
 
 
 # --------------------------------------------------------------------------------------

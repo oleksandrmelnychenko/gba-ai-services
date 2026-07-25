@@ -24,9 +24,9 @@ class DemandForecast(BaseModel):
 
 class InventoryPosition(BaseModel):
     product_id: int
-    on_hand: float = 0.0      # ProductAvailability.Amount
+    on_hand: float = 0.0      # gross physical = ProductAvailability.Amount + active reservations
     reserved: float = 0.0     # ProductReservation
-    on_order: float = 0.0     # open SupplyOrder not yet arrived
+    on_order: float = 0.0     # packed/committed supply not yet received
     available: float = 0.0    # on_hand - reserved
     position: float = 0.0     # available + on_order
 
@@ -96,6 +96,13 @@ class CartPlanRequest(BaseModel):
 class CartReplenishmentPlan(BaseModel):
     items: list[ReorderSuggestion]
     item_count: int
+    total_item_count: int = 0
+    is_truncated: bool = False
+    duplicate_supplier_options_removed: int = 0
+    total_suggested_qty: float = 0.0
+    total_cost_eur: float | None = 0.0
+    priced_cost_eur: float = 0.0
+    unpriced_item_count: int = 0
     as_of_date: str | None = None
     budget_eur: float | None = None
     budget_used_eur: float | None = None
@@ -120,6 +127,12 @@ class DaysOfCoverBucket(BaseModel):
 
 class TopItem(BaseModel):
     product_id: int
+    product_name: str | None = None
+    vendor_code: str | None = None
+    oe_number: str | None = None
+    image_url: str | None = None
+    producer_id: int | None = None
+    producer_name: str | None = None
     suggested_qty: float
     on_hand: float
     reorder_point: float
@@ -134,6 +147,12 @@ class DemandPoint(BaseModel):
 
 class DemandSeries(BaseModel):
     product_id: int
+    product_name: str | None = None
+    vendor_code: str | None = None
+    oe_number: str | None = None
+    image_url: str | None = None
+    producer_id: int | None = None
+    producer_name: str | None = None
     points: list[DemandPoint]
 
 

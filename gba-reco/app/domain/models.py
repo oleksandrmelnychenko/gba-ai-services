@@ -1,9 +1,11 @@
 """Domain models for client recommendations."""
 from __future__ import annotations
 
+import math
 from enum import StrEnum
+from typing import Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class Segment(StrEnum):
@@ -20,21 +22,28 @@ class RecSource(StrEnum):
 
 class ProductRec(BaseModel):
     """One recommended product (contract aligned with gba-server .NET DTO)."""
-    product_id: int
-    score: float
-    rank: int
-    segment: str
+
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    product_id: int = Field(gt=0)
+    score: float = Field(ge=0)
+    rank: int = Field(gt=0)
+    segment: str = Field(min_length=1)
     source: RecSource
 
 
 class RecommendationResult(BaseModel):
-    customer_id: int
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    customer_id: int = Field(gt=0)
     recommendations: list[ProductRec]
-    count: int
-    discovery_count: int
-    segment: str
+    count: int = Field(ge=0)
+    discovery_count: int = Field(ge=0)
+    segment: str = Field(min_length=1)
     precision_estimate: float = Field(
         default=0.033,
+        ge=0,
+        le=1,
         description=(
             "Harness-derived precision@10 for the v3.2 model on the leave-last-basket eval "
             "(n=409, synthetic/ubiquitous excluded; see docs/eval-baseline.md). NOT a per-call "
@@ -43,7 +52,29 @@ class RecommendationResult(BaseModel):
             "(the .NET DTO field is non-nullable double, so the value is kept rather than omitted)."
         ),
     )
-    latency_ms: float = 0.0
+    latency_ms: float = Field(default=0.0, ge=0)
     cached: bool = False
     as_of_date: str | None = None
     model_version: str = "v33-realdata-202606"
+
+    @model_validator(mode="after")
+    def validate_exact_contract(self) -> Self:
+        """Make stale/corrupt cache entries fail closed instead of leaking partial output."""
+        if not math.isfinite(self.precision_estimate) or not math.isfinite(self.latency_ms):
+            raise ValueError("recommendation metrics must be finite")
+        if self.count != len(self.recommendations):
+            raise ValueError("count must equal recommendations length")
+        product_ids = [item.product_id for item in self.recommendations]
+        if len(product_ids) != len(set(product_ids)):
+            raise ValueError("recommendation product ids must be unique")
+        expected_ranks = list(range(1, len(self.recommendations) + 1))
+        if [item.rank for item in self.recommendations] != expected_ranks:
+            raise ValueError("recommendation ranks must be contiguous and one-based")
+        if any(item.segment != self.segment for item in self.recommendations):
+            raise ValueError("every recommendation segment must equal the response segment")
+        actual_discovery = sum(
+            item.source == RecSource.DISCOVERY for item in self.recommendations
+        )
+        if self.discovery_count != actual_discovery:
+            raise ValueError("discovery_count must match recommendation sources")
+        return self

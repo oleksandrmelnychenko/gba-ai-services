@@ -1,8 +1,11 @@
 """Fast unit tests for procurement math — no DB/Redis (pure logic)."""
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 
+from app.data import cost_repository as cost_repo
 from app.data.db import in_clause
 from app.domain.models import DemandForecast, InventoryPosition, Urgency
 from app.services.replenishment import policy
@@ -49,6 +52,31 @@ def test_round_order_qty_moq_and_multiple():
     assert policy._round_order_qty(40, 100, 50) == 100.0
     assert policy._round_order_qty(10, None, None) == 10.0
     assert policy._round_order_qty(10, 0, 1) == 10.0
+
+
+def test_money_rounding_is_decimal_half_up():
+    assert policy._line_cost(1.005, 1) == 1.01
+    assert policy._line_cost(2.675, 1) == 2.68
+    assert policy._line_cost(0.335, 3) == 1.01
+
+
+def test_buyer_unit_cost_override_wins_over_factual_cost():
+    assert policy._resolved_unit_cost(10.0, {"unit_cost_override": 12.3456}) == 12.3456
+    assert policy._resolved_unit_cost(10.0, {"unit_cost_override": 0}) == 10.0
+    assert policy._resolved_unit_cost(10.0, None) == 10.0
+
+
+def test_supplier_cost_median_preserves_sql_decimal_precision(monkeypatch):
+    monkeypatch.setattr(
+        cost_repo,
+        "_fetch_cost_rows",
+        lambda product_ids, as_of, history_days, producer_id=None: [
+            {"pid": 1, "producer_id": 10, "cost_eur": Decimal("1.0001")},
+            {"pid": 1, "producer_id": 10, "cost_eur": Decimal("1.0002")},
+        ],
+    )
+
+    assert cost_repo.producer_unit_costs_eur(10, [1], "2026-07-25") == {1: 1.0002}
 
 
 def test_method_for_xyz_dispatch():

@@ -12,11 +12,10 @@ _headers = {"X-Internal-Api-Key": main.settings.internal_api_key} if main.settin
 
 
 def _stub_profile(monkeypatch, *, rows: list[dict] | None = None, meta: dict | None = None) -> None:
-    monkeypatch.setattr(
-        main,
-        "_portfolio",
-        lambda as_of: {"as_of": as_of, "model_version": "products-test-v1", "rows": rows or []},
-    )
+    async def _fake_portfolio(as_of):
+        return {"as_of": as_of, "model_version": "products-test-v1", "rows": rows or []}
+
+    monkeypatch.setattr(main, "_portfolio", _fake_portfolio)
     monkeypatch.setattr(main.sig, "product_meta", lambda product_ids: meta or {})
 
 
@@ -189,3 +188,26 @@ def test_builder_rejects_duplicate_months_and_non_finite_numbers():
             pass
         else:
             raise AssertionError("malformed repository aggregates must be rejected")
+
+
+def test_builder_uses_half_up_money_and_explicit_quantity_scale():
+    response = product_analytics.build_product_analytics(
+        product_id=1,
+        as_of="2026-07-10",
+        months=1,
+        model_version="test",
+        snapshot={"product_id": 1, "found": True},
+        monthly_rows=[
+            {
+                "ym": "2026-07",
+                "units": Decimal("2.34565"),
+                "order_count": 1,
+                "revenue_eur": Decimal("1.005"),
+            }
+        ],
+    )
+
+    point = response.sales_series[0]
+    assert point.units == 2.3457
+    assert point.revenue_eur == 1.01
+    assert point.avg_price_eur == 0.4285

@@ -11,6 +11,7 @@ raise LookupError, and a real client must score within 0..100.
 from __future__ import annotations
 
 import os
+from datetime import UTC, datetime
 
 import pytest
 
@@ -21,7 +22,20 @@ _DB_ENV = ("DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD")
 
 
 def _db_configured() -> bool:
-    return all(os.environ.get(k) for k in _DB_ENV)
+    if all(os.environ.get(k) for k in _DB_ENV):
+        return True
+    try:
+        from app.core.config import get_settings
+
+        settings = get_settings()
+        return bool(
+            settings.db_host
+            and settings.db_name
+            and settings.db_user
+            and settings.db_password
+        )
+    except Exception:
+        return False
 
 
 skip_no_db = pytest.mark.skipif(
@@ -29,7 +43,30 @@ skip_no_db = pytest.mark.skipif(
     reason="DB env not set (DB_HOST/DB_NAME/DB_USER/DB_PASSWORD); run via 'make integration'",
 )
 
-_AS_OF = "2026-06-15"
+
+def _settings_db_configured() -> bool:
+    """Also honor the service's local .env, which pydantic-settings loads in dev."""
+    try:
+        from app.core.config import get_settings
+
+        settings = get_settings()
+        return bool(
+            settings.db_host
+            and settings.db_name
+            and settings.db_user
+            and settings.db_password
+        )
+    except Exception:
+        return False
+
+
+skip_no_settings_db = pytest.mark.skipif(
+    not _settings_db_configured(),
+    reason="DB settings unavailable; configure service .env or DB_* environment variables",
+)
+
+_CURRENT_AS_OF = datetime.now(UTC).strftime("%Y-%m-%d")
+_AS_OF = os.environ.get("SOLVENCY_TEST_AS_OF", _CURRENT_AS_OF)
 
 
 @pytest.fixture(scope="module")
@@ -51,8 +88,9 @@ def uah_client(repo) -> int:
     """A real client whose turnover flows through a UAH agreement in the window."""
     from app.data.db import query
 
+    placeholder, synthetic = repo._synthetic_not_in()
     rows = query(
-        """
+        f"""
         SELECT TOP 1 ca.ClientID AS client_id
         FROM dbo.Sale s
         JOIN dbo.[Order] o ON o.ID = s.OrderID
@@ -61,7 +99,7 @@ def uah_client(repo) -> int:
         JOIN dbo.Agreement a ON a.ID = ca.AgreementID
         WHERE a.CurrencyID = :uah
               AND oi.IsValidForCurrentSale = 1
-              AND oi.ProductID <> 25422404
+              AND oi.ProductID NOT IN {placeholder}
               AND s.Created > '2000-01-01'
               AND s.Created <= :asof
               AND s.Created >= DATEADD(month, -12, :asof)
@@ -70,7 +108,7 @@ def uah_client(repo) -> int:
                AND SUM(oi.Qty * oi.PricePerItem) > 10000
         ORDER BY SUM(oi.Qty * oi.PricePerItem) DESC
         """,
-        {"uah": UAH_CURRENCY_ID, "asof": _AS_OF},
+        {"uah": UAH_CURRENCY_ID, "asof": _AS_OF, **synthetic},
     )
     if not rows:
         pytest.skip("no UAH client with material recent turnover in dev DB")
@@ -81,13 +119,14 @@ def uah_client(repo) -> int:
 def test_uah_turnover_bucket_is_not_divided_by_fx_rate(repo, uah_client):
     from app.data.db import query
 
+    placeholder, synthetic = repo._synthetic_not_in()
     buckets = repo.turnover_eur_by_currency(uah_client, _AS_OF, 12, _AS_OF)
     uah = [b for b in buckets if b["currency_id"] == UAH_CURRENCY_ID]
     assert uah, f"client {uah_client} has no UAH bucket"
     service_value = float(uah[0]["turnover_eur"])
 
     rows = query(
-        """
+        f"""
         SELECT
             ISNULL(SUM(oi.Qty * oi.PricePerItem), 0) AS no_convert,
             ISNULL(SUM(
@@ -101,12 +140,18 @@ def test_uah_turnover_bucket_is_not_divided_by_fx_rate(repo, uah_client):
         WHERE ca.ClientID = :cid
               AND a.CurrencyID = :uah
               AND oi.IsValidForCurrentSale = 1
-              AND oi.ProductID <> 25422404
+              AND oi.ProductID NOT IN {placeholder}
               AND s.Created > '2000-01-01'
               AND s.Created <= :asof
               AND s.Created >= DATEADD(month, -12, :asof)
         """,
-        {"cid": uah_client, "uah": UAH_CURRENCY_ID, "asof": _AS_OF, "fx": _AS_OF},
+        {
+            "cid": uah_client,
+            "uah": UAH_CURRENCY_ID,
+            "asof": _AS_OF,
+            "fx": _AS_OF,
+            **synthetic,
+        },
     )
     no_convert = float(rows[0]["no_convert"])
     buggy_convert = float(rows[0]["buggy_convert"])
@@ -155,9 +200,96 @@ def test_real_uah_client_scores_in_band(service, uah_client):
     assert result.model_version == "creditscore-v3"
 
 
-# --- Buyer-role applicability (solvency applies ONLY to Buyer-role entities) ---
+def _return_anomaly_client(repo, having: str) -> int | None:
+    from app.data.db import query
 
-PROVIDER_ONLY_CLIENT_ID = 410170  # Універсал банк АТ — provider-only, no Buyer role
+    placeholder, synthetic = repo._synthetic_not_in()
+    rows = query(
+        f"""
+        SELECT TOP 1 sr.ClientID AS client_id
+        FROM dbo.SaleReturnItem sri
+        JOIN dbo.OrderItem oi ON oi.ID = sri.OrderItemID
+        JOIN dbo.SaleReturn sr ON sr.ID = sri.SaleReturnID
+             AND sr.Deleted = 0 AND sr.IsCanceled = 0
+        WHERE sri.Deleted = 0
+              AND oi.ProductID IS NOT NULL
+              AND oi.ProductID NOT IN {placeholder}
+              AND sr.FromDate <= :asof
+              AND sr.FromDate >= DATEADD(month, -12, :asof)
+        GROUP BY sr.ClientID, sri.SaleReturnID, sri.OrderItemID
+        HAVING {having}
+        ORDER BY sr.ClientID
+        """,
+        {"asof": _CURRENT_AS_OF, **synthetic},
+    )
+    return int(rows[0]["client_id"]) if rows else None
+
+
+def _assert_return_rate_matches_canonical_qty(repo, client_id: int):
+    from app.data.db import query
+
+    placeholder, synthetic = repo._synthetic_not_in()
+    rows = query(
+        f"""
+        SELECT
+            (
+                SELECT ISNULL(SUM(sri.Qty), 0)
+                FROM dbo.SaleReturnItem sri
+                JOIN dbo.OrderItem oi ON oi.ID = sri.OrderItemID
+                JOIN dbo.SaleReturn sr ON sr.ID = sri.SaleReturnID
+                     AND sr.Deleted = 0 AND sr.IsCanceled = 0
+                WHERE sri.Deleted = 0
+                      AND oi.ProductID IS NOT NULL
+                      AND oi.ProductID NOT IN {placeholder}
+                      AND sr.ClientID = :cid
+                      AND sr.FromDate <= :asof
+                      AND sr.FromDate >= DATEADD(month, -12, :asof)
+            ) AS return_qty,
+            (
+                SELECT ISNULL(SUM(oi.Qty), 0)
+                FROM dbo.Sale s
+                JOIN dbo.[Order] o ON o.ID = s.OrderID
+                JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
+                JOIN dbo.ClientAgreement ca ON ca.ID = s.ClientAgreementID
+                WHERE ca.ClientID = :cid
+                      AND oi.IsValidForCurrentSale = 1
+                      AND oi.ProductID NOT IN {placeholder}
+                      AND s.Created <= :asof
+                      AND s.Created >= DATEADD(month, -12, :asof)
+            ) AS sold_qty
+        """,
+        {"cid": client_id, "asof": _CURRENT_AS_OF, **synthetic},
+    )
+    sold_qty = float(rows[0]["sold_qty"] or 0)
+    if sold_qty <= 0:
+        pytest.skip(f"return anomaly client {client_id} has no valid sold qty in the window")
+    expected = float(rows[0]["return_qty"] or 0) / sold_qty
+    assert repo.return_qty_rate(client_id, _CURRENT_AS_OF, 12) == pytest.approx(
+        expected, rel=0, abs=1e-12
+    )
+
+
+@skip_no_settings_db
+def test_partial_return_rate_uses_salereturnitem_qty(repo):
+    client_id = _return_anomaly_client(
+        repo, "SUM(sri.Qty) > 0 AND SUM(sri.Qty) < MAX(oi.Qty)"
+    )
+    if client_id is None:
+        pytest.skip("no partial active return in the current integration dataset")
+    _assert_return_rate_matches_canonical_qty(repo, client_id)
+
+
+@skip_no_settings_db
+def test_multiple_return_rows_are_summed(repo):
+    client_id = _return_anomaly_client(
+        repo, "COUNT(*) > 1 AND SUM(sri.Qty) <> MAX(sri.Qty)"
+    )
+    if client_id is None:
+        pytest.skip("no multi-row active return in the current integration dataset")
+    _assert_return_rate_matches_canonical_qty(repo, client_id)
+
+
+# --- Buyer-role applicability (solvency applies ONLY to Buyer-role entities) ---
 
 
 @pytest.fixture(scope="module")
@@ -179,9 +311,39 @@ def buyer_client(repo) -> int:
     return int(rows[0]["client_id"])
 
 
+@pytest.fixture(scope="module")
+def provider_only_client() -> int:
+    """A current entity with at least one role but no active Buyer role."""
+    from app.data.db import query
+
+    rows = query(
+        """
+        SELECT TOP 1 c.ID AS client_id
+        FROM dbo.Client c
+        WHERE c.Deleted = 0
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM dbo.ClientInRole cir
+                  JOIN dbo.ClientType ct ON ct.ID = cir.ClientTypeID
+                  WHERE cir.ClientID = c.ID
+                        AND cir.Deleted = 0
+                        AND ct.[Type] = 0)
+              AND EXISTS (
+                  SELECT 1
+                  FROM dbo.ClientInRole cir
+                  WHERE cir.ClientID = c.ID AND cir.Deleted = 0)
+        ORDER BY c.ID
+        """,
+        {},
+    )
+    if not rows:
+        pytest.skip("no current provider-only/non-buyer entity")
+    return int(rows[0]["client_id"])
+
+
 @skip_no_db
-def test_provider_only_has_no_buyer_role(repo):
-    assert repo.has_buyer_role(PROVIDER_ONLY_CLIENT_ID) is False
+def test_provider_only_has_no_buyer_role(repo, provider_only_client):
+    assert repo.has_buyer_role(provider_only_client) is False
 
 
 @skip_no_db
@@ -190,14 +352,14 @@ def test_buyer_client_has_buyer_role(repo, buyer_client):
 
 
 @skip_no_db
-def test_provider_only_score_not_applicable(service):
-    result = service.score_client(PROVIDER_ONLY_CLIENT_ID, None, _AS_OF, 12, use_cache=False)
+def test_provider_only_score_not_applicable(service, provider_only_client):
+    result = service.score_client(provider_only_client, None, _AS_OF, 12, use_cache=False)
     assert result.applicable is False
     assert result.score is None
     assert result.rating is None
     assert result.sub_factors is None
     assert result.raw_score is None
-    assert result.client_id == PROVIDER_ONLY_CLIENT_ID
+    assert result.client_id == provider_only_client
 
 
 @skip_no_db
@@ -209,17 +371,35 @@ def test_buyer_client_score_applicable_in_band(service, buyer_client):
     assert result.rating in {"A", "B", "C", "D"}
 
 
-# --- v3 scorecard sanity: a known severely-overdue buyer must land in band D ---
+# --- v3 scorecard sanity: a current severe/no-limit buyer must land in band D ---
 
-TRAMP_OIL_CLIENT_ID = 411780  # ТРАМП ОЙЛ — large 180+ overdue exposure, SEV180 positive
+
+@pytest.fixture(scope="module")
+def severe_no_limit_buyer() -> int:
+    """Resolve a live D-regression fixture by business signals, never by score/rating."""
+    from app.risk import dataset
+
+    clients = dataset.buyer_ids()
+    labels = dataset.label_sev180(_AS_OF, clients)
+    severe_ids = [client_id for client_id in clients if labels[client_id] == 1]
+    features = dataset.features_many(severe_ids, _AS_OF, 12)
+    selected = [
+        client_id
+        for client_id in severe_ids
+        if features[client_id]["credit_limit_eur"] == 0.0
+    ]
+    if not selected:
+        pytest.skip("no current SEV180 buyer without a controlled credit limit")
+    return selected[0]
 
 
 @skip_no_db
-def test_known_overdue_buyer_is_band_d(service):
-    """ТРАМП ОЙЛ scores as high-risk (band D, low score) under the v3 current-state scorecard."""
-    result = service.score_client(TRAMP_OIL_CLIENT_ID, None, "2026-06-25", 12, use_cache=False)
+def test_current_severe_no_limit_buyer_is_band_d(service, severe_no_limit_buyer):
+    result = service.score_client(
+        severe_no_limit_buyer, None, _AS_OF, 12, use_cache=False
+    )
     assert result.applicable is True
     assert result.rating == "D"
     assert result.score is not None and result.score < 65
     assert result.pd is not None and result.pd > 0.15  # band D threshold
-    assert result.forward_risk is not None
+    assert result.forward_risk is None

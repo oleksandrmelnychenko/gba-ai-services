@@ -6,13 +6,16 @@ Every mutation also appends an immutable record to task_events.
 """
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
+from app.core.money import cents, decimal_value
 from app.data import mongo
 from app.domain.models import (
     ACTIVE,
@@ -84,7 +87,7 @@ def _ranking_field_updates(doc: dict) -> dict:
         expected_value = _derived_expected_value(doc)
         if expected_value is None:
             expected_value = 0.0
-        updates["expected_value"] = round(expected_value, 2)
+        updates["expected_value"] = cents(expected_value)
     else:
         expected_value = _float_score(expected_value)
 
@@ -155,6 +158,34 @@ def _inbox_sort_key(doc: dict) -> tuple:
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def business_month_bounds_utc(as_of: str | date) -> tuple[datetime, datetime]:
+    """Return the configured business calendar month as an aware UTC half-open interval.
+
+    MongoDB stores BSON datetimes as UTC milliseconds. PyMongo treats legacy naive datetimes as
+    UTC on write and returns aware UTC values because our client is ``tz_aware=True``. Supplying
+    explicit aware UTC query bounds therefore gives both legacy and current documents one
+    unambiguous comparison convention.
+    """
+    business_date = date.fromisoformat(as_of) if isinstance(as_of, str) else as_of
+    timezone = ZoneInfo(get_settings().timezone)
+    month_start_local = datetime(
+        business_date.year,
+        business_date.month,
+        1,
+        tzinfo=timezone,
+    )
+    if business_date.month == 12:
+        next_month_local = datetime(business_date.year + 1, 1, 1, tzinfo=timezone)
+    else:
+        next_month_local = datetime(
+            business_date.year,
+            business_date.month + 1,
+            1,
+            tzinfo=timezone,
+        )
+    return month_start_local.astimezone(UTC), next_month_local.astimezone(UTC)
 
 
 class TransitionError(Exception):
@@ -359,6 +390,41 @@ def sweep_expired() -> int:
     return res.deleted_count
 
 
+def sweep_orphaned() -> int:
+    """Terminal-close active tasks whose client_id no longer exists as a row in dbo.Client
+    (dev re-mint / data wipe): status -> ORPHANED with a reason, documents KEPT for audit (never
+    deleted). System-only transition — not reachable via the status API (no inbound edge in
+    ALLOWED_TRANSITIONS), applied directly like the other sweeps. Returns the number closed."""
+    from app.data import signals_repository
+    active_values = list(s.value for s in ACTIVE)
+    cids = [c for c in mongo.tasks().distinct("client_id", {"status": {"$in": active_values}})
+            if c is not None]
+    if not cids:
+        return 0
+    dead = sorted(set(cids) - signals_repository.existing_client_ids(cids))
+    if not dead:
+        return 0
+    now = _now()
+    reason = "client_id absent from dbo.Client (orphaned by data wipe/re-mint)"
+    orphaned = 0
+    cursor = mongo.tasks().find(
+        {"status": {"$in": active_values}, "client_id": {"$in": dead}},
+        {"task_key": 1, "status": 1, "client_id": 1})
+    for doc in cursor:
+        res = mongo.tasks().update_one(
+            {"_id": doc["_id"], "status": doc["status"]},
+            {"$set": {"status": TaskStatus.ORPHANED.value, "orphan_reason": reason,
+                      "updated_at": now, "resolved_at": now},
+             "$push": {"status_history": {"from": doc["status"], "to": TaskStatus.ORPHANED.value,
+                                          "at": now, "by": "system", "reason": reason}}})
+        if res.modified_count:
+            orphaned += 1
+            _event(doc["task_key"], "status:orphaned", by="system",
+                   reason=f"client {doc.get('client_id')} absent from dbo.Client")
+    log.info("orphan_sweep_done", orphaned=orphaned, dead_clients=len(dead))
+    return orphaned
+
+
 def feedback_rejections(manager_id: int, window_days: int = 90) -> dict:
     """Recent negative signals per (client_id, task_type): tasks the manager DISMISSED or completed
     without a sale (done-not-sold), over the window. Used to penalise repeatedly-rejected pairs so
@@ -548,13 +614,13 @@ def _active_inbox_query(manager_id: int) -> dict:
     }
 
 
-def dashboard_counts(manager_id: int) -> dict:
+def dashboard_counts(manager_id: int, as_of: str) -> dict:
     """Chart-ready counts for a manager dashboard, computed from the SAME task store the cockpit
     inbox/count use — no separate scoring. Returns:
       task_type_mix: active inbox tasks by task_type (inbox surfacing rule);
       urgency_mix:   active inbox tasks by urgency band (same rule as count_active_by_urgency);
-      completed_vs_open: open = active inbox count; done/dismissed = resolved this calendar month
-                         (same month window as team_stats), so the manager view matches the head view.
+      completed_vs_open: open = active inbox count; done/dismissed = resolved in ``as_of``'s Kyiv
+                         calendar month (same window as team_stats), so manager/head views match.
     """
     type_mix: dict[str, int] = {}
     urgency_mix = {"critical": 0, "high": 0, "normal": 0, "low": 0}
@@ -568,9 +634,7 @@ def dashboard_counts(manager_id: int) -> dict:
         if u in urgency_mix:
             urgency_mix[u] += 1
 
-    now = _now()
-    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    next_month = (month_start + timedelta(days=32)).replace(day=1)
+    month_start, next_month = business_month_bounds_utc(as_of)
     done_month = mongo.tasks().count_documents(
         {"manager_id": manager_id, "status": TaskStatus.DONE.value,
          "resolved_at": {"$gte": month_start, "$lt": next_month}})
@@ -595,13 +659,11 @@ def critical_active_count(manager_id: int) -> int:
     return mongo.tasks().count_documents(q)
 
 
-def team_stats(manager_id: int) -> dict:
+def team_stats(manager_id: int, as_of: str) -> dict:
     """Per-manager task throughput for the head dashboard. active = ACTIVE-status count;
-    done_month/dismissed_month = tasks moved to that terminal status with updated_at in the
-    current calendar month; sold_month / revenue_month = done-this-month tasks with a sold outcome."""
-    now = _now()
-    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    next_month = (month_start + timedelta(days=32)).replace(day=1)
+    done_month/dismissed_month = tasks resolved in ``as_of``'s Kyiv calendar month;
+    sold_month / revenue_month = done-in-that-month tasks with a sold outcome."""
+    month_start, next_month = business_month_bounds_utc(as_of)
 
     active = mongo.tasks().count_documents(
         {"manager_id": manager_id, "status": {"$in": list(s.value for s in ACTIVE)}})
@@ -609,7 +671,7 @@ def team_stats(manager_id: int) -> dict:
         {"manager_id": manager_id, "generated_at": {"$gte": month_start, "$lt": next_month}})
 
     done_month = sold_month = dismissed_month = 0
-    revenue_month = 0.0
+    revenue_month = Decimal("0")
     closed = mongo.tasks().find(
         {"manager_id": manager_id,
          "status": {"$in": [TaskStatus.DONE.value, TaskStatus.DISMISSED.value]},
@@ -623,10 +685,10 @@ def team_stats(manager_id: int) -> dict:
         outcome = doc.get("outcome") or {}
         if outcome.get("sold"):
             sold_month += 1
-            revenue_month += float(outcome.get("amount") or 0.0)
+            revenue_month += decimal_value(outcome.get("amount"))
     return {"active": active, "generated_month": generated_month, "done_month": done_month,
             "sold_month": sold_month, "dismissed_month": dismissed_month,
-            "revenue_month": round(revenue_month, 2),
+            "revenue_month": cents(revenue_month),
             # KPI (effectiveness) — derived, no extra query:
             "close_rate": close_rate(done_month, dismissed_month),       # actioned vs resolved
             "conversion_rate": conversion_rate(sold_month, done_month)}  # sold vs done

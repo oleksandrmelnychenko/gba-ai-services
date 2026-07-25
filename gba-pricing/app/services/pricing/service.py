@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
@@ -12,6 +13,7 @@ from app.domain.models import (
     PeerBand,
     PriceRecommendation,
 )
+from app.domain.money import HUNDRED, ZERO, MoneyValue, as_decimal, optional_decimal
 from app.services.pricing import elasticity as elas
 from app.services.pricing import recommend as engine
 
@@ -22,14 +24,35 @@ def _as_of(as_of_date: str | None) -> str:
     return as_of_date or datetime.now().strftime("%Y-%m-%d")
 
 
-def _hydrate(data: dict) -> PriceRecommendation:
+def _hydrate(
+    data: dict,
+    *,
+    expected_product_id: int,
+    expected_product_net_uid: str,
+    expected_agreement_net_uid: str,
+) -> PriceRecommendation | None:
+    """Validate cached identity before hydrating.
+
+    Cache entries written before the canonical product UUID was added are intentionally misses;
+    a price computed for one entity is never allowed to cross an identity boundary.
+    """
+    if (
+        data.get("product_id") != expected_product_id
+        or str(data.get("product_net_uid") or "").lower()
+        != expected_product_net_uid.lower()
+        or str(data.get("client_agreement_netuid") or "").lower()
+        != expected_agreement_net_uid.lower()
+    ):
+        return None
     band = data.get("discount_band")
     peer = data.get("peer_band") or {}
     return PriceRecommendation(
         product_id=data["product_id"],
+        product_net_uid=data["product_net_uid"],
         client_agreement_netuid=data["client_agreement_netuid"],
         currency=data.get("currency", "EUR"),
         baseline_price=data.get("baseline_price"),
+        baseline_source=data.get("baseline_source"),
         recommended_price=data.get("recommended_price"),
         price_floor=data.get("price_floor"),
         unit_cost_eur=data.get("unit_cost_eur"),
@@ -63,11 +86,19 @@ def recommend_price(
     Resolves both entities (LookupError -> 404 at the API), pulls baseline/cost/peer/segment from
     the repository, then delegates the pure A+B math to the engine. Redis-cached on
     (product, agreement, as_of, margin, vat, culture); graceful-degrade on cache failure.
+
+    A NULL/non-positive engine baseline (e.g. inactive/deleted Agreement -> the live world
+    resolver returns NULL) falls back to the client's recent same-Organization-world realized
+    price (repo.client_world_fallback_baseline, baseline_source='client_world_fallback'); only
+    when that too is unavailable does the explicit no-baseline result go out.
     """
     started = datetime.now()
     settings = get_settings()
     as_of = _as_of(as_of_date)
     margin = settings.target_margin_pct if target_margin_pct is None else target_margin_pct
+    margin_value = as_decimal(margin)
+    if margin_value < ZERO or margin_value > HUNDRED:
+        raise ValueError("target_margin_pct must be between 0 and 100")
     window = settings.trailing_window_months
     fx_date = settings.resolve_fx_date(as_of_date)
 
@@ -88,11 +119,33 @@ def recommend_price(
     if use_cache:
         cached = cache.get(key)
         if cached is not None:
-            return _hydrate(cached)
+            hydrated = _hydrate(
+                cached,
+                expected_product_id=pid,
+                expected_product_net_uid=p_net_uid,
+                expected_agreement_net_uid=ca_net_uid,
+            )
+            if hydrated is not None:
+                return hydrated
 
     baseline = repo.baseline_price(p_net_uid, ca_net_uid, culture, with_vat)
+    baseline_source = engine.BASELINE_SOURCE_AGREEMENT
     if baseline is None or baseline <= 0:
-        result = _no_baseline_recommendation(pid, ca_net_uid, as_of)
+        fallback = repo.client_world_fallback_baseline(
+            pid, agreement["client_agreement_id"], as_of, window
+        )
+        if fallback is not None and fallback["fallback_price"] > 0:
+            baseline = fallback["fallback_price"]
+            baseline_source = engine.BASELINE_SOURCE_CLIENT_WORLD
+            log.info(
+                "baseline_client_world_fallback",
+                product_id=pid,
+                client_agreement_netuid=ca_net_uid,
+                fallback_price=str(baseline),
+                n_lines=fallback["n"],
+            )
+    if baseline is None or baseline <= 0:
+        result = _no_baseline_recommendation(pid, p_net_uid, ca_net_uid, as_of)
         if use_cache:
             cache.set(key, result.model_dump(mode="json"))
         latency = (datetime.now() - started).total_seconds() * 1000
@@ -101,6 +154,7 @@ def recommend_price(
             product_id=pid,
             client_agreement_netuid=ca_net_uid,
             baseline_price=result.baseline_price,
+            baseline_source=result.baseline_source,
             recommended_price=result.recommended_price,
             price_floor=result.price_floor,
             suggested_discount_pct=result.suggested_discount_pct,
@@ -144,7 +198,9 @@ def recommend_price(
         target_margin_pct=margin,
         as_of_date=as_of,
         elasticity_estimate=elasticity_estimate,
+        baseline_source=baseline_source,
     )
+    result = result.model_copy(update={"product_net_uid": p_net_uid})
 
     if use_cache:
         cache.set(key, result.model_dump(mode="json"))
@@ -155,6 +211,7 @@ def recommend_price(
         product_id=pid,
         client_agreement_netuid=ca_net_uid,
         baseline_price=result.baseline_price,
+        baseline_source=result.baseline_source,
         recommended_price=result.recommended_price,
         price_floor=result.price_floor,
         suggested_discount_pct=result.suggested_discount_pct,
@@ -209,14 +266,19 @@ def estimate_elasticity(pid: int, pg_id: int | None, as_of: str, window: int) ->
 
 
 def _no_baseline_recommendation(
-    product_id: int, client_agreement_netuid: str, as_of: str
+    product_id: int,
+    product_net_uid: str,
+    client_agreement_netuid: str,
+    as_of: str,
 ) -> PriceRecommendation:
-    """No live engine price (baseline missing or <=0): the product is unpriced for this
-    agreement (no live ProductPricing at the base tier). Emit an explicit no-baseline result with
-    all targets None and LOW confidence so the console suppresses it — never run the A+B math on a
-    0 baseline (which would recommend 0.0 / a bogus floor)."""
+    """No live engine price (baseline missing or <=0) AND the client-world fallback found no
+    same-world realized lines (or the requested world is undeterminable — worlds are never
+    mixed). Emit an explicit no-baseline result with all targets None and LOW confidence so the
+    console suppresses it — never run the A+B math on a 0 baseline (which would recommend 0.0 /
+    a bogus floor)."""
     return PriceRecommendation(
         product_id=product_id,
+        product_net_uid=product_net_uid,
         client_agreement_netuid=client_agreement_netuid,
         currency="EUR",
         baseline_price=None,
@@ -234,7 +296,10 @@ def _no_baseline_recommendation(
     )
 
 
-def _marked_up_from_baseline(baseline: float | None, applied_discount_pct: float) -> float | None:
+def _marked_up_from_baseline(
+    baseline: MoneyValue | None,
+    applied_discount_pct: MoneyValue,
+) -> Decimal | None:
     """The engine's pre-discount list price, derived from the authoritative baseline:
     baseline = marked_up * (1 - applied_discount/100)  (OneTimeDiscount=0 with NULL OrderItemId),
     so marked_up = baseline / (1 - applied/100). applied = the active group DiscountRate on the
@@ -242,8 +307,10 @@ def _marked_up_from_baseline(baseline: float | None, applied_discount_pct: float
     DiscountRate=0). Deriving marked_up from baseline is correct for promo AND non-promo without
     re-resolving the pricing tier, and matches the price-book reconstruction on the normal branch.
     suggested DiscountRate is then solved as (1 - recommended/marked_up)*100."""
-    if baseline is None:
+    baseline_value = optional_decimal(baseline)
+    if baseline_value is None:
         return None
-    if applied_discount_pct >= 100.0:
-        return baseline
-    return baseline / (1.0 - applied_discount_pct / 100.0)
+    discount_pct = as_decimal(applied_discount_pct)
+    if discount_pct >= HUNDRED:
+        return baseline_value
+    return baseline_value / (Decimal(1) - discount_pct / HUNDRED)

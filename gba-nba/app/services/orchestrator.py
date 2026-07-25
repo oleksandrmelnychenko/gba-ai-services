@@ -199,6 +199,10 @@ def generate_for_manager(manager_id: int, as_of: str | None = None) -> dict:
     active = lifecycle.active_count(manager_id)
     counters = {"persisted": 0, "skipped_muted": 0, "skipped_capped": 0, "refreshed": 0,
                 "crit_debt_reserved": 0}
+    # Track final capacity rejects by identity. A critical task admitted by the reserve must stop
+    # being "skipped", but only if that exact task was counted in the first two passes. Using a set
+    # also makes duplicate generator candidates and concurrent task disappearance accounting-safe.
+    capped_task_keys: set[str] = set()
 
     def attempt(task) -> None:
         nonlocal active
@@ -207,13 +211,13 @@ def generate_for_manager(manager_id: int, as_of: str | None = None) -> dict:
             counters["refreshed"] += 1
             return
         if active >= cap:
-            counters["skipped_capped"] += 1
+            capped_task_keys.add(task.task_key)
             return
         if lifecycle.is_muted(manager_id, task.client_id, task.task_type.value):
             counters["skipped_muted"] += 1
             return
         if per_client[task.client_id] >= s.max_tasks_per_client_per_day:
-            counters["skipped_capped"] += 1
+            capped_task_keys.add(task.task_key)
             return
         lifecycle.upsert_generated(task)
         per_client[task.client_id] += 1
@@ -256,10 +260,11 @@ def generate_for_manager(manager_id: int, as_of: str | None = None) -> dict:
             per_type[TaskType.DEBT_FOLLOWUP] += 1
             active += 1
             counters["persisted"] += 1
-            counters["skipped_capped"] -= 1
+            capped_task_keys.discard(task.task_key)
             admitted += 1
         counters["crit_debt_reserved"] = admitted
 
+    counters["skipped_capped"] = len(capped_task_keys)
     stats = {"manager_id": manager_id, "as_of": as_of, "candidates": len(candidates),
              "generators_total": len(_GENERATORS), "generators_failed": generators_failed,
              "by_type": {tt.value: n for tt, n in per_type.items()}, **counters}

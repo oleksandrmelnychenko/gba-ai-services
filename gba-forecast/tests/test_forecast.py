@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from datetime import date
+from decimal import Decimal
+
+import pytest
 
 from app.core.config import get_settings
 from app.services import forecast as fc
@@ -136,6 +139,17 @@ def test_forecast_points_empty_when_too_thin():
 
 def test_forecast_points_never_crashes_on_zero_horizon():
     assert fc.forecast_points({"2026-06": 10.0}, date(2026, 6, 24), CFG, horizon=0) == []
+
+
+def test_eur_boundary_uses_decimal_half_up_and_rejects_non_finite():
+    assert fc.eur_cents(Decimal("10.004")) == 10.0
+    assert fc.eur_cents(Decimal("10.005")) == 10.01
+    assert fc.eur_cents(Decimal("10.995")) == 11.0
+    assert fc.eur_cents(Decimal("-0.01")) == 0.0
+
+    for invalid in (float("nan"), float("inf"), float("-inf"), "not-a-number"):
+        with pytest.raises(ValueError, match="finite"):
+            fc.eur_cents(invalid)
 
 
 def test_forecast_points_auto_picks_sba_for_intermittent_series():

@@ -23,7 +23,7 @@ class Settings(BaseSettings):
 
     redis_host: str = "127.0.0.1"
     redis_port: int = 6379
-    redis_db: int = 3
+    redis_db: int = 4
     cache_ttl: int = 3600
     redis_retry_interval_seconds: int = 30
 
@@ -46,10 +46,18 @@ class Settings(BaseSettings):
     # bump on any forecast-method change so outcomes can be sliced/A-B'd by version
     model_version: str = "forecast-v1"
 
+    # Optional override for the synthetic «Ввід боргів» debt-entry ProductID. 0 = resolve it
+    # dynamically from dbo.Product (the 1С sync re-mints the row, so a pinned ID goes stale).
+    synthetic_product_id: int = 0
+
     # Forecast policy (env-tunable; calibrate on real data — never guess).
     forecast_horizon_months: int = 6  # default # of months to project forward
     max_forecast_horizon_months: int = 24  # hard API cap to prevent accidental heavy calls
     history_months: int = 24  # trailing window of monthly history fed to the model
+    # Health is business-ready only while the newest canonical (non-synthetic) sale consumed by
+    # the model is no older than this. Seven days tolerates weekends without masking a stopped
+    # 1С/source synchronization for weeks.
+    source_max_age_hours: int = 168
     # Mode selecting how the monthly EUR sale series is projected forward:
     #   "auto"        — per-series method selection by Syntetos-Boylan demand quadrant
     #                   (smooth -> EWMA, erratic -> moving_avg, intermittent/lumpy -> SBA);
@@ -77,6 +85,7 @@ class Settings(BaseSettings):
         "max_forecast_horizon_months",
         "history_months",
         "min_history_months",
+        "source_max_age_hours",
     )
     @classmethod
     def positive_int(cls, value: int) -> int:
@@ -106,6 +115,8 @@ class Settings(BaseSettings):
 
         if self.forecast_horizon_months > self.max_forecast_horizon_months:
             raise RuntimeError("FORECAST_HORIZON_MONTHS cannot exceed MAX_FORECAST_HORIZON_MONTHS")
+        if self.min_history_months > self.history_months:
+            raise RuntimeError("MIN_HISTORY_MONTHS cannot exceed HISTORY_MONTHS")
 
     @property
     def sqlalchemy_url(self) -> str:

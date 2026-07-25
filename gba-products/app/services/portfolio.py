@@ -7,6 +7,9 @@ still computed per-SKU (where cost is known) and feeds the health-score.
 """
 from __future__ import annotations
 
+from decimal import Decimal
+
+from app.core import exact_numbers as exact
 from app.core.config import get_settings
 from app.data import signals_repository as sig
 from app.services import classification as cl
@@ -17,64 +20,149 @@ from app.services.stock_health import classify_band
 def build_portfolio(as_of: str) -> dict:
     cfg = get_settings()
 
-    stock = {int(r["product_id"]): r for r in sig.on_hand_stock()}
-    vel = {int(r["product_id"]): r for r in sig.sales_velocity(as_of, cfg.velocity_window_days)}
-    sold_recently = sig.sold_product_ids(as_of, cfg.dead_window_days)
-    price = {int(r["product_id"]): float(r["avg_price_eur"] or 0)
-             for r in sig.avg_sale_price_eur(as_of, cfg.dead_window_days)}
-    rets = {int(r["product_id"]): float(r["returned_qty"] or 0)
-            for r in sig.returns_for_products(as_of, cfg.return_window_days)}
+    stock = _index_by_product(sig.on_hand_stock(), "on_hand_stock")
+    vel = _index_by_product(
+        sig.sales_velocity(as_of, cfg.velocity_window_days),
+        "sales_velocity",
+    )
+    sold_recently = {
+        exact.positive_int(product_id, "sold_product_ids.product_id")
+        for product_id in sig.sold_product_ids(as_of, cfg.dead_window_days)
+    }
+    prices = _index_by_product(
+        sig.avg_sale_price_eur(as_of, cfg.dead_window_days),
+        "avg_sale_price_eur",
+    )
+    rets = _index_by_product(
+        sig.returns_for_products(as_of, cfg.return_window_days),
+        "returns_for_products",
+    )
 
     labels = cl.month_labels(as_of, cfg.classify_months)
-    monthly: dict[int, dict[str, float]] = {}
+    monthly: dict[int, dict[str, Decimal]] = {}
     for r in sig.monthly_units(as_of, cfg.classify_months):
-        monthly.setdefault(int(r["product_id"]), {})[r["ym"]] = float(r["units"] or 0)
+        pid = exact.positive_int(r.get("product_id"), "monthly_units.product_id")
+        label = str(r.get("ym") or "")
+        if label not in labels:
+            raise ValueError(f"monthly_units returned unexpected month {label!r}")
+        product_months = monthly.setdefault(pid, {})
+        if label in product_months:
+            raise ValueError(f"monthly_units returned duplicate ({pid}, {label})")
+        product_months[label] = exact.decimal_value(
+            r.get("units") or 0,
+            "monthly_units.units",
+            non_negative=True,
+        )
 
     universe = set(stock) | set(monthly) | set(vel)
     rows: list[dict] = []
     for pid in universe:
         st = stock.get(pid)
-        qty = float(st["qty_on_hand"]) if st else 0.0
-        eur_value = float(st["eur_value"] or 0) if st else 0.0
-        unit_cost = (eur_value / qty) if qty > 0 else None
+        qty = exact.decimal_value(
+            st["qty_on_hand"] if st else 0,
+            "qty_on_hand",
+            non_negative=True,
+        )
+        unit_cost_raw = st.get("unit_cost_eur") if st else None
+        unit_cost = (
+            exact.decimal_value(unit_cost_raw, "unit_cost_eur", non_negative=True)
+            if unit_cost_raw is not None
+            else None
+        )
+        eur_value_raw = st.get("eur_value") if st else None
+        if unit_cost is None and eur_value_raw is not None:
+            raise ValueError(f"stock product {pid} has value without unit cost")
+        if unit_cost is not None and eur_value_raw is None:
+            raise ValueError(f"stock product {pid} has unit cost without value")
+        eur_value = exact.decimal_value(
+            eur_value_raw or 0,
+            "eur_value",
+            non_negative=True,
+        )
 
-        sold_recent_qty = float(vel[pid]["sold_qty"] or 0) if pid in vel else 0.0
-        daily_rate = sold_recent_qty / cfg.velocity_window_days
-        band = classify_band(qty, daily_rate, pid in sold_recently, cfg)
+        sold_recent_qty = exact.decimal_value(
+            vel[pid]["sold_qty"] if pid in vel else 0,
+            "sold_qty",
+            non_negative=True,
+        )
+        daily_rate = sold_recent_qty / Decimal(cfg.velocity_window_days)
+        band = classify_band(float(qty), float(daily_rate), pid in sold_recently, cfg)
         cover = (qty / daily_rate) if daily_rate > 0 else None
 
-        series = cl.series_from(monthly.get(pid, {}), labels)
-        annual_units = sum(series)
+        monthly_values = monthly.get(pid, {})
+        series = cl.series_from(
+            {label: float(value) for label, value in monthly_values.items()},
+            labels,
+        )
+        annual_units = sum(
+            (monthly_values.get(label, Decimal("0")) for label in labels),
+            Decimal("0"),
+        )
         xyz = cl.xyz_classify(cl.demand_variability(series, cfg), cfg)
         nonzero = [i for i, u in enumerate(series) if u > 0]
         days_since_first = ((len(series) - 1 - nonzero[0]) * 30 + 15) if nonzero else None
         lifecycle = cl.lifecycle_from_series(series, days_since_first, pid in sold_recently, cfg)
 
-        avg_price = price.get(pid, 0.0)
+        price_row = prices.get(pid)
+        revenue_eur = exact.decimal_value(
+            price_row.get("revenue_eur") if price_row else 0,
+            "revenue_eur",
+            non_negative=True,
+        )
+        priced_qty = exact.decimal_value(
+            price_row.get("sold_qty") if price_row else 0,
+            "priced sold_qty",
+            non_negative=True,
+        )
+        avg_price = revenue_eur / priced_qty if priced_qty > 0 else Decimal("0")
+        if price_row is not None and price_row.get("avg_price_eur") is not None:
+            reported_avg = exact.unit_price(
+                price_row["avg_price_eur"],
+                "repository avg_price_eur",
+            )
+            if reported_avg != exact.unit_price(avg_price, "derived avg_price_eur"):
+                raise ValueError(f"price aggregate mismatch for product {pid}")
         margin_pct = None
         if unit_cost is not None and avg_price > 0:
             margin_pct = (avg_price - unit_cost) / avg_price
-        revenue_eur = avg_price * annual_units
-        return_rate = (rets.get(pid, 0.0) / annual_units) if annual_units > 0 else 0.0
+        returned_qty = exact.decimal_value(
+            rets[pid].get("returned_qty") if pid in rets else 0,
+            "returned_qty",
+            non_negative=True,
+        )
+        return_rate = (returned_qty / annual_units) if annual_units > 0 else Decimal("0")
         rows.append({
             "product_id": pid,
-            "qty_on_hand": round(qty, 2),
-            "eur_value": round(eur_value, 2),
-            "unit_cost_eur": round(unit_cost, 4) if unit_cost is not None else None,
-            "avg_price_eur": round(avg_price, 4) if avg_price else None,
-            "margin_pct": round(margin_pct, 4) if margin_pct is not None else None,
-            "annual_units": round(annual_units, 2),
-            "revenue_eur": round(revenue_eur, 2),
-            "cover_days": round(cover, 1) if cover is not None else None,
-            "return_rate": round(return_rate, 4),
+            "qty_on_hand": exact.quantity(qty, "qty_on_hand"),
+            "eur_value": exact.money(eur_value, "eur_value"),
+            "unit_cost_eur": (
+                exact.unit_price(unit_cost, "unit_cost_eur")
+                if unit_cost is not None
+                else None
+            ),
+            "avg_price_eur": (
+                exact.unit_price(avg_price, "avg_price_eur")
+                if avg_price > 0
+                else None
+            ),
+            "margin_pct": (
+                exact.ratio(margin_pct, "margin_pct")
+                if margin_pct is not None
+                else None
+            ),
+            "annual_units": exact.quantity(annual_units, "annual_units"),
+            "returned_units": exact.quantity(returned_qty, "returned_units"),
+            "revenue_eur": exact.money(revenue_eur, "revenue_eur"),
+            "cover_days": exact.cover_days(cover) if cover is not None else None,
+            "return_rate": exact.ratio(return_rate, "return_rate", non_negative=True),
             "band": band.value,
             "xyz": xyz.value,
             "lifecycle": lifecycle.value,
             "_band_enum": band,
             "_xyz_enum": xyz,
             "_lifecycle_enum": lifecycle,
-            "_margin_pct_raw": margin_pct,
-            "_return_rate_raw": return_rate,
+            "_margin_pct_raw": float(margin_pct) if margin_pct is not None else None,
+            "_return_rate_raw": float(return_rate),
         })
 
     _assign_abc(rows, cfg)
@@ -121,25 +209,52 @@ def build_portfolio(as_of: str) -> dict:
         row["action_reasons"] = reasons
         for key in ("_band_enum", "_xyz_enum", "_lifecycle_enum", "_margin_pct_raw", "_return_rate_raw"):
             row.pop(key, None)
-    return {
+    result = {
         "as_of": as_of,
         "model_version": cfg.model_version,
         "count": len(rows),
         "overview": _overview(rows),
         "rows": rows,
     }
+    _validate_portfolio_result(result)
+    return result
+
+
+def _index_by_product(rows: list[dict], source: str) -> dict[int, dict]:
+    indexed: dict[int, dict] = {}
+    for row in rows:
+        pid = exact.positive_int(row.get("product_id"), f"{source}.product_id")
+        if pid in indexed:
+            raise ValueError(f"{source} returned duplicate product_id {pid}")
+        indexed[pid] = row
+    return indexed
 
 
 def _assign_abc(rows: list[dict], cfg) -> None:
-    total_rev = sum(r["revenue_eur"] for r in rows)
-    if total_rev <= 0.0:
+    total_rev = exact.decimal_sum(
+        [row["revenue_eur"] for row in rows],
+        "portfolio revenue_eur",
+        non_negative=True,
+    )
+    if total_rev <= 0:
         for r in rows:
             r["abc"] = "unknown"
         return
-    cum = 0.0
-    for r in sorted(rows, key=lambda x: x["revenue_eur"], reverse=True):
-        cum += r["revenue_eur"]
-        r["abc"] = cl.abc_classify(cum / total_rev, cfg).value
+    cumulative = Decimal("0")
+    for row in sorted(
+        rows,
+        key=lambda item: (
+            exact.decimal_value(item["revenue_eur"], "revenue_eur"),
+            -int(item["product_id"]),
+        ),
+        reverse=True,
+    ):
+        cumulative += exact.decimal_value(
+            row["revenue_eur"],
+            "revenue_eur",
+            non_negative=True,
+        )
+        row["abc"] = cl.abc_classify(float(cumulative / total_rev), cfg).value
 
 
 def _overview(rows: list[dict]) -> dict:
@@ -152,8 +267,22 @@ def _overview(rows: list[dict]) -> dict:
 
     return {
         "total_skus": len(rows),
-        "total_eur_value": round(sum(r["eur_value"] for r in rows), 2),
-        "total_revenue_eur": round(sum(r["revenue_eur"] for r in rows), 2),
+        "total_eur_value": exact.money(
+            exact.decimal_sum(
+                [row["eur_value"] for row in rows],
+                "overview eur_value",
+                non_negative=True,
+            ),
+            "total_eur_value",
+        ),
+        "total_revenue_eur": exact.money(
+            exact.decimal_sum(
+                [row["revenue_eur"] for row in rows],
+                "overview revenue_eur",
+                non_negative=True,
+            ),
+            "total_revenue_eur",
+        ),
         "by_band": tally("band"),
         "by_lifecycle": tally("lifecycle"),
         "by_action": tally("action_label"),
@@ -161,3 +290,38 @@ def _overview(rows: list[dict]) -> dict:
         "by_xyz": tally("xyz"),
         "avg_health": round(sum(r["health"] for r in rows) / len(rows), 1) if rows else 0.0,
     }
+
+
+def _validate_portfolio_result(result: dict) -> None:
+    rows = result["rows"]
+    product_ids = [exact.positive_int(row.get("product_id"), "portfolio.product_id") for row in rows]
+    if len(product_ids) != len(set(product_ids)):
+        raise ValueError("portfolio rows contain duplicate product_id")
+    if result["count"] != len(rows):
+        raise ValueError("portfolio count does not match rows")
+
+    overview = result["overview"]
+    for field in ("by_band", "by_lifecycle", "by_action", "by_abc", "by_xyz"):
+        if sum(overview[field].values()) != len(rows):
+            raise ValueError(f"overview {field} count does not match rows")
+
+    expected_value = exact.money(
+        exact.decimal_sum(
+            [row["eur_value"] for row in rows],
+            "portfolio eur_value",
+            non_negative=True,
+        ),
+        "portfolio total_eur_value",
+    )
+    expected_revenue = exact.money(
+        exact.decimal_sum(
+            [row["revenue_eur"] for row in rows],
+            "portfolio revenue_eur",
+            non_negative=True,
+        ),
+        "portfolio total_revenue_eur",
+    )
+    if overview["total_eur_value"] != expected_value:
+        raise ValueError("overview total_eur_value does not match rows")
+    if overview["total_revenue_eur"] != expected_revenue:
+        raise ValueError("overview total_revenue_eur does not match rows")

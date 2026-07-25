@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import os
 from collections import Counter
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -21,7 +23,9 @@ from app.core.config import get_settings  # noqa: E402
 
 get_settings.cache_clear()
 
+from app.core.money import cents  # noqa: E402
 from app.data import signals_repository as sig  # noqa: E402
+from app.services import targets  # noqa: E402
 from app.services.generators import (  # noqa: E402
     churn_winback,
     debt_followup,
@@ -29,7 +33,8 @@ from app.services.generators import (  # noqa: E402
 )
 
 MANAGER_NETUID = "9E8CC9EA-9F71-4546-988E-0F2F388B7B43"
-AS_OF, WIN = "2026-06-15", "2026-06"
+AS_OF = datetime.now(ZoneInfo(get_settings().timezone)).date().isoformat()
+WIN = AS_OF[:7]
 
 
 @pytest.fixture(scope="module")
@@ -102,3 +107,58 @@ def test_generate_produces_a_spread_of_urgencies(manager_id):
     assert crit_share < 0.95, (
         f"{crit_share:.0%} of tasks are critical — near-total saturation is the inflated-debt symptom"
     )
+
+
+def test_target_mtd_matches_independent_sql_to_the_cent(manager_id):
+    from app.data.db import query
+
+    result = targets.compute_target(manager_id, as_of=AS_OF)
+    month_start = f"{AS_OF[:7]}-01"
+    asof_exclusive = (
+        datetime.fromisoformat(AS_OF).date()
+        + __import__("datetime").timedelta(days=1)
+    ).isoformat()
+    synthetic = sorted(sig._excluded())
+    from app.data.db import in_clause
+
+    excluded_sql, excluded_params = in_clause("excluded", synthetic)
+    shipped = query(
+        f"""
+        SELECT SUM(CAST(oi.Qty AS decimal(38, 14))
+                   * CAST(oi.PricePerItem AS decimal(38, 14))) AS amount
+        FROM dbo.[Order] o
+        JOIN dbo.ClientAgreement ca ON ca.ID = o.ClientAgreementID
+        JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
+        JOIN dbo.Client c ON c.ID = ca.ClientID
+        WHERE c.Deleted = 0 AND c.MainManagerID = :mid
+              AND oi.IsValidForCurrentSale = 1
+              AND o.Created >= :month_start AND o.Created < :asof_exclusive
+              AND oi.ProductID IS NOT NULL
+              AND oi.ProductID NOT IN {excluded_sql}
+        """,
+        {
+            "mid": manager_id,
+            "month_start": month_start,
+            "asof_exclusive": asof_exclusive,
+            **excluded_params,
+        },
+    )[0]["amount"]
+    paid = query(
+        """
+        SELECT SUM(CAST(dbo.GetExchangedToEuroValue(
+                       p.Amount, p.CurrencyID, p.FromDate) AS decimal(38, 14))) AS amount
+        FROM dbo.IncomePaymentOrder p
+        JOIN dbo.Client c ON c.ID = p.ClientID
+        WHERE c.Deleted = 0 AND c.MainManagerID = :mid
+              AND p.Deleted = 0
+              AND p.FromDate >= :month_start AND p.FromDate < :asof_exclusive
+        """,
+        {
+            "mid": manager_id,
+            "month_start": month_start,
+            "asof_exclusive": asof_exclusive,
+        },
+    )[0]["amount"]
+
+    assert result["shipped"]["mtd"] == cents(shipped)
+    assert result["paid"]["mtd"] == cents(paid)

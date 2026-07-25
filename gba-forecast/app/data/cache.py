@@ -18,7 +18,7 @@ from app.core.metrics import METRICS
 
 log = get_logger("cache")
 
-_VER = "v1"
+_VER = "v2"
 _client: redis.Redis | None = None
 _unavailable = False
 _last_failure_at = 0.0

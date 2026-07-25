@@ -1,6 +1,8 @@
 """Cockpit API tests — TestClient + mongomock + monkeypatched manager resolution (no live DB)."""
 from __future__ import annotations
 
+from datetime import date
+
 import mongomock
 import pytest
 from fastapi.testclient import TestClient
@@ -8,10 +10,11 @@ from fastapi.testclient import TestClient
 from app.domain.models import Contact, Explanation, Task, TaskType, Urgency
 
 MGR_UID = "11111111-1111-1111-1111-111111111111"
+MIXED_CASE_MGR_UID = "A1111111-B111-C111-D111-E11111111111"
 OTHER_UID = "22222222-2222-2222-2222-222222222222"
 UNKNOWN_UID = "99999999-9999-9999-9999-999999999999"
 
-_NETUID_MAP = {MGR_UID: 1, OTHER_UID: 2}
+_NETUID_MAP = {MGR_UID: 1, MIXED_CASE_MGR_UID: 1, OTHER_UID: 2}
 
 
 @pytest.fixture
@@ -50,6 +53,7 @@ def test_inbox_returns_only_that_managers_tasks(client):
     assert resp.status_code == 200
     body = resp.json()
     assert body["manager_id"] == 1
+    assert body["manager_net_uid"] == MGR_UID.lower()
     assert body["manager_net_uid"] == MGR_UID
     assert body["count"] == 1
     assert body["tasks"][0]["manager_id"] == 1
@@ -74,6 +78,7 @@ def test_status_happy_path(client):
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "done"
+    assert body["manager_net_uid"] == MGR_UID
     assert body["outcome"]["sold"] is True
     assert body["outcome"]["amount"] == 5000
 
@@ -107,6 +112,7 @@ def test_notes_happy_path(client):
                        json={"task_key": key, "text": "call friday"})
     assert resp.status_code == 200
     body = resp.json()
+    assert body["manager_net_uid"] == MGR_UID
     assert body["notes"][-1]["text"] == "call friday"
     assert body["notes"][-1]["author_id"] == 1
 
@@ -122,6 +128,92 @@ def test_malformed_netuid_404(client):
     resp = client.get("/cockpit/inbox", params={"manager_net_uid": "not-a-guid"})
     assert resp.status_code == 404
     assert resp.json()["detail"] == "unknown_manager"
+
+
+@pytest.mark.parametrize(
+    ("requested_as_of", "expected_as_of"),
+    [
+        (None, "2026-07-25"),
+        ("2026-06-08", "2026-06-08"),
+    ],
+)
+def test_generate_echoes_canonical_identity_and_resolved_business_date(
+    client, monkeypatch, requested_as_of, expected_as_of
+):
+    from app.api import main
+    from app.services import orchestrator
+
+    monkeypatch.setattr(main, "_kyiv_today", lambda: date(2026, 7, 25))
+    captured = {}
+
+    def _generate(manager_id, as_of):
+        captured.update({"manager_id": manager_id, "as_of": as_of})
+        return {
+            "manager_id": manager_id,
+            "as_of": as_of,
+            "candidates": 0,
+            "generators_total": 4,
+            "generators_failed": 0,
+            "by_type": {},
+            "persisted": 0,
+            "skipped_muted": 0,
+            "skipped_capped": 0,
+            "refreshed": 0,
+            "crit_debt_reserved": 0,
+        }
+
+    monkeypatch.setattr(orchestrator, "generate_for_manager", _generate)
+    params = {"manager_net_uid": MIXED_CASE_MGR_UID}
+    if requested_as_of is not None:
+        params["as_of_date"] = requested_as_of
+
+    response = client.post("/cockpit/generate", params=params)
+
+    assert response.status_code == 200
+    assert captured == {"manager_id": 1, "as_of": expected_as_of}
+    body = response.json()
+    assert set(body) == {
+        "manager_id",
+        "manager_net_uid",
+        "requested_as_of",
+        "as_of",
+        "candidates",
+        "generators_total",
+        "generators_failed",
+        "by_type",
+        "persisted",
+        "skipped_muted",
+        "skipped_capped",
+        "refreshed",
+        "crit_debt_reserved",
+    }
+    assert body["manager_id"] == 1
+    assert body["manager_net_uid"] == MIXED_CASE_MGR_UID.lower()
+    assert body["requested_as_of"] == requested_as_of
+    assert body["as_of"] == expected_as_of
+
+
+def test_generate_fails_closed_when_orchestrator_identity_drifts(client, monkeypatch):
+    from app.services import orchestrator
+
+    monkeypatch.setattr(
+        orchestrator,
+        "generate_for_manager",
+        lambda manager_id, as_of: {
+            "manager_id": manager_id + 1,
+            "as_of": as_of,
+            "generators_total": 4,
+            "generators_failed": 0,
+        },
+    )
+
+    response = client.post(
+        "/cockpit/generate",
+        params={"manager_net_uid": MGR_UID, "as_of_date": "2026-06-08"},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "generation_identity_mismatch"
 
 
 def test_internal_key_required_when_configured(client, monkeypatch):

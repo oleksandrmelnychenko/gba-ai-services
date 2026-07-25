@@ -3,6 +3,8 @@ LookupError->404 contract, cache-hit hydration, the no-cost peer-only path, and 
 line exclusion assumption baked into the repository SQL."""
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 
 from app.domain.models import Confidence
@@ -31,10 +33,6 @@ def _wire_repo(monkeypatch, **over):
     monkeypatch.setattr(service.repo, "peer_band", lambda *a, **k: over.get(
         "peer", {"p25": 17.0, "p50": 18.5, "p75": 19.5, "n": 12}))
     monkeypatch.setattr(service.repo, "product_group_id", lambda *a, **k: over.get("pg_id", 106))
-    monkeypatch.setattr(service.repo, "active_group_discount", lambda *a, **k: over.get(
-        "group_discount", 0.0))
-    monkeypatch.setattr(service.repo, "is_promotional", lambda *a, **k: over.get(
-        "is_promotional", False))
     monkeypatch.setattr(service.repo, "segment_discount_distribution", lambda *a, **k: over.get(
         "segment", {"p75": 12.0, "p90": 18.0, "n": 40}))
 
@@ -46,6 +44,7 @@ def test_recommend_resolves_and_assembles(monkeypatch):
         as_of_date="2026-06-15", use_cache=False,
     )
     assert out.product_id == 7
+    assert out.product_net_uid == "p-uid"
     assert out.client_agreement_netuid == "ca-uid"
     assert out.baseline_price == 20.0
     assert out.recommended_price == 18.5
@@ -53,6 +52,47 @@ def test_recommend_resolves_and_assembles(monkeypatch):
     assert out.confidence == Confidence.HIGH
     assert out.rationale == "peer-median"
     assert out.model_version == "pricing-ab-v2"
+
+
+def test_recommend_live_baseline_reports_agreement_source(monkeypatch):
+    _wire_repo(monkeypatch)
+    out = service.recommend_price(
+        product_id=7, product_net_uid=None, client_agreement_net_uid="ca-uid",
+        as_of_date="2026-06-15", use_cache=False,
+    )
+    assert out.baseline_source == "agreement"
+
+
+def test_recommend_null_baseline_uses_client_world_fallback(monkeypatch):
+    _wire_repo(monkeypatch, baseline=None)
+    monkeypatch.setattr(
+        service.repo, "client_world_fallback_baseline",
+        lambda *a, **k: {"fallback_price": 14.55, "n": 5},
+    )
+    out = service.recommend_price(
+        product_id=7, product_net_uid=None, client_agreement_net_uid="ca-uid",
+        as_of_date="2026-06-15", use_cache=False,
+    )
+    assert out.baseline_price == 14.55
+    assert out.baseline_source == "client_world_fallback"
+    assert out.recommended_price == 14.55
+    assert out.rationale != "no-baseline"
+
+
+def test_recommend_null_baseline_undeterminable_world_stays_no_baseline(monkeypatch):
+    _wire_repo(monkeypatch, baseline=None)
+    monkeypatch.setattr(
+        service.repo, "client_world_fallback_baseline", lambda *a, **k: None
+    )
+    out = service.recommend_price(
+        product_id=7, product_net_uid=None, client_agreement_net_uid="ca-uid",
+        as_of_date="2026-06-15", use_cache=False,
+    )
+    assert out.baseline_price is None
+    assert out.baseline_source is None
+    assert out.recommended_price is None
+    assert out.confidence == Confidence.LOW
+    assert out.rationale == "no-baseline"
 
 
 def test_recommend_unknown_product_raises_lookup(monkeypatch):
@@ -116,11 +156,32 @@ def test_recommend_target_margin_override(monkeypatch):
     assert out.price_floor == 15.0
 
 
+def test_recommend_rejects_out_of_range_business_margin(monkeypatch):
+    _wire_repo(monkeypatch)
+    with pytest.raises(ValueError, match="target_margin_pct"):
+        service.recommend_price(
+            product_id=7,
+            product_net_uid=None,
+            client_agreement_net_uid="ca-uid",
+            target_margin_pct=Decimal("100.01"),
+            as_of_date="2026-06-15",
+            use_cache=False,
+        )
+
+
+def test_marked_up_derivation_stays_decimal(monkeypatch):
+    _wire_repo(monkeypatch)
+    marked_up = service._marked_up_from_baseline(Decimal("1.005"), Decimal("10"))
+    assert isinstance(marked_up, Decimal)
+    assert marked_up == Decimal("1.005") / Decimal("0.9")
+
+
 def test_recommend_cache_hit_hydrates(monkeypatch):
     _wire_repo(monkeypatch)
     from app.domain.models import DiscountBand, PeerBand, PriceRecommendation
     cached_obj = PriceRecommendation(
         product_id=7, client_agreement_netuid="ca-uid", baseline_price=20.0,
+        product_net_uid="p-uid",
         recommended_price=18.5, price_floor=11.2, unit_cost_eur=10.0,
         suggested_discount_pct=7.5,
         discount_band=DiscountBand(min_pct=18.0, target_pct=18.0, max_pct=44.0),
@@ -143,6 +204,31 @@ def test_recommend_cache_hit_hydrates(monkeypatch):
     assert out.discount_band.max_pct == 44.0
 
 
+def test_recommend_rejects_cache_entry_for_different_product_identity(monkeypatch):
+    _wire_repo(monkeypatch)
+    from app.domain.models import PeerBand, PriceRecommendation
+
+    cached = PriceRecommendation(
+        product_id=7,
+        product_net_uid="different-product",
+        client_agreement_netuid="ca-uid",
+        baseline_price=999.0,
+        recommended_price=999.0,
+        peer_band=PeerBand(),
+    ).model_dump(mode="json")
+    monkeypatch.setattr(service.cache, "get", lambda *a, **k: cached)
+
+    out = service.recommend_price(
+        product_id=7,
+        product_net_uid=None,
+        client_agreement_net_uid="ca-uid",
+        as_of_date="2026-06-15",
+        use_cache=True,
+    )
+    assert out.product_net_uid == "p-uid"
+    assert out.recommended_price == 18.5
+
+
 def test_synthetic_line_excluded_in_repository_sql():
     import inspect
 
@@ -150,3 +236,8 @@ def test_synthetic_line_excluded_in_repository_sql():
     assert ":synthetic" in inspect.getsource(pricing_repository.unit_cost_eur)
     assert ":synthetic" in inspect.getsource(pricing_repository.peer_band)
     assert "IsValidForCurrentSale = 1" in inspect.getsource(pricing_repository.peer_band)
+    fallback_src = inspect.getsource(pricing_repository.client_world_fallback_baseline)
+    assert ":synthetic" in fallback_src
+    assert "IsValidForCurrentSale = 1" in fallback_src
+    assert "PriceSourceIsAmg = req.world" in fallback_src
+    assert "PriceSourceIsAmg IS NOT NULL" in fallback_src

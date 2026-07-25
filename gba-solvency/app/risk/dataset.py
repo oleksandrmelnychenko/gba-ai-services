@@ -39,6 +39,7 @@ import pandas as pd
 
 from app.core.config import get_settings
 from app.data.db import in_clause, query
+from app.data.synthetic_product import synthetic_product_ids
 
 # SEV180 severity threshold (EUR). A buyer is a positive iff overdue 180+ EUR >= this.
 SEV180_MIN_EUR = 100.0
@@ -76,8 +77,8 @@ FEATURE_COLUMNS: list[str] = [
 
 
 def _synthetic_not_in() -> tuple[str, dict[str, Any]]:
-    """Parameterized 'NOT IN (...)' over every configured synthetic 1С debt-entry ProductID."""
-    ids = sorted(get_settings().synthetic_line_product_ids)
+    """Parameterized 'NOT IN (...)' over every effective synthetic 1С debt-entry ProductID."""
+    ids = sorted(synthetic_product_ids())
     placeholder, params = in_clause("synthetic", ids)
     return placeholder, params
 
@@ -283,7 +284,10 @@ def feat_credit_terms(feature_date: str) -> pd.DataFrame:
       grace_days        = MAX(NumberDaysDebt) across the buyer's agreements (most lenient term).
       has_credit_control= 1 iff ANY agreement has IsControlAmountDebt OR IsControlNumberDaysDebt.
     ClientAgreement.CurrentAmount is in agreement currency -> EUR via the FX fn at FD.
-    Only agreements created on or before FD participate (leakage rule).
+    NO ca.Created recency predicate: the nightly 1C sync re-stamps ClientAgreement.Created on
+    every run (all rows carry the last sync timestamp), so `ca.Created <= FD` excludes the
+    ENTIRE table and collapses every credit-terms feature to 0. The column carries no
+    point-in-time information — current terms are the best point-in-time approximation.
     """
     rows = query(
         """
@@ -301,7 +305,6 @@ def feat_credit_terms(feature_date: str) -> pd.DataFrame:
         JOIN dbo.Agreement a ON a.ID = ca.AgreementID
         WHERE ca.Deleted = 0
               AND a.Deleted = 0
-              AND ca.Created <= :fd
         GROUP BY ca.ClientID
         """,
         {"fd": feature_date},
@@ -404,13 +407,11 @@ def feat_rfm(feature_date: str, window_months: int = 12) -> pd.DataFrame:
 def feat_returns(feature_date: str, window_months: int = 12) -> pd.DataFrame:
     """return_rate_12mo = returned qty / sold qty over the window.
 
-    Returned qty is reconstructed the SAME faithful way gba-products does (verified on
-    ConcordDb_V5): the 1С DataSync write path omits SaleReturnItem.Qty (14/19,969 nonzero ~0), so
-    SUM(sri.Qty) is a dead ~0 constant. Instead each non-deleted SaleReturnItem means "this
-    OrderItem line came back", so we take the line's sold OrderItem.Qty once per distinct
-    (SaleReturnID, OrderItemID) and sum. Window on SaleReturn.FromDate (sr.Created is a bulk-sync
-    mirror stamp that mis-dates returns); active returns only (sr.Deleted=0 AND sr.IsCanceled=0);
-    oi.Deleted is NOT filtered; exclude the synthetic 1С product.
+    Returned qty follows gba-server's canonical SUM(SaleReturnItem.Qty) rule, grouped first by
+    (SaleReturnID, OrderItemID). This preserves partial quantities and sums multiple active item
+    rows instead of replacing them with the original OrderItem.Qty. Window on SaleReturn.FromDate;
+    active returns only (sr.Deleted=0 AND sr.IsCanceled=0); oi.Deleted is not filtered; exclude the
+    synthetic 1С product.
     Sold qty: valid OrderItem.Qty (synthetic excluded) by buyer, windowed by Sale.Created<=FD.
     """
     ph, syn = _synthetic_not_in()
@@ -432,9 +433,9 @@ def feat_returns(feature_date: str, window_months: int = 12) -> pd.DataFrame:
     )
     ret = query(
         f"""
-        SELECT client_id, ISNULL(SUM(oi_qty), 0) AS return_qty
+        SELECT client_id, ISNULL(SUM(returned_qty), 0) AS return_qty
         FROM (
-            SELECT sr.ClientID AS client_id, MAX(oi.Qty) AS oi_qty
+            SELECT sr.ClientID AS client_id, SUM(sri.Qty) AS returned_qty
             FROM dbo.SaleReturnItem sri
             JOIN dbo.OrderItem oi ON oi.ID = sri.OrderItemID
             JOIN dbo.SaleReturn sr ON sr.ID = sri.SaleReturnID
@@ -619,7 +620,6 @@ def features_one(client_id: int, feature_date: str, window_months: int = 12) -> 
         WHERE ca.Deleted = 0
               AND a.Deleted = 0
               AND ca.ClientID = :cid
-              AND ca.Created <= :fd
         """,
         {"fd": feature_date, "cid": client_id},
     )
@@ -662,15 +662,14 @@ def features_one(client_id: int, feature_date: str, window_months: int = 12) -> 
         {"fd": feature_date, "cid": client_id, "sentinel": s.tenure_sentinel_date, **syn},
     )
 
-    # GROUP 5 — returns (mirrors feat_returns, one client). Returned qty reconstructed the
-    # gba-products way: distinct (SaleReturnID, OrderItemID) sold OrderItem.Qty, windowed on
-    # SaleReturn.FromDate, active returns only (sr.Created qty path is a dead ~0 constant).
+    # GROUP 5 — returns (mirrors feat_returns, one client). Canonical returned qty is the SUM of
+    # SaleReturnItem.Qty per (SaleReturnID, OrderItemID), windowed on SaleReturn.FromDate.
     _sql_ret = (
         f"""
         SELECT
-            (SELECT ISNULL(SUM(line.oi_qty), 0)
+            (SELECT ISNULL(SUM(line.returned_qty), 0)
              FROM (
-                SELECT MAX(oi.Qty) AS oi_qty
+                SELECT SUM(sri.Qty) AS returned_qty
                 FROM dbo.SaleReturnItem sri
                 JOIN dbo.OrderItem oi ON oi.ID = sri.OrderItemID
                 JOIN dbo.SaleReturn sr ON sr.ID = sri.SaleReturnID
@@ -886,7 +885,6 @@ def features_many(
         WHERE ca.Deleted = 0
               AND a.Deleted = 0
               AND ca.ClientID IN {ph_cid}
-              AND ca.Created <= :fd
         GROUP BY ca.ClientID
         """,
         {"fd": feature_date, **cid_params},
@@ -981,9 +979,9 @@ def features_many(
     )
     ret = query(
         f"""
-        SELECT client_id, ISNULL(SUM(oi_qty), 0) AS return_qty
+        SELECT client_id, ISNULL(SUM(returned_qty), 0) AS return_qty
         FROM (
-            SELECT sr.ClientID AS client_id, MAX(oi.Qty) AS oi_qty
+            SELECT sr.ClientID AS client_id, SUM(sri.Qty) AS returned_qty
             FROM dbo.SaleReturnItem sri
             JOIN dbo.OrderItem oi ON oi.ID = sri.OrderItemID
             JOIN dbo.SaleReturn sr ON sr.ID = sri.SaleReturnID

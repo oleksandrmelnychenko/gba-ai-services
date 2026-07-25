@@ -23,6 +23,7 @@ from app.data import cache
 from app.data.db import dispose, get_engine
 from app.domain.models import (
     BatchScoreRequest,
+    ClientIdentityMismatchError,
     ScoreRequest,
     SolvencyCharts,
     SolvencyScore,
@@ -32,7 +33,7 @@ settings = get_settings()
 log = get_logger("api")
 
 # Routes reachable without the internal key (operational endpoints).
-_OPEN_PATHS = {"/health"}
+_OPEN_PATHS = {"/health", "/ready"}
 
 
 def _service():
@@ -156,23 +157,62 @@ def _synthetic_drift_ok_cached() -> bool | None:
 
 @app.get("/health")
 def health() -> dict:
+    return _health_snapshot()
+
+
+def _health_snapshot() -> dict:
     db_ok = True
     try:
         with get_engine().connect() as c:
             c.exec_driver_sql("SELECT 1")
     except Exception:
         db_ok = False
+    redis_ok = cache.health()
     synthetic_drift_ok = _synthetic_drift_ok_cached() if db_ok else None
+    source = {
+        "business_ready": False,
+        "reasons": ["database_unavailable"],
+    }
+    if db_ok:
+        try:
+            from app.data import solvency_repository as repo
+
+            source = repo.source_readiness(settings.max_source_lag_days)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("source_readiness_failed", error=str(exc))
+            source = {
+                "business_ready": False,
+                "reasons": ["source_query_failed"],
+            }
+    business_ready = source.get("business_ready") is True
+    healthy = (
+        db_ok
+        and redis_ok
+        and business_ready
+        and synthetic_drift_ok is True
+    )
     drift = _drift_summary_cached()
     return {
-        "status": "healthy" if db_ok and synthetic_drift_ok is not False else "degraded",
+        "status": "healthy" if healthy else "degraded",
+        "business_ready": business_ready,
         "db_connected": db_ok,
-        "redis_connected": cache.health(),
+        "redis_connected": redis_ok,
         "synthetic_drift_ok": synthetic_drift_ok,
+        "source": source,
         "model_drift": drift,
         "version": "0.1.0",
         "model_version": settings.model_version,
     }
+
+
+@app.get("/ready")
+def ready() -> JSONResponse:
+    snapshot = _health_snapshot()
+    is_ready = snapshot["status"] == "healthy"
+    return JSONResponse(
+        status_code=200 if is_ready else 503,
+        content={**snapshot, "status": "ready" if is_ready else "not_ready"},
+    )
 
 
 @app.get("/monitor")
@@ -198,14 +238,14 @@ def metrics() -> dict:
 
 @app.post("/score", response_model=SolvencyScore)
 def score(req: ScoreRequest) -> SolvencyScore:
-    if req.client_id is None and req.client_net_uid is None:
-        raise HTTPException(status_code=422, detail="client_id or client_net_uid required")
     try:
         return _service().score_client(
             client_id=req.client_id, client_net_uid=req.client_net_uid,
             as_of_date=req.as_of_date.isoformat() if req.as_of_date else None,
             window_months=req.window_months, use_cache=req.use_cache,
         )
+    except ClientIdentityMismatchError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001

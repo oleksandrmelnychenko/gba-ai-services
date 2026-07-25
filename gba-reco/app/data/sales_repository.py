@@ -7,12 +7,164 @@ from __future__ import annotations
 
 import threading
 import time
+from datetime import datetime, timedelta
+from typing import Any
 
 from app.core.config import get_settings
 from app.data.db import in_clause, query
 
 _UBIQUITY_CACHE: dict[float, tuple[float, frozenset[int]]] = {}
 _UBIQUITY_LOCK = threading.Lock()
+
+_SYNTHETIC_NAME = "Ввід боргів"
+_SYNTHETIC_TTL = 3600.0
+_SYNTHETIC_CACHE: tuple[float, frozenset[int]] | None = None
+_SYNTHETIC_LOCK = threading.Lock()
+_READINESS_TTL = 60.0
+_READINESS_CACHE: dict[int, tuple[float, dict[str, Any]]] = {}
+_READINESS_LOCK = threading.Lock()
+
+
+def synthetic_product_ids() -> frozenset[int]:
+    """Synthetic accounting line(s) — the debt-entry product («Ввід боргів») — excluded
+    unconditionally from every recommendation/candidate population.
+
+    Catalog re-syncs re-mint the row under a NEW ID (25422404 → 29555414 → ...), so a hardcoded id
+    goes stale; the live id is resolved by Name at runtime and cached for an hour. An empty
+    resolution is NOT cached (retried on the next call), and a non-empty
+    Settings.synthetic_product_ids (SYNTHETIC_PRODUCT_IDS env) overrides the dynamic lookup."""
+    global _SYNTHETIC_CACHE
+    override = get_settings().synthetic_product_ids
+    if override:
+        return override
+    now = time.monotonic()
+    with _SYNTHETIC_LOCK:
+        if _SYNTHETIC_CACHE is not None and now - _SYNTHETIC_CACHE[0] < _SYNTHETIC_TTL:
+            return _SYNTHETIC_CACHE[1]
+    rows = query(
+        """
+        SELECT TOP 1 ID AS pid
+        FROM dbo.Product
+        WHERE Name = :name AND Deleted = 0
+        ORDER BY ID DESC
+        """,
+        {"name": _SYNTHETIC_NAME},
+    )
+    result = frozenset(int(r["pid"]) for r in rows)
+    if result:
+        with _SYNTHETIC_LOCK:
+            _SYNTHETIC_CACHE = (time.monotonic(), result)
+    return result
+
+
+def source_readiness(max_lag_days: int) -> dict[str, Any]:
+    """Cached business-source probe for health/readiness endpoints.
+
+    Connectivity alone is not readiness: the service also needs a current valid sales spine,
+    the dynamic synthetic exclusion, and positive stock on an operational resale storage.
+    """
+    now_mono = time.monotonic()
+    with _READINESS_LOCK:
+        cached = _READINESS_CACHE.get(max_lag_days)
+        if cached is not None and now_mono - cached[0] < _READINESS_TTL:
+            return dict(cached[1])
+
+    synthetic_ids = synthetic_product_ids()
+    synth_ph, synth_params = in_clause("health_synth", list(synthetic_ids) or [0])
+    rows = query(
+        f"""
+        SELECT
+            (
+                SELECT TOP 1 o.Created
+                FROM dbo.ClientAgreement ca
+                JOIN dbo.Client c ON c.ID = ca.ClientID AND c.Deleted = 0
+                JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
+                JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
+                WHERE oi.IsValidForCurrentSale = 1
+                      AND oi.ProductID IS NOT NULL
+                      AND oi.ProductID NOT IN {synth_ph}
+                ORDER BY o.Created DESC, o.ID DESC
+            ) AS latest_sale_at,
+            (
+                SELECT COUNT_BIG(DISTINCT pa.ProductID)
+                FROM dbo.ProductAvailability pa
+                JOIN dbo.Product p ON p.ID = pa.ProductID AND p.Deleted = 0
+                JOIN dbo.Storage s ON s.ID = pa.StorageID
+                WHERE pa.Deleted = 0 AND pa.Amount > 0
+                      AND s.Deleted = 0
+                      AND (s.AvailableForReSale = 1 OR s.IsResale = 1)
+            ) AS stocked_product_count,
+            (
+                SELECT COUNT_BIG(*)
+                FROM dbo.Storage s
+                WHERE s.Deleted = 0
+                      AND (s.AvailableForReSale = 1 OR s.IsResale = 1)
+            ) AS sellable_storage_count
+        """,
+        synth_params,
+    )
+    row = rows[0] if rows else {}
+    latest = row.get("latest_sale_at")
+    fresh = isinstance(latest, datetime) and latest >= datetime.now() - timedelta(
+        days=max_lag_days
+    )
+    stocked_count = int(row.get("stocked_product_count") or 0)
+    storage_count = int(row.get("sellable_storage_count") or 0)
+    reasons: list[str] = []
+    if not synthetic_ids:
+        reasons.append("synthetic_product_unresolved")
+    if latest is None:
+        reasons.append("valid_sales_missing")
+    elif not fresh:
+        reasons.append("valid_sales_stale")
+    if storage_count <= 0:
+        reasons.append("sellable_storage_missing")
+    if stocked_count <= 0:
+        reasons.append("sellable_stock_missing")
+
+    result = {
+        "business_ready": not reasons,
+        "reasons": reasons,
+        "latest_sale_at": latest.isoformat() if isinstance(latest, datetime) else None,
+        "stocked_product_count": stocked_count,
+        "sellable_storage_count": storage_count,
+        "synthetic_product_count": len(synthetic_ids),
+    }
+    with _READINESS_LOCK:
+        _READINESS_CACHE[max_lag_days] = (time.monotonic(), dict(result))
+    return result
+
+
+def client_exists(customer_id: int) -> bool:
+    """Whether the requested current client identity exists."""
+    rows = query(
+        """
+        SELECT TOP 1 1 AS found
+        FROM dbo.Client
+        WHERE ID = :cid AND Deleted = 0 AND NetUID IS NOT NULL
+        """,
+        {"cid": customer_id},
+    )
+    return bool(rows)
+
+
+def active_product_ids(product_ids: list[int]) -> set[int]:
+    """Requested ids that are current, non-synthetic catalog products."""
+    if not product_ids:
+        return set()
+    ph, params = in_clause("active_product", list(dict.fromkeys(product_ids)))
+    synth_ph, synth_params = in_clause(
+        "active_synth", list(synthetic_product_ids()) or [0]
+    )
+    rows = query(
+        f"""
+        SELECT ID AS pid
+        FROM dbo.Product
+        WHERE ID IN {ph} AND Deleted = 0 AND ID NOT IN {synth_ph}
+        """,
+        {**params, **synth_params},
+    )
+    return {int(row["pid"]) for row in rows}
 
 
 def _query_ubiquitous(pct: float) -> frozenset[int]:
@@ -38,8 +190,9 @@ def _query_ubiquitous(pct: float) -> frozenset[int]:
 
 
 def ubiquitous_product_ids(pct: float) -> frozenset[int]:
-    """Products to exclude from rec/candidate populations: the configured synthetic accounting
-    lines (always, e.g. debt-entry 25422404) UNION the data-driven ubiquity set — products bought
+    """Products to exclude from rec/candidate populations: the synthetic accounting
+    lines (always, e.g. the debt-entry line — see synthetic_product_ids) UNION the data-driven
+    ubiquity set — products bought
     by more than `pct` of distinct clients over the last 12mo on the SAME valid population the
     recommender uses (oi.IsValidForCurrentSale=1). These are universal staples / synthetic lines,
     not cross-sell candidates, and pollute popularity ranking.
@@ -53,7 +206,7 @@ def ubiquitous_product_ids(pct: float) -> frozenset[int]:
         entry = _UBIQUITY_CACHE.get(pct)
         if entry is not None and now - entry[0] < s.ubiquity_cache_ttl:
             return entry[1]
-    result = s.synthetic_product_ids | _query_ubiquitous(pct)
+    result = synthetic_product_ids() | _query_ubiquitous(pct)
     with _UBIQUITY_LOCK:
         _UBIQUITY_CACHE[pct] = (time.monotonic(), result)
     return result
@@ -79,13 +232,67 @@ def client_region_id(customer_id: int) -> int | None:
     return int(rid) if rid is not None else None
 
 
+def client_net_uid(customer_id: int) -> str | None:
+    """Client.NetUID (the 1C natural key) for a client id — ANY generation, deleted or not,
+    so a stale id from before a client re-sync still resolves to the same identity."""
+    rows = query(
+        "SELECT NetUID AS uid FROM dbo.Client WHERE ID = :cid",
+        {"cid": customer_id},
+    )
+    if not rows or rows[0]["uid"] is None:
+        return None
+    return str(rows[0]["uid"]).lower()
+
+
+def product_vendor_codes(product_ids: list[int]) -> list[str]:
+    """Distinct VendorCode natural keys for product ids (any catalog generation).
+
+    Codes shared by MORE than one live row are skipped: placeholder codes like «-» sit on
+    hundreds of unrelated live products, so they identify nothing — storing one as a negative
+    would blast-exclude the whole junk-code cohort at read time. A real re-mint lineage has at
+    most one live row per code."""
+    if not product_ids:
+        return []
+    ph, params = in_clause("p", list(dict.fromkeys(product_ids)))
+    rows = query(
+        f"""
+        SELECT DISTINCT p.VendorCode AS vc
+        FROM dbo.Product p
+        WHERE p.ID IN {ph} AND p.VendorCode IS NOT NULL AND p.VendorCode <> ''
+              AND (SELECT COUNT(*) FROM dbo.Product l
+                   WHERE l.VendorCode = p.VendorCode AND l.Deleted = 0) <= 1
+        """,
+        params,
+    )
+    return [str(r["vc"]) for r in rows]
+
+
+def product_ids_for_vendor_codes(vendor_codes: list[str]) -> set[int]:
+    """EVERY Product.ID generation (live AND soft-deleted) carrying one of the VendorCodes.
+
+    Used to expand stored negative-feedback VendorCodes into an exclusion set: candidate pools
+    are built from order history BEFORE live_remap runs, so excluding only the live id would let
+    a dead-generation candidate slip through and be remapped onto the negatived live row."""
+    if not vendor_codes:
+        return set()
+    ph, params = in_clause("v", list(dict.fromkeys(vendor_codes)))
+    rows = query(
+        f"SELECT ID AS pid FROM dbo.Product WHERE VendorCode IN {ph}",
+        params,
+    )
+    return {int(r["pid"]) for r in rows}
+
+
 def count_orders_before(customer_id: int, as_of_date: str) -> int:
     rows = query(
         """
         SELECT COUNT(DISTINCT o.ID) AS n
         FROM dbo.ClientAgreement ca
         JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
+        JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
         WHERE ca.ClientID = :cid AND o.Created < :asof
+              AND oi.IsValidForCurrentSale = 1
+              AND oi.ProductID IS NOT NULL
         """,
         {"cid": customer_id, "asof": as_of_date},
     )
@@ -96,10 +303,10 @@ def repurchase_rate(customer_id: int, as_of_date: str) -> float:
     """Share of products bought 2+ times — drives REGULAR sub-segmentation.
 
     Restricted to the valid rec sales spine (oi.IsValidForCurrentSale = 1) with the synthetic
-    accounting lines (e.g. debt-entry 25422404) excluded, matching the rest of the reco spine.
+    accounting lines (the debt-entry line) excluded, matching the rest of the reco spine.
     Without this, synthetic-only / synthetic-dominated clients score an inflated rate (e.g. 1.0)
     and flip REGULAR sub-segmentation on a non-real-product line."""
-    synth_ph, synth_params = in_clause("syn", list(get_settings().synthetic_product_ids) or [0])
+    synth_ph, synth_params = in_clause("syn", list(synthetic_product_ids()) or [0])
     rows = query(
         f"""
         SELECT
@@ -131,7 +338,8 @@ def product_frequency(customer_id: int, as_of_date: str) -> dict[int, int]:
         FROM dbo.ClientAgreement ca
         JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
         JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
-        WHERE ca.ClientID = :cid AND o.Created < :asof AND oi.ProductID IS NOT NULL
+        WHERE ca.ClientID = :cid AND o.Created < :asof
+              AND oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
         GROUP BY oi.ProductID
         """,
         {"cid": customer_id, "asof": as_of_date},
@@ -146,7 +354,8 @@ def product_last_purchase(customer_id: int, as_of_date: str) -> dict[int, object
         FROM dbo.ClientAgreement ca
         JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
         JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
-        WHERE ca.ClientID = :cid AND o.Created < :asof AND oi.ProductID IS NOT NULL
+        WHERE ca.ClientID = :cid AND o.Created < :asof
+              AND oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
         GROUP BY oi.ProductID
         """,
         {"cid": customer_id, "asof": as_of_date},
@@ -163,8 +372,9 @@ def customer_products(customer_id: int, as_of_date: str, limit: int = 500) -> se
             FROM dbo.ClientAgreement ca
             JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
             JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
-            WHERE ca.ClientID = :cid AND o.Created < :asof AND oi.ProductID IS NOT NULL
-            ORDER BY o.Created DESC
+            WHERE ca.ClientID = :cid AND o.Created < :asof
+                  AND oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
+            ORDER BY o.Created DESC, o.ID DESC, oi.ProductID ASC
         ) t
         """,
         {"cid": customer_id, "asof": as_of_date, "lim": limit},
@@ -198,9 +408,10 @@ def candidate_similar_customers(product_ids: set[int], exclude_id: int, as_of_da
         JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
         WHERE ca.ClientID <> :exclude
               AND o.Created < :asof
+              AND oi.IsValidForCurrentSale = 1
               AND oi.ProductID IN {placeholder}
         GROUP BY ca.ClientID
-        ORDER BY overlap DESC
+        ORDER BY overlap DESC, ca.ClientID ASC
         """,
         {"exclude": exclude_id, "asof": as_of_date, "lim": limit, **pparams, **extra},
     )
@@ -221,7 +432,8 @@ def customer_products_bulk(customer_ids: list[int], as_of_date: str) -> dict[int
         FROM dbo.ClientAgreement ca
         JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
         JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
-        WHERE ca.ClientID IN {placeholder} AND o.Created < :asof AND oi.ProductID IS NOT NULL
+        WHERE ca.ClientID IN {placeholder} AND o.Created < :asof
+              AND oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
         """,
         {"asof": as_of_date, **params},
     )
@@ -254,7 +466,8 @@ def collaborative_products(
             FROM dbo.ClientAgreement ca
             JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
             JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
-            WHERE ca.ClientID = :cid AND o.Created < :asof AND oi.ProductID IS NOT NULL
+            WHERE ca.ClientID = :cid AND o.Created < :asof
+                  AND oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
         ),
         Sim AS (
             SELECT customer_id, similarity FROM (VALUES {sim_rows}) AS t(customer_id, similarity)
@@ -270,6 +483,7 @@ def collaborative_products(
             JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
             JOIN Sim s ON ca.ClientID = s.customer_id
             WHERE o.Created < :asof
+                  AND oi.IsValidForCurrentSale = 1
                   AND oi.ProductID IS NOT NULL
                   AND NOT EXISTS (SELECT 1 FROM Owned ow WHERE ow.pid = oi.ProductID)
         )
@@ -283,6 +497,40 @@ def collaborative_products(
         {"asof": as_of_date, "cid": customer_id, **sim_params},
     )
     return {int(r["pid"]): float(r["score"]) for r in rows}
+
+
+def in_stock_product_ids(product_ids: list[int]) -> set[int]:
+    """Subset whose exact live catalog row has stock on an operational resale storage.
+
+    Candidate ids come from order history, which can carry soft-deleted catalog generations;
+    stock lives on the live row, so the check bridges generations via the VendorCode natural key
+    using the same newest-live-row rule as ``live_remap``. ONE set-membership query is used for
+    the whole candidate pool, never one query per product.
+    """
+    if not product_ids:
+        return set()
+    ph, params = in_clause("p", list(dict.fromkeys(product_ids)))
+    rows = query(
+        f"""
+        WITH live_map AS (
+            SELECT d.ID AS old_id,
+                   CASE WHEN d.Deleted = 0 THEN d.ID ELSE MAX(l.ID) END AS live_id
+            FROM dbo.Product d
+            JOIN dbo.Product l ON l.VendorCode = d.VendorCode AND l.Deleted = 0
+            WHERE d.ID IN {ph} AND d.VendorCode IS NOT NULL AND d.VendorCode <> ''
+            GROUP BY d.ID, d.Deleted
+        )
+        SELECT DISTINCT m.old_id AS pid
+        FROM live_map m
+        JOIN dbo.ProductAvailability pa
+             ON pa.ProductID = m.live_id AND pa.Deleted = 0 AND pa.Amount > 0
+        JOIN dbo.Storage s ON s.ID = pa.StorageID
+        WHERE s.Deleted = 0
+              AND (s.AvailableForReSale = 1 OR s.IsResale = 1)
+        """,
+        params,
+    )
+    return {int(r["pid"]) for r in rows}
 
 
 def product_groups(product_ids: list[int]) -> dict[int, int]:

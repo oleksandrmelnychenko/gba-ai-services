@@ -29,12 +29,17 @@ ALLOW_OPEN_INTERNAL_API=false
 FORECAST_HORIZON_MONTHS=6
 MAX_FORECAST_HORIZON_MONTHS=24
 HISTORY_MONTHS=24
+SOURCE_MAX_AGE_HOURS=168
 FORECAST_METHOD=auto
 MIN_HISTORY_MONTHS=3
 ```
 
 Local/dev may set `ALLOW_OPEN_INTERNAL_API=true` only when `INTERNAL_API_KEY` is intentionally
 empty. Shared environments should fail startup if the internal key is missing.
+
+`/health` and `/ready` are business-aware: they are green only when SQL and Redis are reachable
+and the canonical non-synthetic `OrderItem` sales source exists, has valid rows in the history
+window, and its newest sale is within `SOURCE_MAX_AGE_HOURS`.
 
 `FORECAST_METHOD=auto` selects the method per demand segment: smooth series use EWMA, erratic
 series use the window mean, intermittent/lumpy series use SBA, and no-demand series stay on the
@@ -67,6 +72,24 @@ Expected forecast response shape:
 {
   "ByClient": [{"SaleAmount": 23.9, "MonthNameUK": "Лип 2026"}],
   "ByProduct": [],
-  "ByClientAndProduct": []
+  "ByClientAndProduct": [],
+  "meta": {
+    "status": "ready",
+    "as_of": "2026-07-25",
+    "horizon_months": 6,
+    "currency": "EUR",
+    "requested": {"client_net_id": "<uuid>", "product_net_id": null},
+    "resolved": {"client_id": 123, "client_net_id": "<uuid>", "product_id": null, "product_net_id": null},
+    "identity": {"client": "resolved", "product": "not_requested"},
+    "history": {
+      "ByClient": {
+        "status": "sufficient",
+        "month_count": 12,
+        "non_zero_month_count": 9,
+        "total_eur": 1234.56,
+        "sufficient": true
+      }
+    }
+  }
 }
 ```

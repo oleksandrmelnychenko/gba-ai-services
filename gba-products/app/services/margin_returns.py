@@ -7,28 +7,64 @@ crash. revenue_eur / unit_cost_eur / avg_price_eur / eur_value are already EUR; 
 """
 from __future__ import annotations
 
+from decimal import Decimal
 
-def _margin_eur(row: dict) -> float:
+from app.core import exact_numbers as exact
+
+
+def _margin_eur(row: dict) -> Decimal:
     """Margin-€ contribution = margin_pct * revenue_eur. Caller guards margin_pct is not None."""
-    return (row["margin_pct"] or 0.0) * (row["revenue_eur"] or 0.0)
+    return exact.decimal_value(
+        row["margin_pct"] or 0,
+        "margin_pct",
+    ) * exact.decimal_value(
+        row["revenue_eur"] or 0,
+        "revenue_eur",
+        non_negative=True,
+    )
 
 
 def _enrich(row: dict) -> dict:
     """Compact view of a row for the margin/returns lenses (derived fields, no DB)."""
     margin_pct = row.get("margin_pct")
-    revenue = row.get("revenue_eur") or 0.0
-    annual = row.get("annual_units") or 0.0
-    rate = row.get("return_rate") or 0.0
+    revenue = exact.decimal_value(
+        row.get("revenue_eur") or 0,
+        "revenue_eur",
+        non_negative=True,
+    )
+    annual = exact.decimal_value(
+        row.get("annual_units") or 0,
+        "annual_units",
+        non_negative=True,
+    )
+    rate = exact.decimal_value(
+        row.get("return_rate") or 0,
+        "return_rate",
+        non_negative=True,
+    )
+    returned = exact.decimal_value(
+        row.get("returned_units") if row.get("returned_units") is not None else rate * annual,
+        "returned_units",
+        non_negative=True,
+    )
     return {
         "product_id": row["product_id"],
         "margin_pct": margin_pct,
-        "margin_eur": round(margin_pct * revenue, 2) if margin_pct is not None else None,
-        "revenue_eur": round(revenue, 2),
+        "margin_eur": (
+            exact.money(
+                exact.decimal_value(margin_pct, "margin_pct") * revenue,
+                "margin_eur",
+                non_negative=False,
+            )
+            if margin_pct is not None
+            else None
+        ),
+        "revenue_eur": exact.money(revenue, "revenue_eur"),
         "unit_cost_eur": row.get("unit_cost_eur"),
         "avg_price_eur": row.get("avg_price_eur"),
-        "annual_units": round(annual, 2),
-        "return_rate": round(rate, 4),
-        "returned_units": round(rate * annual, 2),
+        "annual_units": exact.quantity(annual, "annual_units"),
+        "return_rate": exact.ratio(rate, "return_rate", non_negative=True),
+        "returned_units": exact.quantity(returned, "returned_units"),
         "band": row.get("band"),
         "lifecycle": row.get("lifecycle"),
         "abc": row.get("abc"),
@@ -69,26 +105,75 @@ def margin_returns_summary(rows: list[dict]) -> dict:
     """Portfolio totals: revenue-weighted avg margin% (where known), €-at-negative-margin,
     overall return rate (Σ returned units / Σ annual_units), and the relevant counts."""
     known = [r for r in rows if r.get("margin_pct") is not None]
-    rev_known = sum((r["revenue_eur"] or 0.0) for r in known)
-    wsum = sum(_margin_eur(r) for r in known)
+    rev_known = exact.decimal_sum(
+        [row["revenue_eur"] or 0 for row in known],
+        "known revenue_eur",
+        non_negative=True,
+    )
+    wsum = sum((_margin_eur(row) for row in known), Decimal("0"))
     weighted_margin = (wsum / rev_known) if rev_known > 0 else None
 
     neg = [r for r in known if r["margin_pct"] < 0]
-    eur_at_negative_margin = sum((r["revenue_eur"] or 0.0) for r in neg)
+    eur_at_negative_margin = exact.decimal_sum(
+        [row["revenue_eur"] or 0 for row in neg],
+        "negative-margin revenue_eur",
+        non_negative=True,
+    )
 
-    total_units = sum((r.get("annual_units") or 0.0) for r in rows)
-    total_returned = sum((r.get("return_rate") or 0.0) * (r.get("annual_units") or 0.0) for r in rows)
+    total_units = exact.decimal_sum(
+        [row.get("annual_units") or 0 for row in rows],
+        "annual_units",
+        non_negative=True,
+    )
+    total_returned = sum(
+        (
+            exact.decimal_value(
+                (
+                    row.get("returned_units")
+                    if row.get("returned_units") is not None
+                    else exact.decimal_value(
+                        row.get("return_rate") or 0,
+                        "return_rate",
+                        non_negative=True,
+                    )
+                    * exact.decimal_value(
+                        row.get("annual_units") or 0,
+                        "annual_units",
+                        non_negative=True,
+                    )
+                ),
+                "returned_units",
+                non_negative=True,
+            )
+            for row in rows
+        ),
+        Decimal("0"),
+    )
     overall_return_rate = (total_returned / total_units) if total_units > 0 else 0.0
 
     return {
         "total_skus": len(rows),
         "skus_with_known_margin": len(known),
         "skus_unknown_margin": len(rows) - len(known),
-        "weighted_avg_margin_pct": round(weighted_margin, 4) if weighted_margin is not None else None,
+        "weighted_avg_margin_pct": (
+            exact.ratio(weighted_margin, "weighted_avg_margin_pct")
+            if weighted_margin is not None
+            else None
+        ),
         "negative_margin_skus": len(neg),
-        "eur_at_negative_margin": round(eur_at_negative_margin, 2),
-        "revenue_eur_known_margin": round(rev_known, 2),
-        "total_annual_units": round(total_units, 2),
-        "total_returned_units": round(total_returned, 2),
-        "overall_return_rate": round(overall_return_rate, 4),
+        "eur_at_negative_margin": exact.money(
+            eur_at_negative_margin,
+            "eur_at_negative_margin",
+        ),
+        "revenue_eur_known_margin": exact.money(
+            rev_known,
+            "revenue_eur_known_margin",
+        ),
+        "total_annual_units": exact.quantity(total_units, "total_annual_units"),
+        "total_returned_units": exact.quantity(total_returned, "total_returned_units"),
+        "overall_return_rate": exact.ratio(
+            overall_return_rate,
+            "overall_return_rate",
+            non_negative=True,
+        ),
     }

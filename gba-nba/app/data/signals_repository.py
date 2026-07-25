@@ -9,10 +9,15 @@ Verified columns:
 """
 from __future__ import annotations
 
+import time
 from collections import defaultdict
+from datetime import datetime, timedelta
+from decimal import Decimal
 from functools import lru_cache
+from typing import Any
 
 from app.core.config import get_settings
+from app.core.money import cents, cents_decimal, decimal_value
 from app.data.db import in_clause, query
 
 
@@ -43,15 +48,110 @@ def ubiquitous_product_ids(pct: float) -> frozenset[int]:
     return frozenset(int(r["pid"]) for r in rows)
 
 
+_SYNTHETIC_REFRESH_S = 3600.0
+_synthetic_state: dict = {"at": 0.0, "ids": frozenset()}
+_SOURCE_READINESS_TTL_S = 60.0
+_source_readiness_state: dict = {"at": 0.0, "max_lag_days": None, "value": None}
+
+
+def synthetic_product_ids() -> frozenset[int]:
+    """Live id(s) of the synthetic debt-entry product («Ввід боргів»), resolved dynamically so the
+    hard exclusion survives dev re-mints (the old pinned 25422404 is a dead row; the live row today
+    is 29555414). settings.synthetic_product_ids, when set via env, is an explicit override.
+    Cached in-process, refreshed hourly or on an empty resolve."""
+    override = get_settings().synthetic_product_ids
+    if override:
+        return frozenset(override)
+    now = time.monotonic()
+    if _synthetic_state["ids"] and now - _synthetic_state["at"] < _SYNTHETIC_REFRESH_S:
+        return _synthetic_state["ids"]
+    rows = query(
+        "SELECT TOP 1 ID AS id FROM dbo.Product WHERE Name = :nm AND Deleted = 0 ORDER BY ID DESC",
+        {"nm": "Ввід боргів"},
+    )
+    ids = frozenset(int(r["id"]) for r in rows)
+    if ids:
+        _synthetic_state.update({"at": now, "ids": ids})
+    return ids or _synthetic_state["ids"]
+
+
+def source_readiness(max_lag_days: int) -> dict[str, Any]:
+    """Business-aware SQL source probe, briefly cached for health polling."""
+    now_mono = time.monotonic()
+    cached = _source_readiness_state["value"]
+    if (
+        cached is not None
+        and _source_readiness_state["max_lag_days"] == max_lag_days
+        and now_mono - _source_readiness_state["at"] < _SOURCE_READINESS_TTL_S
+    ):
+        return dict(cached)
+
+    synthetic_ids = synthetic_product_ids()
+    rows = query(
+        """
+        SELECT
+            (
+                SELECT TOP 1 o.Created
+                FROM dbo.[Order] o
+                JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
+                WHERE oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
+                ORDER BY o.Created DESC, o.ID DESC
+            ) AS latest_sale_at,
+            (
+                SELECT COUNT_BIG(DISTINCT c.MainManagerID)
+                FROM dbo.Client c
+                JOIN dbo.[User] u ON u.ID = c.MainManagerID AND u.Deleted = 0
+                WHERE c.Deleted = 0 AND c.MainManagerID IS NOT NULL
+            ) AS manager_count
+        """
+    )
+    row = rows[0] if rows else {}
+    latest = row.get("latest_sale_at")
+    manager_count = int(row.get("manager_count") or 0)
+    fresh = isinstance(latest, datetime) and latest >= datetime.now() - timedelta(
+        days=max_lag_days
+    )
+    reasons: list[str] = []
+    if not synthetic_ids:
+        reasons.append("synthetic_product_unresolved")
+    if latest is None:
+        reasons.append("valid_sales_missing")
+    elif not fresh:
+        reasons.append("valid_sales_stale")
+    if manager_count <= 0:
+        reasons.append("active_managers_missing")
+    result = {
+        "source_ready": not reasons,
+        "source_reasons": reasons,
+        "latest_sale_at": latest.isoformat() if isinstance(latest, datetime) else None,
+        "manager_count": manager_count,
+        "synthetic_product_count": len(synthetic_ids),
+    }
+    _source_readiness_state.update(
+        {"at": time.monotonic(), "max_lag_days": max_lag_days, "value": dict(result)}
+    )
+    return result
+
+
 def _excluded() -> frozenset[int]:
-    """Products excluded from turnover/feature signals: the configured synthetic accounting ids
-    (debt-entry "Ввід боргів з 1С" = 25422404) UNION the data-driven ubiquity set. The synthetic
-    ids are a HARD guard — pinned in settings.synthetic_product_ids and excluded unconditionally, so
-    the exclusion holds even if 25422404's rolling 12-month ubiquity ever dips below
-    ubiquity_exclude_pct (today it sits at ~0.77 and is the ONLY product clearing the threshold).
-    Mirrors gba-reco/gba-products. The ubiquity set still catches any OTHER future universal staple."""
+    """Products excluded from turnover/feature signals: the synthetic accounting ids (debt-entry
+    «Ввід боргів», resolved live) UNION the data-driven ubiquity set. The synthetic ids are a HARD
+    guard — excluded unconditionally, so the exclusion holds even if the debt-entry's rolling
+    12-month ubiquity ever dips below ubiquity_exclude_pct. Mirrors gba-reco/gba-products. The
+    ubiquity set still catches any OTHER future universal staple."""
     s = get_settings()
-    return frozenset(s.synthetic_product_ids) | ubiquitous_product_ids(s.ubiquity_exclude_pct)
+    return synthetic_product_ids() | ubiquitous_product_ids(s.ubiquity_exclude_pct)
+
+
+def existing_client_ids(client_ids: list[int]) -> set[int]:
+    """Subset of client_ids that still exist as rows in dbo.Client (any Deleted state — soft-deleted
+    clients are still real rows; only re-mint/wipe victims are absent)."""
+    out: set[int] = set()
+    for i in range(0, len(client_ids), 500):
+        ph, params = in_clause("c", client_ids[i:i + 500])
+        rows = query(f"SELECT ID AS id FROM dbo.Client WHERE ID IN {ph}", params)
+        out.update(int(r["id"]) for r in rows)
+    return out
 
 
 def manager_id_for_netuid(net_uid: str) -> int | None:
@@ -315,21 +415,32 @@ def _debt_dashboard_from_rows(rows: list[dict]) -> dict:
     aging buckets). Shared by the single-manager and all-managers paths so both produce identical
     numbers from identical per-client rows."""
     buckets = [("0-30", 0, 30), ("31-60", 31, 60), ("61-90", 61, 90), ("90+", 91, None)]
-    aging = {label: {"amount_eur": 0.0, "count": 0} for label, _, _ in buckets}
-    value_at_risk = 0.0
+    aging = {label: {"amount_eur": Decimal("0"), "count": 0} for label, _, _ in buckets}
     for r in rows:
-        amount = float(r["overdue_amount"] or 0.0)
+        amount = decimal_value(r["overdue_amount"])
         days = int(r["max_overdue_days"] or 0)
-        value_at_risk += amount
         for label, lo, hi in buckets:
             if days >= lo and (hi is None or days <= hi):
                 aging[label]["amount_eur"] += amount
                 aging[label]["count"] += 1
                 break
+    # The headline is canonically the sum of the bucket cents the API actually displays.
+    # Independently rounding the raw grand total and four buckets can otherwise differ by €0.01.
+    rounded_amounts = {
+        label: cents_decimal(aging[label]["amount_eur"])
+        for label, _, _ in buckets
+    }
+    value_at_risk = sum(rounded_amounts.values(), Decimal("0"))
     return {
-        "value_at_risk_eur": round(value_at_risk, 2),
-        "debt_aging": [{"bucket": label, "amount_eur": round(aging[label]["amount_eur"], 2),
-                        "count": aging[label]["count"]} for label, _, _ in buckets],
+        "value_at_risk_eur": cents(value_at_risk),
+        "debt_aging": [
+            {
+                "bucket": label,
+                "amount_eur": cents(rounded_amounts[label]),
+                "count": aging[label]["count"],
+            }
+            for label, _, _ in buckets
+        ],
     }
 
 
@@ -535,7 +646,7 @@ def client_features(client_ids: list[int], as_of: str, window_days: int = 365) -
 
 # --- sales-target engine: monthly shipped & paid per manager ---
 
-def monthly_shipped(manager_id: int, since: str, as_of: str) -> dict[str, float]:
+def monthly_shipped(manager_id: int, since: str, as_of: str) -> dict[str, Decimal]:
     """Per-month SHIPPED revenue (EUR) for a manager: SUM(OrderItem.Qty*PricePerItem) by Order month,
     synthetic lines excluded. since/as_of are 'YYYY-MM-DD'. Returns {'YYYY-MM': amount}."""
     excl = _excluded()
@@ -558,10 +669,10 @@ def monthly_shipped(manager_id: int, since: str, as_of: str) -> dict[str, float]
         """,
         params,
     )
-    return {r["ym"]: float(r["amt"] or 0) for r in rows}
+    return {r["ym"]: decimal_value(r["amt"]) for r in rows}
 
 
-def monthly_paid(manager_id: int, since: str, as_of: str) -> dict[str, float]:
+def monthly_paid(manager_id: int, since: str, as_of: str) -> dict[str, Decimal]:
     """Per-month PAID cash (EUR) for a manager, by FromDate month, via ClientID->manager.
 
     NB: use FromDate (actual payment date), NOT Created (which is the bulk-sync insert date — all
@@ -580,4 +691,4 @@ def monthly_paid(manager_id: int, since: str, as_of: str) -> dict[str, float]:
         """,
         {"mid": manager_id, "since": since, "asof": as_of},
     )
-    return {r["ym"]: float(r["amt"] or 0) for r in rows}
+    return {r["ym"]: decimal_value(r["amt"]) for r in rows}

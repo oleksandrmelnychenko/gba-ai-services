@@ -80,7 +80,8 @@ def test_is_promotional_present_and_service_derives_marked_up_from_baseline():
     assert "_marked_up_from_baseline" in svc_code
 
     helper_code = _code_without_docstring(service._marked_up_from_baseline)
-    assert "baseline / (1.0 - applied_discount_pct / 100.0)" in helper_code
+    assert "baseline_value / (Decimal(1) - discount_pct / HUNDRED)" in helper_code
+    assert "as_decimal" in helper_code
 
 
 def test_unit_cost_excludes_1c_debt_lots():
@@ -130,6 +131,45 @@ def test_synthetic_debt_line_excluded_everywhere():
     (it contaminates both cost lots and realized price)."""
     assert ":synthetic" in inspect.getsource(repo.unit_cost_eur)
     assert ":synthetic" in inspect.getsource(repo.peer_band)
+
+
+def test_product_resolver_requires_live_matching_non_synthetic_identity():
+    """REVERT CAUGHT: a deleted or debt-entry product must resolve as not-found (API 404), never
+    flow into the pricing engine and become a misleading 200/no-baseline response."""
+    code = _code_without_docstring(repo.resolve_product)
+    assert "p.Deleted = 0" in code
+    assert "p.ID <> :synthetic" in code
+    assert "p.Name <> N'Ввід боргів'" in code
+    assert "synthetic_product_id()" in code
+    assert "resolved_id == synthetic" in code
+    assert "resolved_name ==" in code
+    assert "Ввід боргів" in code
+    assert "p.ID = :pid" in code
+    assert "p.NetUID = :uid" in code
+
+
+def test_api_money_uses_decimal_half_up_and_repository_keeps_aggregates_decimal():
+    """REVERT CAUGHT: Python round/float restores banker's/binary rounding (1.005 -> 1.00)."""
+    round_code = _code_without_docstring(engine._round2)
+    assert "ROUND_HALF_UP" in round_code
+    assert ".quantize(CENT" in round_code
+    assert "round(" not in round_code
+
+    for fn in (
+        repo.baseline_price,
+        repo.client_world_fallback_baseline,
+        repo.unit_cost_eur,
+        repo.peer_band,
+    ):
+        code = _code_without_docstring(fn)
+        assert "optional_decimal" in code
+
+    for fn in (
+        repo.client_world_fallback_baseline,
+        repo.unit_cost_eur,
+        repo.peer_band,
+    ):
+        assert "AS decimal(38,14)" in _code_without_docstring(fn)
 
 
 def test_elasticity_panel_uses_priceperitem_as_eur_not_fx_converted():

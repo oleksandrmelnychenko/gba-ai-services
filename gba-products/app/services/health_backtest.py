@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable
+from decimal import Decimal
 from typing import Any
+
+from app.core import exact_numbers as exact
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -123,7 +126,13 @@ def _group_summary(rows: list[dict[str, Any]], key: str) -> list[dict[str, Any]]
 
 
 def _round(value: float | None, digits: int = 4) -> float | None:
-    return round(value, digits) if value is not None else None
+    if value is None:
+        return None
+    return exact.quantized_float(
+        value,
+        Decimal("1").scaleb(-digits),
+        "health backtest metric",
+    )
 
 
 def _lift(high: list[dict[str, Any]], low: list[dict[str, Any]], key: str) -> float | None:

@@ -6,12 +6,13 @@ stays green without a DB; run via `make integration` or `pytest -m integration` 
 DB + the running gba-solvency service.
 
 Scenarios:
-  COHORT          -- 30 real role-1 buyers with >=EUR250 180+ overdue must all land C/D, most
-                     with forward high/very_high; ~12 zero-debt buyers-with-sales mostly A/B.
-  NAMED REGRESSION-- 411780 ТРАМП ОЙЛ, 411801 АБРАМЧЕНКО -> D (were 64/65 under the old expert).
-  GATE            -- ~10 provider-only / non-buyer ids -> applicable=false, score/contrib null.
-  MONOTONIC       -- within a matched tenure/turnover band, higher 180+ overdue -> not-higher
-                     score (rank sanity).
+  COHORT          -- current role-1 buyers with >=EUR250 180+ overdue must all land C/D;
+                     debt-free buyers-with-sales must mostly land A/B.
+  REGRESSION      -- dynamically selected severe buyers with no controlled limit must remain D.
+  GATE            -- current provider-only / non-buyer ids -> applicable=false, score null.
+  FORWARD         -- only the model's declared population (debt>0, not already SEV180) is compared
+                     exactly with the behavioral scorecard; already-SEV180 has no forward score.
+  LEAKAGE         -- changing excluded current-SEV180 magnitude cannot change current score.
   CONTRACT        -- v3 shape complete: all keys, types, sub_factors null, rating in A..D,
                      0<=score<=100, pd in [0,1], contributions nonempty for an applicable buyer,
                      model_version == creditscore-v3.
@@ -22,19 +23,15 @@ Scenarios:
 from __future__ import annotations
 
 import os
+from datetime import UTC, datetime
 
 import pytest
 
 pytestmark = pytest.mark.integration
 
-_AS_OF = "2026-06-25"
+_AS_OF = os.environ.get("SOLVENCY_TEST_AS_OF", datetime.now(UTC).date().isoformat())
 SEV180_MIN_EUR = 100.0
 
-# Anchors confirmed from data/current_state_scores.parquet (the trained per-client ground truth)
-# and live :8003 at as-of 2026-06-25.
-TRAMP_OIL_CLIENT_ID = 411780      # ТРАМП ОЙЛ — large 180+ overdue, parquet score 45.7 / band D
-ABRAMCHENKO_CLIENT_ID = 411801    # АБРАМЧЕНКО — parquet score 46.6 / band D
-PROVIDER_ONLY_CLIENT_ID = 410170  # Універсал банк АТ — provider-only, no Buyer role
 NONEXISTENT_CLIENT_ID = 999999999
 
 LIVE_BASE_URL = os.environ.get("SOLVENCY_BASE_URL", "http://127.0.0.1:8003")
@@ -105,10 +102,11 @@ def _score(service, client_id: int):
 
 @pytest.fixture(scope="module")
 def overdue_cohort() -> list[dict]:
-    """Up to 30 role-1 buyers whose 180+ overdue EUR exposure is >= 250, biggest first.
+    """Current role-1 buyers whose 180+ overdue EUR exposure is >= 250, biggest first.
 
     Mirrors app.risk.dataset._sev180_eur_by_client (the SEV180 label engine) but restricted to
-    Buyer-role entities and the >=250 severity floor.
+    Buyer-role entities and the >=250 severity floor. Uses EXISTS rather than joining roles so
+    multiple role rows cannot multiply monetary exposure.
     """
     from app.data.db import query
 
@@ -121,11 +119,15 @@ def overdue_cohort() -> list[dict]:
             FROM dbo.ClientInDebt cid
             JOIN dbo.Debt d ON d.ID = cid.DebtID
             JOIN dbo.Agreement a ON a.ID = cid.AgreementID
-            JOIN dbo.ClientInRole cir ON cir.ClientID = cid.ClientID
-            JOIN dbo.ClientType ct ON ct.ID = cir.ClientTypeID
             WHERE cid.Deleted = 0 AND d.Deleted = 0 AND d.Created <= :asof
                   AND DATEDIFF(day, d.Created, :asof) > a.NumberDaysDebt + 180
-                  AND cir.Deleted = 0 AND ct.[Type] = 0
+                  AND EXISTS (
+                      SELECT 1
+                      FROM dbo.ClientInRole cir
+                      JOIN dbo.ClientType ct ON ct.ID = cir.ClientTypeID
+                      WHERE cir.ClientID = cid.ClientID
+                            AND cir.Deleted = 0
+                            AND ct.[Type] = 0)
         ) t
         GROUP BY client_id
         HAVING SUM(eur) >= 250
@@ -136,6 +138,41 @@ def overdue_cohort() -> list[dict]:
     if len(rows) < 10:
         pytest.skip(f"only {len(rows)} >=EUR250 overdue buyers in dev DB; need >=10")
     return [{"client_id": int(r["client_id"]), "sev_eur": float(r["sev_eur"])} for r in rows]
+
+
+@pytest.fixture(scope="module")
+def severe_d_regression_cohort(overdue_cohort) -> list[dict]:
+    """At least two current severe buyers with no controlled credit limit.
+
+    This is the live-data replacement for pre-rebuild numeric IDs. The current scorecard's
+    independent risk signals (open debt plus no controlled limit) must keep this cohort in D;
+    the fixture never selects by score or rating.
+    """
+    from app.data.db import query
+    from app.risk import dataset
+
+    ids = [row["client_id"] for row in overdue_cohort]
+    features = dataset.features_many(ids, _AS_OF, 12)
+    selected = [
+        row
+        for row in overdue_cohort
+        if features[row["client_id"]]["credit_limit_eur"] == 0.0
+    ][:5]
+    if len(selected) < 2:
+        pytest.skip("fewer than two current severe buyers have no controlled credit limit")
+    placeholders = ", ".join(f":cid_{index}" for index in range(len(selected)))
+    params = {f"cid_{index}": row["client_id"] for index, row in enumerate(selected)}
+    names = {
+        int(row["ID"]): str(row["Name"])
+        for row in query(
+            f"SELECT ID, Name FROM dbo.Client WHERE ID IN ({placeholders})",
+            params,
+        )
+    }
+    return [
+        {**row, "name": names.get(row["client_id"], str(row["client_id"]))}
+        for row in selected
+    ]
 
 
 @pytest.fixture(scope="module")
@@ -198,6 +235,45 @@ def nonbuyer_ids() -> list[int]:
 
 
 @pytest.fixture(scope="module")
+def forward_at_risk_cohort() -> list[dict]:
+    """One current, material-debt buyer from every available behavioral forward band.
+
+    The selection is drawn only from the artifact's declared serving population:
+    ``total_debt_eur > 0`` and not already SEV180. Expected values come from the standalone
+    scorecard and are compared exactly to the service integration path.
+    """
+    from app.risk import dataset
+    from app.risk.score_forward import score_forward
+
+    clients = dataset.buyer_ids()
+    labels = dataset.label_sev180(_AS_OF, clients)
+    aging = dataset.feat_debt_aging(_AS_OF)
+    candidates = [
+        int(row.client_id)
+        for row in aging.itertuples()
+        if float(row.total_debt_eur) >= 1.0 and labels[int(row.client_id)] == 0
+    ]
+    if not candidates:
+        pytest.skip("no current material-debt, not-yet-SEV180 buyers")
+    features = dataset.features_many(candidates, _AS_OF, 12)
+    by_band: dict[str, dict] = {}
+    for client_id in candidates:
+        expected = score_forward(features[client_id])
+        band = str(expected["band"])
+        current = by_band.get(band)
+        if current is None or expected["pd_behavioral"] > current["expected"]["pd_behavioral"]:
+            by_band[band] = {
+                "client_id": client_id,
+                "features": features[client_id],
+                "expected": expected,
+            }
+    selected = [by_band[band] for band in ("low", "medium", "high", "very_high") if band in by_band]
+    if len(selected) < 2:
+        pytest.skip(f"only forward bands {sorted(by_band)} represented in the current source")
+    return selected
+
+
+@pytest.fixture(scope="module")
 def brand_new_buyer() -> int:
     """A buyer-role entity with NO sales at all (cold-start)."""
     from app.data.db import query
@@ -239,19 +315,28 @@ def test_cohort_overdue_buyers_all_band_c_or_d(service, overdue_cohort):
 
 
 @skip_no_db
-def test_cohort_overdue_buyers_mostly_forward_high(service, overdue_cohort):
-    """Most of the overdue cohort should fire the 6mo early-warning (forward high/very_high)."""
-    high = 0
-    for c in overdue_cohort:
-        res = _score(service, c["client_id"])
-        assert res.forward_risk is not None
-        if res.forward_risk.band in {"high", "very_high"}:
-            high += 1
-    frac = high / len(overdue_cohort)
-    assert frac >= 0.80, (
-        f"only {high}/{len(overdue_cohort)} ({frac:.0%}) overdue buyers flagged forward "
-        f"high/very_high; expected the majority"
-    )
+def test_forward_at_risk_cohort_matches_behavioral_scorecard(
+    service, forward_at_risk_cohort
+):
+    """The service must preserve the standalone scorecard exactly on its valid population.
+
+    Already-SEV180 clients are deliberately absent: the artifact was trained only on debt-positive
+    buyers who had not defaulted at feature time. Comparing today's already-defaulted cohort to a
+    future-default model was the old test's category error.
+    """
+    bands = set()
+    for row in forward_at_risk_cohort:
+        assert row["features"]["total_debt_eur"] > 0
+        assert row["features"]["overdue_eur_180plus"] < SEV180_MIN_EUR
+        expected = row["expected"]
+        result = _score(service, row["client_id"])
+        assert result.forward_risk is not None
+        assert result.forward_risk.band == expected["band"]
+        assert result.forward_risk.pd == pytest.approx(
+            expected["pd_behavioral"], rel=0, abs=1e-12
+        )
+        bands.add(result.forward_risk.band.value)
+    assert len(bands) >= 2, f"forward fixture did not exercise multiple bands: {bands}"
 
 
 @skip_no_db
@@ -272,32 +357,44 @@ def test_cohort_clean_buyers_mostly_a_or_b(service, clean_cohort):
 
 
 # --------------------------------------------------------------------------------------------
-# NAMED REGRESSION  (these were 64/65 under the old expert model; v3 must call them D)
+# D REGRESSION  (dynamic, survives client-ID re-mints)
 # --------------------------------------------------------------------------------------------
 @skip_no_db
-@pytest.mark.parametrize(
-    "client_id, name",
-    [(TRAMP_OIL_CLIENT_ID, "ТРАМП ОЙЛ"), (ABRAMCHENKO_CLIENT_ID, "АБРАМЧЕНКО")],
-)
-def test_named_regression_high_risk_buyer_is_band_d(service, client_id, name):
-    res = _score(service, client_id)
-    assert res.applicable is True, f"{name} ({client_id}) must be an applicable buyer"
-    assert res.rating == "D", f"{name} ({client_id}) regressed: rating={res.rating}"
-    assert res.score is not None and res.score < 65, (
-        f"{name} ({client_id}) score {res.score} not low (old expert scored it ~64/65)"
-    )
-    assert res.pd is not None and res.pd > 0.15, (  # band D PD floor
-        f"{name} ({client_id}) PD {res.pd} below band-D threshold"
-    )
-    assert res.forward_risk is not None
+def test_dynamic_severe_no_limit_regression_cohort_is_band_d(
+    service, severe_d_regression_cohort
+):
+    failures = []
+    for row in severe_d_regression_cohort:
+        result = _score(service, row["client_id"])
+        if (
+            result.applicable is not True
+            or result.rating != "D"
+            or result.score is None
+            or result.score >= 65
+            or result.pd is None
+            or result.pd <= 0.15
+        ):
+            failures.append(
+                (
+                    row["client_id"],
+                    row["name"],
+                    result.rating,
+                    result.score,
+                    result.pd,
+                )
+            )
+        # A current SEV180 is outside the forward model's declared population.
+        assert result.forward_risk is None
+    assert not failures, f"dynamic severe/no-limit D regression failures: {failures}"
 
 
 # --------------------------------------------------------------------------------------------
 # GATE  (solvency applies only to buyers)
 # --------------------------------------------------------------------------------------------
 @skip_no_db
-def test_gate_provider_only_known_id_not_applicable(service):
-    res = _score(service, PROVIDER_ONLY_CLIENT_ID)
+def test_gate_current_provider_only_not_applicable(service, nonbuyer_ids):
+    client_id = nonbuyer_ids[0]
+    res = _score(service, client_id)
     assert res.applicable is False
     assert res.score is None and res.rating is None and res.pd is None
     assert res.contributions is None and res.forward_risk is None
@@ -315,107 +412,44 @@ def test_gate_nonbuyer_cohort_all_not_applicable(service, nonbuyer_ids):
 
 
 # --------------------------------------------------------------------------------------------
-# MONOTONIC  (rank sanity within a matched tenure/turnover band)
+# TARGET LEAKAGE / MONOTONIC SANITY
 # --------------------------------------------------------------------------------------------
 @skip_no_db
-def test_monotonic_higher_overdue_not_higher_score(service):
-    """Within a matched tenure+turnover band, the MORE-overdue buyer must NOT earn a better
-    rating (rank sanity). 'Overdue' is measured on the SAME feature the model consumes
-    (overdue_eur_180plus from features_one), so the comparison is apples-to-apples and not
-    confounded by other debt-aging signals.
+def test_current_score_is_invariant_to_excluded_sev180_magnitude(overdue_cohort):
+    """Live features prove the target itself cannot improve (or alter) the current score.
 
-    NOTE on resolution: the v3 scorecard saturates -- once any debt-aging signal trips, the
-    score floors in band C/D (~45-65) and the integer is then driven by turnover / debt-line
-    count, not overdue magnitude. So we assert at the model's real decision granularity (the
-    rating band) and allow a small score tolerance for jitter inside the saturated floor.
+    ``overdue_eur_180plus`` and its derived share are intentionally excluded from the supervised
+    current-state scorecard to prevent target leakage. The old matched-client test varied many
+    other features and compared two unrelated buyers; this counterfactual holds every consumed
+    feature constant and therefore tests the actual monotonic/leakage contract exactly.
     """
-    from collections import defaultdict
-
-    from app.data.db import query
     from app.risk import dataset
+    from app.risk.score_current import _card, score_current
 
-    rows = query(
-        """
-        SELECT ca.ClientID AS client_id,
-               (DATEDIFF(month, MIN(s.Created), :asof) / 12) AS tenure_band,
-               (CASE WHEN SUM(oi.Qty * oi.PricePerItem) >= 100000 THEN 3
-                     WHEN SUM(oi.Qty * oi.PricePerItem) >= 20000 THEN 2
-                     WHEN SUM(oi.Qty * oi.PricePerItem) >= 5000 THEN 1 ELSE 0 END) AS turn_band
-        FROM dbo.Sale s
-        JOIN dbo.[Order] o ON o.ID = s.OrderID
-        JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-        JOIN dbo.ClientAgreement ca ON ca.ID = s.ClientAgreementID
-        JOIN dbo.ClientInRole cir ON cir.ClientID = ca.ClientID
-        JOIN dbo.ClientType ct ON ct.ID = cir.ClientTypeID
-        WHERE oi.IsValidForCurrentSale = 1 AND oi.ProductID <> 25422404
-              AND s.Created > '2000-01-01' AND s.Created <= :asof
-              AND s.Created >= DATEADD(month, -12, :asof)
-              AND cir.Deleted = 0 AND ct.[Type] = 0
-              AND ca.ClientID IN (
-                  SELECT cid.ClientID FROM dbo.ClientInDebt cid
-                  JOIN dbo.Debt d ON d.ID = cid.DebtID
-                  JOIN dbo.Agreement a ON a.ID = cid.AgreementID
-                  WHERE cid.Deleted = 0 AND d.Deleted = 0 AND d.Created <= :asof
-                        AND DATEDIFF(day, d.Created, :asof) > a.NumberDaysDebt + 180)
-        GROUP BY ca.ClientID
-        HAVING SUM(oi.Qty * oi.PricePerItem) > 0
-        """,
-        {"asof": _AS_OF},
-    )
-    if len(rows) < 4:
-        pytest.skip("not enough overdue+active buyers to form matched pairs")
+    consumed_features = set(_card()["features"])
+    assert "overdue_eur_180plus" not in consumed_features
+    assert "pct_debt_180plus" not in consumed_features
 
-    buckets: dict[tuple, list[int]] = defaultdict(list)
-    for r in rows:
-        buckets[(int(r["tenure_band"]), int(r["turn_band"]))].append(int(r["client_id"]))
-    # keep only bands with >=2 members, cap per band to bound feature pulls
-    candidate_ids = [cid for ids in buckets.values() if len(ids) >= 2 for cid in ids[:8]]
-    if not candidate_ids:
-        pytest.skip("no matched tenure/turnover band has >=2 overdue buyers")
-
-    _RANK = {"A": 0, "B": 1, "C": 2, "D": 3}  # worse rating -> higher rank
-    info: dict[int, tuple[float, int, int]] = {}  # cid -> (overdue_180plus, score, rank)
-    for cid in candidate_ids:
-        feats = dataset.features_one(cid, _AS_OF)
-        res = _score(service, cid)
-        info[cid] = (float(feats.get("overdue_eur_180plus") or 0.0), res.score, _RANK[res.rating])
-
-    _SCORE_TOL = 6
-    pairs_checked = 0
-    violations = []
-    for ids in buckets.values():
-        members = [cid for cid in ids[:8] if cid in info]
-        if len(members) < 2:
-            continue
-        members.sort(key=lambda c: info[c][0])  # by overdue_eur_180plus
-        lo, hi = members[0], members[-1]
-        od_lo, s_lo, r_lo = info[lo]
-        od_hi, s_hi, r_hi = info[hi]
-        if od_hi <= max(od_lo, 1.0) * 1.5:  # need a materially larger overdue to be meaningful
-            continue
-        pairs_checked += 1
-        better_rating = r_hi < r_lo
-        materially_higher_score = s_hi > s_lo + _SCORE_TOL
-        if better_rating or materially_higher_score:
-            violations.append(
-                (lo, round(od_lo), s_lo, ["A", "B", "C", "D"][r_lo],
-                 hi, round(od_hi), s_hi, ["A", "B", "C", "D"][r_hi])
-            )
-
-    if pairs_checked == 0:
-        pytest.skip("no matched tenure/turnover pairs with a material 180+ overdue gap")
-    assert not violations, (
-        "monotonicity violated (more overdue -> higher score) for "
-        f"{len(violations)}/{pairs_checked} pairs: {violations}"
-    )
+    ids = [row["client_id"] for row in overdue_cohort[:10]]
+    features = dataset.features_many(ids, _AS_OF, 12)
+    for client_id in ids:
+        baseline_features = features[client_id]
+        amplified_features = dict(baseline_features)
+        amplified_features["overdue_eur_180plus"] *= 10
+        amplified_features["pct_debt_180plus"] = 1.0
+        baseline = score_current(baseline_features)
+        amplified = score_current(amplified_features)
+        assert amplified["score"] == baseline["score"], client_id
+        assert amplified["pd"] == baseline["pd"], client_id
+        assert amplified["band"] == baseline["band"], client_id
 
 
 # --------------------------------------------------------------------------------------------
 # CONTRACT  (v3 response shape, both in-process and live)
 # --------------------------------------------------------------------------------------------
 @skip_no_db
-def test_contract_inprocess_shape_for_applicable_buyer(service, overdue_cohort):
-    res = _score(service, overdue_cohort[0]["client_id"])
+def test_contract_inprocess_shape_for_applicable_buyer(service, forward_at_risk_cohort):
+    res = _score(service, forward_at_risk_cohort[0]["client_id"])
     assert res.applicable is True
     assert isinstance(res.score, int) and 0 <= res.score <= 100
     assert res.rating in {"A", "B", "C", "D"}
@@ -432,13 +466,14 @@ def test_contract_inprocess_shape_for_applicable_buyer(service, overdue_cohort):
 
 
 @skip_no_db
-def test_contract_live_response_shape_applicable():
+def test_contract_live_response_shape_applicable(forward_at_risk_cohort):
     _require_live()
     import httpx as requests
 
+    client_id = forward_at_risk_cohort[0]["client_id"]
     r = requests.post(
         f"{LIVE_BASE_URL}/score",
-        json={"client_id": TRAMP_OIL_CLIENT_ID, "as_of_date": _AS_OF, "use_cache": False},
+        json={"client_id": client_id, "as_of_date": _AS_OF, "use_cache": False},
         headers=_api_headers(),
         timeout=30,
     )
@@ -449,6 +484,7 @@ def test_contract_live_response_shape_applicable():
         "forward_risk", "sub_factors", "model_version",
     }
     assert required.issubset(body.keys()), f"missing keys: {required - set(body.keys())}"
+    assert body["client_id"] == client_id
     assert body["applicable"] is True
     assert body["model_version"] == "creditscore-v3"
     assert body["sub_factors"] is None
@@ -460,11 +496,15 @@ def test_contract_live_response_shape_applicable():
 
 
 @skip_no_db
-def test_contract_live_batch_scores_cohort():
+def test_contract_live_batch_scores_cohort(
+    severe_d_regression_cohort, nonbuyer_ids
+):
     _require_live()
     import httpx as requests
 
-    ids = [TRAMP_OIL_CLIENT_ID, ABRAMCHENKO_CLIENT_ID, PROVIDER_ONLY_CLIENT_ID]
+    severe_ids = [row["client_id"] for row in severe_d_regression_cohort[:2]]
+    provider_id = nonbuyer_ids[0]
+    ids = [*severe_ids, provider_id]
     r = requests.post(
         f"{LIVE_BASE_URL}/score/batch",
         json={"client_ids": ids, "as_of_date": _AS_OF, "use_cache": False},
@@ -474,9 +514,9 @@ def test_contract_live_batch_scores_cohort():
     assert r.status_code == 200, r.text
     body = r.json()
     by_id = {row["client_id"]: row for row in body["results"]}
-    assert by_id[TRAMP_OIL_CLIENT_ID]["rating"] == "D"
-    assert by_id[ABRAMCHENKO_CLIENT_ID]["rating"] == "D"
-    assert by_id[PROVIDER_ONLY_CLIENT_ID]["applicable"] is False
+    assert set(by_id) == set(ids)
+    assert all(by_id[client_id]["rating"] == "D" for client_id in severe_ids)
+    assert by_id[provider_id]["applicable"] is False
 
 
 # --------------------------------------------------------------------------------------------

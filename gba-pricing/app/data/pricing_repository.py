@@ -4,8 +4,9 @@ All SQL is parameterized (:name) — no f-string interpolation. Every query hono
 discovery data traps (/tmp/pricing-discovery.json):
   (a) NEVER filter Deleted=0 on Sale/Order/OrderItem (=1 on 100% of rows). Validity comes from
       OrderItem.IsValidForCurrentSale=1.
-  (b) Synthetic 1С debt-entry line (ProductID 25422404) is EXCLUDED everywhere (cost lots,
-      peer band, discount distribution) — it contaminates cost and realized price.
+  (b) Synthetic 1С debt-entry line («Ввід боргів», ID resolved live by synthetic_product_id —
+      the row gets re-minted) is EXCLUDED everywhere (cost lots, peer band, discount
+      distribution) — it contaminates cost and realized price.
   (c) FX snapshot date is pinned per run (GetExchangedToEuroValue revalues at call time): the
       revenue date pin = Sale.Created; the engine passes a deterministic fx_date.
   (d) Cost via ConsignmentItem.AccountingPrice (Deleted=0, AccountingPrice>0, RemainingQty>0):
@@ -23,31 +24,212 @@ The baseline price is computed by the live engine itself
 """
 from __future__ import annotations
 
+import threading
+import time
+from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 from app.core.config import get_settings
+from app.core.logging import get_logger
 from app.data.db import query
+from app.domain.money import optional_decimal
+
+log = get_logger("pricing_repository")
+
+_SYNTHETIC_REFRESH_S = 3600.0
+_synthetic_id: int | None = None
+_synthetic_expires_at = 0.0
+_READINESS_TTL_S = 60.0
+_readiness_lock = threading.Lock()
+_readiness_state: dict[int, tuple[float, dict[str, Any]]] = {}
+
+
+def synthetic_product_id() -> int:
+    """The 1С debt-entry product («Ввід боргів») is periodically re-minted with a NEW ID (the old
+    hardcoded 25422404 is dead), so the exclusion ID is resolved live and cached for an hour;
+    SYNTHETIC_LINE_PRODUCT_ID is only the fallback when the lookup fails and nothing is cached.
+    """
+    global _synthetic_id, _synthetic_expires_at
+    now = time.monotonic()
+    if _synthetic_id is not None and now < _synthetic_expires_at:
+        return _synthetic_id
+    try:
+        rows = query(
+            "SELECT TOP 1 ID FROM dbo.Product "
+            "WHERE Name = N'Ввід боргів' AND Deleted = 0 ORDER BY ID DESC"
+        )
+        if rows and rows[0]["ID"] is not None:
+            resolved = int(rows[0]["ID"])
+            if resolved != _synthetic_id:
+                log.info("synthetic_product_resolved", product_id=resolved)
+            _synthetic_id = resolved
+            _synthetic_expires_at = now + _SYNTHETIC_REFRESH_S
+            return _synthetic_id
+        log.warning("synthetic_product_not_found")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("synthetic_product_resolve_failed", error=str(exc))
+    if _synthetic_id is not None:
+        return _synthetic_id
+    return get_settings().synthetic_line_product_id
+
+
+def source_readiness(max_lag_days: int) -> dict[str, Any]:
+    """Return a short-lived, factual business-source readiness snapshot.
+
+    Pricing depends on more than an open MSSQL socket: the canonical valid sales spine must be
+    current, live products and agreements must exist, and the synthetic 1C debt line must be
+    resolved from the current catalog (a configured fallback is not sufficient evidence).
+    """
+    now_mono = time.monotonic()
+    with _readiness_lock:
+        cached = _readiness_state.get(max_lag_days)
+        if cached is not None and now_mono - cached[0] < _READINESS_TTL_S:
+            return dict(cached[1])
+
+    synthetic = synthetic_product_id()
+    rows = query(
+        """
+        SELECT
+            (
+                SELECT TOP 1 o.Created
+                FROM dbo.[Order] o
+                JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
+                JOIN dbo.Product p ON p.ID = oi.ProductID AND p.Deleted = 0
+                WHERE oi.IsValidForCurrentSale = 1
+                      AND oi.ProductID <> :synthetic
+                      AND oi.Qty > 0
+                      AND oi.PricePerItem > 0
+                ORDER BY o.Created DESC, o.ID DESC
+            ) AS latest_sale_at,
+            (
+                SELECT COUNT_BIG(*)
+                FROM dbo.Product p
+                WHERE p.Deleted = 0
+                      AND p.NetUID IS NOT NULL
+                      AND p.ID <> :synthetic
+                      AND p.Name <> N'Ввід боргів'
+            ) AS active_product_count,
+            (
+                SELECT COUNT_BIG(*)
+                FROM dbo.ClientAgreement ca
+                JOIN dbo.Agreement a ON a.ID = ca.AgreementID
+                WHERE ca.NetUID IS NOT NULL
+            ) AS agreement_count,
+            (
+                SELECT COUNT_BIG(*)
+                FROM dbo.Product p
+                WHERE p.ID = :synthetic
+                      AND p.Deleted = 0
+                      AND p.Name = N'Ввід боргів'
+            ) AS synthetic_product_count
+        """,
+        {"synthetic": synthetic},
+    )
+    row = rows[0] if rows else {}
+    latest = row.get("latest_sale_at")
+    source_fresh = isinstance(latest, datetime) and latest >= datetime.now() - timedelta(
+        days=max_lag_days
+    )
+    product_count = int(row.get("active_product_count") or 0)
+    agreement_count = int(row.get("agreement_count") or 0)
+    synthetic_count = int(row.get("synthetic_product_count") or 0)
+    reasons: list[str] = []
+    if latest is None:
+        reasons.append("canonical_sales_missing")
+    elif not source_fresh:
+        reasons.append("canonical_sales_stale")
+    if product_count <= 0:
+        reasons.append("active_products_missing")
+    if agreement_count <= 0:
+        reasons.append("client_agreements_missing")
+    if synthetic_count != 1:
+        reasons.append("synthetic_product_unresolved")
+
+    result = {
+        "business_ready": not reasons,
+        "reasons": reasons,
+        "latest_sale_at": latest.isoformat() if isinstance(latest, datetime) else None,
+        "max_source_lag_days": max_lag_days,
+        "active_product_count": product_count,
+        "client_agreement_count": agreement_count,
+        "synthetic_product_count": synthetic_count,
+        "synthetic_product_id": synthetic if synthetic_count == 1 else None,
+    }
+    with _readiness_lock:
+        _readiness_state[max_lag_days] = (time.monotonic(), dict(result))
+    return result
 
 
 def resolve_product(product_id: int | None, product_net_uid: str | None) -> dict[str, Any] | None:
-    """Resolve a product to {id, net_uid} from either ID or NetUID. The engine functions key on
-    NetUID; the cost/peer queries key on ID — so both are always carried.
+    """Resolve one live, non-synthetic product to ``{id, net_uid}``.
+
+    When both identities are supplied they must resolve to the same row.  Soft-deleted products
+    and the dynamically resolved 1С debt-entry product are deliberately indistinguishable from
+    an unknown product to callers, so the API returns 404 instead of a misleading 200/no-baseline.
     """
-    if product_id is not None:
+    if product_id is not None and product_id <= 0:
+        return None
+    if product_net_uid is not None:
+        product_net_uid = product_net_uid.strip()
+        if not product_net_uid:
+            return None
+    if product_id is None and product_net_uid is None:
+        return None
+
+    synthetic = synthetic_product_id()
+    params: dict[str, Any] = {"synthetic": synthetic}
+    if product_id is not None and product_net_uid is not None:
         rows = query(
-            "SELECT TOP 1 ID, NetUID FROM dbo.Product WHERE ID = :pid",
-            {"pid": product_id},
+            """
+            SELECT TOP 1 p.ID, p.NetUID, p.Name
+            FROM dbo.Product p
+            WHERE p.ID = :pid
+                  AND p.NetUID = :uid
+                  AND p.Deleted = 0
+                  AND p.ID <> :synthetic
+                  AND p.Name <> N'Ввід боргів'
+            """,
+            {"pid": product_id, "uid": product_net_uid, **params},
+        )
+    elif product_id is not None:
+        rows = query(
+            """
+            SELECT TOP 1 p.ID, p.NetUID, p.Name
+            FROM dbo.Product p
+            WHERE p.ID = :pid
+                  AND p.Deleted = 0
+                  AND p.ID <> :synthetic
+                  AND p.Name <> N'Ввід боргів'
+            """,
+            {"pid": product_id, **params},
         )
     elif product_net_uid is not None:
         rows = query(
-            "SELECT TOP 1 ID, NetUID FROM dbo.Product WHERE NetUID = :uid",
-            {"uid": product_net_uid},
+            """
+            SELECT TOP 1 p.ID, p.NetUID, p.Name
+            FROM dbo.Product p
+            WHERE p.NetUID = :uid
+                  AND p.Deleted = 0
+                  AND p.ID <> :synthetic
+                  AND p.Name <> N'Ввід боргів'
+            """,
+            {"uid": product_net_uid, **params},
         )
-    else:
-        return None
     if not rows:
         return None
-    return {"id": int(rows[0]["ID"]), "net_uid": str(rows[0]["NetUID"])}
+    resolved_id = int(rows[0]["ID"])
+    resolved_uid = rows[0]["NetUID"]
+    resolved_name = str(rows[0].get("Name") or "").strip()
+    if (
+        resolved_id == synthetic
+        or resolved_name == "Ввід боргів"
+        or resolved_uid is None
+    ):
+        return None
+    if product_id is not None and resolved_id != product_id:
+        return None
+    return {"id": resolved_id, "net_uid": str(resolved_uid)}
 
 
 def resolve_client_agreement(client_agreement_net_uid: str) -> dict[str, Any] | None:
@@ -80,8 +262,12 @@ def resolve_client_agreement(client_agreement_net_uid: str) -> dict[str, Any] | 
     }
 
 
-def baseline_price(product_net_uid: str, client_agreement_net_uid: str,
-                   culture: str, with_vat: bool) -> float | None:
+def baseline_price(
+    product_net_uid: str,
+    client_agreement_net_uid: str,
+    culture: str,
+    with_vat: bool,
+) -> Decimal | None:
     """THE optimizer baseline — the live engine value, returned UNCHANGED for reference.
 
     Calls dbo.GetCalculatedProductPriceWithSharesAndVat(@ProductNetId, @ClientAgreementNetId,
@@ -103,7 +289,84 @@ def baseline_price(product_net_uid: str, client_agreement_net_uid: str,
     )
     if not rows or rows[0]["baseline_price"] is None:
         return None
-    return float(rows[0]["baseline_price"])
+    return optional_decimal(rows[0]["baseline_price"])
+
+
+def client_world_fallback_baseline(
+    product_id: int,
+    client_agreement_id: int,
+    as_of_date: str,
+    window_months: int,
+) -> dict[str, Any] | None:
+    """WORLD-SAFE fallback baseline for a NULL agreement-scoped engine price.
+
+    dbo.GetPricingSourceForAgreement gates Agreement.IsActive=1 AND Agreement.Deleted=0 (and
+    ClientAgreement/Organization Deleted=0), so an inactive/deleted Agreement resolves a NULL
+    world and dbo.GetCalculatedProductPriceWithSharesAndVat returns NULL — even when the client
+    keeps buying the product. Fallback = MEDIAN realized OrderItem.PricePerItem (already EUR —
+    see peer_band) over the CLIENT's valid sale lines for the product in the trailing window,
+    RESTRICTED to the requested agreement's Organization world (Organization.PriceSourceIsAmg):
+    the per-source pricing cutover is live and worlds must NEVER mix.
+
+    The requested world is read from the RAW Agreement row (no IsActive/Deleted gate — that gate
+    is exactly why the engine returned NULL) but still requires a live Organization with a
+    non-NULL PriceSourceIsAmg; every candidate sale line must resolve its own
+    agreement->Organization world through the same INNER JOIN chain and match it by equality, so
+    a line whose world is NULL/unresolvable can never leak in. If the requested world itself
+    cannot be determined -> None (the caller keeps the no-baseline result). Line filters mirror
+    peer_band (traps a,b): IsValidForCurrentSale=1, ProductID<>synthetic, PricePerItem>0.
+    """
+    rows = query(
+        """
+        WITH req AS (
+            SELECT org.PriceSourceIsAmg AS world, ca.ClientID AS client_id
+            FROM dbo.ClientAgreement ca
+            JOIN dbo.Agreement a ON a.ID = ca.AgreementID
+            JOIN dbo.Organization org
+                  ON org.ID = a.OrganizationID
+                 AND org.Deleted = 0
+            WHERE ca.ID = :caid
+                  AND org.PriceSourceIsAmg IS NOT NULL
+        ),
+        lines AS (
+            SELECT oi.PricePerItem AS eur_price
+            FROM req
+            JOIN dbo.ClientAgreement ca2 ON ca2.ClientID = req.client_id
+            JOIN dbo.[Order] o ON o.ClientAgreementID = ca2.ID
+            JOIN dbo.Sale s ON s.OrderID = o.ID
+            JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
+            JOIN dbo.Agreement a2 ON a2.ID = ca2.AgreementID
+            JOIN dbo.Organization org2
+                  ON org2.ID = a2.OrganizationID
+                 AND org2.Deleted = 0
+            WHERE oi.ProductID = :pid
+                  AND oi.IsValidForCurrentSale = 1
+                  AND oi.ProductID <> :synthetic
+                  AND oi.PricePerItem > 0
+                  AND org2.PriceSourceIsAmg = req.world
+                  AND s.Created <= :asof
+                  AND s.Created >= DATEADD(month, :neg_months, :asof)
+        )
+        SELECT DISTINCT
+            CAST(
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY eur_price) OVER ()
+                AS decimal(38,14)
+            ) AS fallback_price,
+            (SELECT COUNT(*) FROM lines) AS n
+        FROM lines
+        """,
+        {
+            "pid": product_id, "caid": client_agreement_id,
+            "asof": as_of_date, "neg_months": -window_months,
+            "synthetic": synthetic_product_id(),
+        },
+    )
+    if not rows or rows[0]["fallback_price"] is None:
+        return None
+    return {
+        "fallback_price": optional_decimal(rows[0]["fallback_price"]),
+        "n": int(rows[0]["n"] or 0),
+    }
 
 
 def base_list_price_and_markup(product_id: int, agreement_id: int) -> dict[str, Any] | None:
@@ -161,7 +424,7 @@ def base_list_price_and_markup(product_id: int, agreement_id: int) -> dict[str, 
         return None
     r = rows[0]
     return {
-        "base_price": float(r["base_price"]) if r["base_price"] is not None else None,
+        "base_price": optional_decimal(r["base_price"]),
         "extra_charge": float(r["extra_charge"] or 0.0),
         "base_pricing_id": int(r["base_pricing_id"]) if r["base_pricing_id"] is not None else None,
         "culture": r["culture"],
@@ -258,8 +521,10 @@ def unit_cost_eur(product_id: int) -> dict[str, Any]:
     rows = query(
         """
         SELECT
-            (SELECT TOP 1 PERCENTILE_CONT(0.5)
+            (SELECT TOP 1 CAST(
+                          PERCENTILE_CONT(0.5)
                           WITHIN GROUP (ORDER BY ci.AccountingPrice) OVER ()
+                          AS decimal(38,14))
              FROM dbo.ConsignmentItem ci
              JOIN dbo.Consignment c ON c.ID = ci.ConsignmentID
              LEFT JOIN dbo.ProductIncome pi ON pi.ID = c.ProductIncomeID
@@ -268,7 +533,11 @@ def unit_cost_eur(product_id: int) -> dict[str, Any]:
                    AND ci.AccountingPrice > 0
                    AND ci.RemainingQty > 0
                    AND ci.ProductID <> :synthetic
-                   AND (pi.ID IS NULL OR pi.SourceDocumentType IS NULL OR pi.SourceDocumentType <> :debt_doc_type)) AS median_cost,
+                   AND (
+                       pi.ID IS NULL
+                       OR pi.SourceDocumentType IS NULL
+                       OR pi.SourceDocumentType <> :debt_doc_type
+                   )) AS median_cost,
             (SELECT COUNT(*)
              FROM dbo.ConsignmentItem ci
              JOIN dbo.Consignment c ON c.ID = ci.ConsignmentID
@@ -278,7 +547,11 @@ def unit_cost_eur(product_id: int) -> dict[str, Any]:
                    AND ci.AccountingPrice > 0
                    AND ci.RemainingQty > 0
                    AND ci.ProductID <> :synthetic
-                   AND (pi.ID IS NULL OR pi.SourceDocumentType IS NULL OR pi.SourceDocumentType <> :debt_doc_type)) AS lot_count,
+                   AND (
+                       pi.ID IS NULL
+                       OR pi.SourceDocumentType IS NULL
+                       OR pi.SourceDocumentType <> :debt_doc_type
+                   )) AS lot_count,
             (SELECT TOP 1 ci.AccountingPrice
              FROM dbo.ConsignmentItem ci
              JOIN dbo.Consignment c ON c.ID = ci.ConsignmentID
@@ -287,12 +560,16 @@ def unit_cost_eur(product_id: int) -> dict[str, Any]:
                    AND ci.Deleted = 0
                    AND ci.AccountingPrice > 0
                    AND ci.ProductID <> :synthetic
-                   AND (pi.ID IS NULL OR pi.SourceDocumentType IS NULL OR pi.SourceDocumentType <> :debt_doc_type)
+                   AND (
+                       pi.ID IS NULL
+                       OR pi.SourceDocumentType IS NULL
+                       OR pi.SourceDocumentType <> :debt_doc_type
+                   )
              ORDER BY ci.ID DESC) AS latest_cost
         """,
         {
             "pid": product_id,
-            "synthetic": s.synthetic_line_product_id,
+            "synthetic": synthetic_product_id(),
             "debt_doc_type": s.debt_import_source_document_type,
         },
     )
@@ -301,10 +578,10 @@ def unit_cost_eur(product_id: int) -> dict[str, Any]:
     latest = r.get("latest_cost")
     lot_count = int(r.get("lot_count") or 0)
     if median is not None:
-        cost = float(median)
+        cost = optional_decimal(median)
         source = "median_onhand"
     elif latest is not None:
-        cost = float(latest)
+        cost = optional_decimal(latest)
         source = "latest_lot"
     else:
         cost = None
@@ -312,8 +589,8 @@ def unit_cost_eur(product_id: int) -> dict[str, Any]:
     return {
         "unit_cost_eur": cost,
         "lot_count": lot_count,
-        "median_cost": float(median) if median is not None else None,
-        "latest_cost": float(latest) if latest is not None else None,
+        "median_cost": optional_decimal(median),
+        "latest_cost": optional_decimal(latest),
         "cost_source": source,
     }
 
@@ -393,15 +670,24 @@ def peer_band(product_id: int, as_of_date: str, window_months: int,
                   OR ABS(eur_price - med) <= :mad_k * 1.4826 * mad
         )
         SELECT DISTINCT
-            PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY eur_price) OVER () AS p25,
-            PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY eur_price) OVER () AS p50,
-            PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY eur_price) OVER () AS p75,
+            CAST(
+                PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY eur_price) OVER ()
+                AS decimal(38,14)
+            ) AS p25,
+            CAST(
+                PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY eur_price) OVER ()
+                AS decimal(38,14)
+            ) AS p50,
+            CAST(
+                PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY eur_price) OVER ()
+                AS decimal(38,14)
+            ) AS p75,
             (SELECT COUNT(DISTINCT ca_id) FROM trimmed) AS n
         FROM trimmed
         """,
         {
             "pid": product_id, "asof": as_of_date, "neg_months": -window_months,
-            "synthetic": s.synthetic_line_product_id,
+            "synthetic": synthetic_product_id(),
             "mad_k": s.peer_band_mad_k,
             "min_rows": s.peer_band_mad_min_rows,
         },
@@ -410,9 +696,9 @@ def peer_band(product_id: int, as_of_date: str, window_months: int,
         return {"p25": None, "p50": None, "p75": None, "n": 0}
     r = rows[0]
     return {
-        "p25": float(r["p25"]) if r["p25"] is not None else None,
-        "p50": float(r["p50"]) if r["p50"] is not None else None,
-        "p75": float(r["p75"]) if r["p75"] is not None else None,
+        "p25": optional_decimal(r["p25"]),
+        "p50": optional_decimal(r["p50"]),
+        "p75": optional_decimal(r["p75"]),
         "n": int(r["n"] or 0),
     }
 
@@ -473,7 +759,6 @@ def product_line_count(product_id: int, as_of_date: str, window_months: int) -> 
     """Number of VALID sale lines for a product in the trailing window — the estimability band
     discriminant (bands A/B >=100 lines support a per-SKU elasticity; below it pools/falls back).
     Same valid-row + synthetic-exclude filters as the panel."""
-    s = get_settings()
     rows = query(
         """
         SELECT COUNT(*) AS n
@@ -489,7 +774,7 @@ def product_line_count(product_id: int, as_of_date: str, window_months: int) -> 
               AND s.Created >= DATEADD(month, :neg_months, :asof)
         """,
         {"pid": product_id, "asof": as_of_date, "neg_months": -window_months,
-         "synthetic": s.synthetic_line_product_id},
+         "synthetic": synthetic_product_id()},
     )
     return int(rows[0]["n"] or 0) if rows else 0
 
@@ -507,7 +792,6 @@ def product_panel(product_id: int, as_of_date: str, window_months: int) -> list[
     Sale/Order/OrderItem), ProductID<>synthetic 1С line, PricePerItem>0, Qty>0, trailing window by
     Sale.Created. The per-product UoM/price outlier reject and the regression run in Python.
     """
-    s = get_settings()
     return query(
         """
         SELECT
@@ -529,7 +813,7 @@ def product_panel(product_id: int, as_of_date: str, window_months: int) -> list[
         """,
         {
             "pid": product_id, "asof": as_of_date, "neg_months": -window_months,
-            "synthetic": s.synthetic_line_product_id,
+            "synthetic": synthetic_product_id(),
         },
     )
 
@@ -543,7 +827,6 @@ def group_panel(product_group_id_value: int, as_of_date: str, window_months: int
     Capped at max_products of the highest-volume SKUs in the group (by valid line count) so a giant
     group cannot blow up the design matrix; the cap is generous relative to the bands A/B universe.
     """
-    s = get_settings()
     return query(
         """
         WITH grp AS (
@@ -582,6 +865,6 @@ def group_panel(product_group_id_value: int, as_of_date: str, window_months: int
         """,
         {
             "pgid": product_group_id_value, "asof": as_of_date, "neg_months": -window_months,
-            "synthetic": s.synthetic_line_product_id, "max_products": max_products,
+            "synthetic": synthetic_product_id(), "max_products": max_products,
         },
     )

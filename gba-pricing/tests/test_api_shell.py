@@ -14,7 +14,6 @@ from app.domain.models import (
     PriceRecommendation,
 )
 
-
 CA_UID = "11111111-1111-1111-1111-111111111111"
 CA_UID_B = "22222222-2222-2222-2222-222222222222"
 CA_UID_C = "33333333-3333-3333-3333-333333333333"
@@ -58,6 +57,51 @@ def test_metrics_endpoint():
     resp = client.get("/metrics", headers=_headers())
     assert resp.status_code == 200
     assert "uptime_seconds" in resp.json()
+
+
+def test_health_fails_closed_when_business_source_is_not_ready(monkeypatch):
+    monkeypatch.setattr(main, "get_engine", lambda: types.SimpleNamespace(
+        connect=lambda: _ConnectionContext()
+    ))
+    monkeypatch.setattr(main.cache, "health", lambda: True)
+    monkeypatch.setattr(
+        main.repo,
+        "source_readiness",
+        lambda _max_lag: {
+            "business_ready": False,
+            "reasons": ["canonical_sales_stale"],
+        },
+    )
+    response = TestClient(main.app).get("/health")
+    assert response.status_code == 200
+    assert response.json()["status"] == "degraded"
+    assert response.json()["business_ready"] is False
+
+
+def test_ready_requires_database_cache_and_business_source(monkeypatch):
+    monkeypatch.setattr(main, "get_engine", lambda: types.SimpleNamespace(
+        connect=lambda: _ConnectionContext()
+    ))
+    monkeypatch.setattr(main.cache, "health", lambda: True)
+    monkeypatch.setattr(
+        main.repo,
+        "source_readiness",
+        lambda _max_lag: {"business_ready": True, "reasons": []},
+    )
+    response = TestClient(main.app).get("/ready")
+    assert response.status_code == 200
+    assert response.json()["status"] == "ready"
+
+
+class _ConnectionContext:
+    def __enter__(self):
+        return self
+
+    def exec_driver_sql(self, _sql: str) -> None:
+        return None
+
+    def __exit__(self, *_args) -> None:
+        return None
 
 
 def test_price_requires_product_identifier():
@@ -118,6 +162,35 @@ def test_price_with_fake_service(monkeypatch):
     assert body["confidence"] == "high"
     assert body["model_version"] == "pricing-ab-v2"
     assert body["discount_band"]["target_pct"] == 7.5
+
+
+def test_price_maps_rejected_synthetic_product_to_not_found(monkeypatch):
+    mod = types.ModuleType("app.services.pricing.service")
+
+    def recommend_price(**_):
+        raise LookupError("product not found")
+
+    mod.recommend_price = recommend_price
+    monkeypatch.setitem(sys.modules, "app.services.pricing.service", mod)
+
+    client = TestClient(main.app)
+    resp = client.post(
+        "/price",
+        json={"product_id": 777, "client_agreement_net_uid": CA_UID},
+        headers=_headers(),
+    )
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "product not found"
+
+
+def test_price_rejects_nonpositive_product_id():
+    client = TestClient(main.app)
+    resp = client.post(
+        "/price",
+        json={"product_id": 0, "client_agreement_net_uid": CA_UID},
+        headers=_headers(),
+    )
+    assert resp.status_code == 422
 
 
 def test_price_batch_isolates_errors(monkeypatch):

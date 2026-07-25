@@ -17,22 +17,22 @@ class Settings(BaseSettings):
     db_password: str = Field(default="", description="Set in .env; never hardcode")
     db_pool_size: int = 10
     db_max_overflow: int = 10
-    db_login_timeout_seconds: int = 5
-    db_query_timeout_seconds: int = 30
 
     redis_host: str = "127.0.0.1"
     redis_port: int = 6379
     redis_db: int = 2
-    cache_ttl: int = 3600
+    # ~25h: the day's snapshots must outlive the whole business day; freshness comes from the
+    # hourly in-process portfolio refresh, not from TTL expiry (a 1h TTL made the dashboard
+    # rebuild cold every hour).
+    cache_ttl: int = 90000
 
     api_host: str = "0.0.0.0"
     api_port: int = 8005
     log_level: str = "INFO"
 
     # Shared secret the trusted gba-server proxy must present (X-Internal-Api-Key).
-    # Fail-closed: startup refuses without a key unless ALLOW_OPEN_INTERNAL_API=true (local only).
+    # Empty = open (dev only); set in every non-local deployment.
     internal_api_key: str = ""
-    allow_open_internal_api: bool = False
     cors_allow_origins: list[str] = Field(
         default_factory=lambda: [
             "http://localhost:8083",
@@ -42,7 +42,14 @@ class Settings(BaseSettings):
     )
 
     # bump on any scoring/classification change so outcomes can be sliced/A-B'd by version
-    model_version: str = "products-v2-abc"
+    # Stock semantics changed from the now-empty ReSaleAvailability cost layer to operational
+    # ProductAvailability, and v4 makes all currency/quantity boundaries Decimal + HALF_UP.
+    # Bump the cache namespace so a deploy cannot serve either all-zero or binary-float snapshots.
+    model_version: str = "products-v4-exact-decimal"
+
+    # Optional override for the synthetic «Ввід боргів» debt-entry ProductID. 0 = resolve it
+    # dynamically from dbo.Product (the 1С sync re-mints the row, so a pinned ID goes stale).
+    synthetic_product_id: int = 0
 
     # Inventory-health policy (env-tunable; calibrate thresholds on real data — never guess).
     velocity_window_days: int = 180     # trailing window for the demand rate
@@ -87,12 +94,6 @@ class Settings(BaseSettings):
     w_stability: float = 0.12
     w_returns: float = 0.03
     w_abc: float = 0.22
-
-    def validate_runtime_configuration(self) -> None:
-        if not self.internal_api_key and not self.allow_open_internal_api:
-            raise RuntimeError(
-                "INTERNAL_API_KEY is required. Set ALLOW_OPEN_INTERNAL_API=true only for local/dev."
-            )
 
     @property
     def sqlalchemy_url(self) -> str:

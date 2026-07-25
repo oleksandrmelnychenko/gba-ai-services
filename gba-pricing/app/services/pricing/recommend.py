@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import ROUND_HALF_UP, Decimal
 
 from app.core.config import get_settings
 from app.domain.models import (
@@ -9,6 +10,7 @@ from app.domain.models import (
     PeerBand,
     PriceRecommendation,
 )
+from app.domain.money import CENT, HUNDRED, ZERO, MoneyValue, as_decimal, optional_decimal
 from app.services.pricing.elasticity import elastic_optimal_price, is_sane_elasticity
 
 HIGH_COST_LOTS = 3
@@ -19,6 +21,9 @@ ELAS_SOURCE_PER_SKU = "per-sku"
 ELAS_SOURCE_POOLED = "pooled-group"
 ELAS_SOURCE_NONE = "none"
 
+BASELINE_SOURCE_AGREEMENT = "agreement"
+BASELINE_SOURCE_CLIENT_WORLD = "client_world_fallback"
+
 R_BELOW_MARGIN = "below-margin-loss-flag"
 R_MARGIN_FLOOR = "margin-floor"
 R_PEER_MEDIAN = "peer-median"
@@ -28,28 +33,34 @@ R_NO_ANCHOR = "no-anchor"
 R_NO_BASELINE = "no-baseline"
 
 
-def _round2(x: float) -> float:
-    return round(x, 2)
+def _round2(value: MoneyValue) -> float:
+    """Serialize a monetary/percentage value at two decimals using accounting rounding."""
+    return float(as_decimal(value).quantize(CENT, rounding=ROUND_HALF_UP))
 
 
-def price_floor(unit_cost_eur: float | None, target_margin_pct: float) -> float | None:
+def price_floor(
+    unit_cost_eur: MoneyValue | None,
+    target_margin_pct: MoneyValue,
+) -> Decimal | None:
     """Hard margin floor: unit_cost_eur*(1+target_margin_pct/100). None when no cost lot
     exists (peer-band-only path, floor skipped)."""
     if unit_cost_eur is None:
         return None
-    return unit_cost_eur * (1.0 + target_margin_pct / 100.0)
+    unit_cost = as_decimal(unit_cost_eur)
+    margin_pct = as_decimal(target_margin_pct)
+    return unit_cost * (Decimal(1) + margin_pct / HUNDRED)
 
 
 @dataclass
 class RecommendedPrice:
-    value: float | None
+    value: Decimal | None
     rationale: str
 
 
 def recommended_price(
-    floor: float | None,
-    peer_p50: float | None,
-    baseline: float | None,
+    floor: MoneyValue | None,
+    peer_p50: MoneyValue | None,
+    baseline: MoneyValue | None,
 ) -> RecommendedPrice:
     """clamp( max(floor, peer_P50), lower=floor, upper=baseline ).
 
@@ -57,59 +68,74 @@ def recommended_price(
     FLAG -> recommended=floor, rationale='below-margin-loss-flag'. With no floor (no cost) the
     band is peer-only and still capped at the baseline.
     """
-    if baseline is not None and baseline <= 0:
+    floor_value = optional_decimal(floor)
+    peer_value = optional_decimal(peer_p50)
+    baseline_value = optional_decimal(baseline)
+
+    if baseline_value is not None and baseline_value <= ZERO:
         return RecommendedPrice(value=None, rationale=R_NO_BASELINE)
 
-    if floor is not None and baseline is not None and floor > baseline:
-        return RecommendedPrice(value=floor, rationale=R_BELOW_MARGIN)
+    if (
+        floor_value is not None
+        and baseline_value is not None
+        and floor_value > baseline_value
+    ):
+        return RecommendedPrice(value=floor_value, rationale=R_BELOW_MARGIN)
 
-    target = peer_p50
-    if floor is not None:
-        target = floor if target is None else max(floor, target)
+    target = peer_value
+    if floor_value is not None:
+        target = floor_value if target is None else max(floor_value, target)
 
     if target is None:
-        if baseline is not None:
-            return RecommendedPrice(value=baseline, rationale=R_AT_BASELINE)
+        if baseline_value is not None:
+            return RecommendedPrice(value=baseline_value, rationale=R_AT_BASELINE)
         return RecommendedPrice(value=None, rationale=R_NO_ANCHOR)
 
     bound = target
-    if floor is not None:
-        bound = max(bound, floor)
-    if baseline is not None:
-        bound = min(bound, baseline)
+    if floor_value is not None:
+        bound = max(bound, floor_value)
+    if baseline_value is not None:
+        bound = min(bound, baseline_value)
 
-    if floor is not None and bound <= floor:
+    if floor_value is not None and bound <= floor_value:
         rationale = R_MARGIN_FLOOR
-    elif baseline is not None and bound >= baseline:
+    elif baseline_value is not None and bound >= baseline_value:
         rationale = R_AT_BASELINE
     else:
         rationale = R_PEER_MEDIAN
     return RecommendedPrice(value=bound, rationale=rationale)
 
 
-def discount_from_price(rec_price: float | None, marked_up: float | None) -> float | None:
+def discount_from_price(
+    rec_price: MoneyValue | None,
+    marked_up: MoneyValue | None,
+) -> Decimal | None:
     """The DiscountRate that reproduces rec_price through the engine formula:
     (1 - rec_price/marked_up)*100 where marked_up = ROUND(P + P*ExtraCharge/100, 14)."""
-    if rec_price is None or not marked_up or marked_up <= 0:
+    rec_value = optional_decimal(rec_price)
+    marked_up_value = optional_decimal(marked_up)
+    if rec_value is None or marked_up_value is None or marked_up_value <= ZERO:
         return None
-    return (1.0 - rec_price / marked_up) * 100.0
+    return (Decimal(1) - rec_value / marked_up_value) * HUNDRED
 
 
 def cap_discount(
-    raw_discount_pct: float | None,
-    peer_p75: float | None,
-    peer_p90: float | None,
-) -> tuple[float | None, bool]:
+    raw_discount_pct: MoneyValue | None,
+    peer_p75: MoneyValue | None,
+    peer_p90: MoneyValue | None,
+) -> tuple[Decimal | None, bool]:
     """Cap the suggested discount at the peer P75 of ProductGroupDiscount.DiscountRate, hard-
     capped at P90. Returns (capped_pct, was_capped). Negative discounts (a recommended price
     above the marked-up list) are floored at 0."""
     if raw_discount_pct is None:
         return None, False
-    capped = max(0.0, raw_discount_pct)
+    capped = max(ZERO, as_decimal(raw_discount_pct))
+    peer_p75_value = optional_decimal(peer_p75)
+    peer_p90_value = optional_decimal(peer_p90)
     was_capped = False
-    cap = peer_p75 if peer_p75 is not None else peer_p90
-    if peer_p90 is not None:
-        cap = peer_p90 if cap is None else min(cap, peer_p90)
+    cap = peer_p75_value if peer_p75_value is not None else peer_p90_value
+    if peer_p90_value is not None:
+        cap = peer_p90_value if cap is None else min(cap, peer_p90_value)
     if cap is not None and capped > cap:
         capped = cap
         was_capped = True
@@ -117,14 +143,18 @@ def cap_discount(
 
 
 def confidence_for(
-    lot_count: int, peer_n: int, has_cost: bool, baseline: float | None = None
+    lot_count: int,
+    peer_n: int,
+    has_cost: bool,
+    baseline: MoneyValue | None = None,
 ) -> Confidence:
     """high if cost lots>=3 AND peer n>=10; low if no cost OR peer n<3; medium otherwise.
 
     A missing/non-positive baseline (no live engine price for this product × agreement) forces
     LOW so the console suppresses the recommendation instead of surfacing a bogus anchor.
     """
-    if baseline is None or baseline <= 0:
+    baseline_value = optional_decimal(baseline)
+    if baseline_value is None or baseline_value <= ZERO:
         return Confidence.LOW
     if not has_cost or peer_n < LOW_PEER_N:
         return Confidence.LOW
@@ -133,11 +163,16 @@ def confidence_for(
     return Confidence.MEDIUM
 
 
-def margin_pct_at(rec_price: float | None, unit_cost_eur: float | None) -> float | None:
+def margin_pct_at(
+    rec_price: MoneyValue | None,
+    unit_cost_eur: MoneyValue | None,
+) -> Decimal | None:
     """(rec_price - unit_cost_eur)/rec_price*100. None if no cost or non-positive price."""
-    if rec_price is None or unit_cost_eur is None or rec_price <= 0:
+    rec_value = optional_decimal(rec_price)
+    unit_cost = optional_decimal(unit_cost_eur)
+    if rec_value is None or unit_cost is None or rec_value <= ZERO:
         return None
-    return (rec_price - unit_cost_eur) / rec_price * 100.0
+    return (rec_value - unit_cost) / rec_value * HUNDRED
 
 
 def rationale_for(price_rationale: str, discount_was_capped: bool) -> str:
@@ -153,7 +188,8 @@ def rationale_for(price_rationale: str, discount_was_capped: bool) -> str:
 
 
 def elasticity_outputs(
-    elasticity_estimate: dict | None, unit_cost_eur: float | None
+    elasticity_estimate: dict | None,
+    unit_cost_eur: MoneyValue | None,
 ) -> tuple[float | None, str | None, float | None]:
     """Gate the SECONDARY elasticity signal. Returns (elasticity, source, elastic_optimal_price).
 
@@ -175,14 +211,15 @@ def build_recommendation(
     *,
     product_id: int,
     client_agreement_netuid: str,
-    baseline: float | None,
-    marked_up: float | None,
+    baseline: MoneyValue | None,
+    marked_up: MoneyValue | None,
     cost: dict,
     peer: dict,
     segment: dict,
-    target_margin_pct: float,
+    target_margin_pct: MoneyValue,
     as_of_date: str,
     elasticity_estimate: dict | None = None,
+    baseline_source: str = BASELINE_SOURCE_AGREEMENT,
 ) -> PriceRecommendation:
     """Pure assembler — every input is already fetched. Computes floor, recommended price,
     suggested discount (capped), discount band, confidence, margin and rationale. No I/O.
@@ -207,9 +244,13 @@ def build_recommendation(
     suggested_discount, was_capped = cap_discount(raw_discount, seg_p75, seg_p90)
 
     floor_discount = discount_from_price(floor, marked_up)
-    min_pct = max(0.0, floor_discount) if floor_discount is not None else 0.0
-    max_pct = seg_p90 if seg_p90 is not None else (seg_p75 if seg_p75 is not None else 0.0)
-    target_pct = suggested_discount if suggested_discount is not None else 0.0
+    min_pct = max(ZERO, floor_discount) if floor_discount is not None else ZERO
+    max_pct = (
+        optional_decimal(seg_p90)
+        if seg_p90 is not None
+        else (optional_decimal(seg_p75) if seg_p75 is not None else ZERO)
+    )
+    target_pct = suggested_discount if suggested_discount is not None else ZERO
     lo, hi = sorted([min_pct, max_pct])
     target_pct = min(max(target_pct, lo), hi)
     discount_band = DiscountBand(
@@ -232,6 +273,7 @@ def build_recommendation(
         client_agreement_netuid=client_agreement_netuid,
         currency="EUR",
         baseline_price=_round2(baseline) if baseline is not None else None,
+        baseline_source=baseline_source if baseline is not None else None,
         recommended_price=_round2(rec.value) if rec.value is not None else None,
         price_floor=_round2(floor) if floor is not None else None,
         unit_cost_eur=_round2(unit_cost) if unit_cost is not None else None,

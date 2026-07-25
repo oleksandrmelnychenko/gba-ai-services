@@ -7,16 +7,18 @@ unit tests never caught.
 
 Env (set before app.core.config import): DB_HOST DB_PORT DB_NAME DB_USER DB_PASSWORD REDIS_DB.
 
-Pinned dev-DB entities (ConcordDb_V5, discovered live; parameterized, read-only):
-  UNPRICED    product 26177445 × agreement 688b618c-... -> engine baseline 0 -> recommended None.
-  NORMAL      product 26166832 × agreement 642d648f-... -> applied 10% group discount;
-              marked_up*(1-applied/100) reproduces the engine baseline (38.493).
-  CONTAMINATED product 26168142 × agreement 688b618c-... -> on-hand lots mix 1С debt lots
-              (~1160 EUR) with real lots (15 EUR); debt-excluded cost = 15.00, naive median = 587.58.
+Pinned dev-DB entities (current restored ConcordDb_V5, discovered live; read-only):
+  FALLBACK    product 29427720 × agreement 641f1c1f-... -> engine baseline NULL and a positive
+              same-world realized-price fallback.
+  NORMAL      product 29460936 × agreement 681d8099-... -> applied 19% group discount;
+              marked_up*(1-applied/100) reproduces the engine baseline (12.04632).
+  CONTAMINATED product 29377180 -> one real on-hand lot (SourceDocumentType=3) and one 1С debt
+              lot (SourceDocumentType=1); the robust unit cost must select only the real lot.
 """
 from __future__ import annotations
 
 import os
+from decimal import Decimal
 
 import pytest
 
@@ -31,35 +33,68 @@ pytestmark = [
     ),
 ]
 
-UNPRICED_PRODUCT_ID = 26177445
-UNPRICED_CA_NETUID = "688b618c-6f5a-4bc0-9caf-6b2aac0c1c9c"
+FALLBACK_PRODUCT_ID = 29427720
+FALLBACK_CA_NETUID = "641f1c1f-2f15-463f-8cb8-85a5fde36174"
 
-NORMAL_PRODUCT_ID = 26166832
-NORMAL_CA_NETUID = "642d648f-8dca-460b-b9ab-e92d05e53dea"
-NORMAL_APPLIED_DISCOUNT_PCT = 10.0
+NORMAL_PRODUCT_ID = 29460936
+NORMAL_CA_NETUID = "681d8099-a32e-4d3f-b9a1-b7aaac748bd1"
+NORMAL_APPLIED_DISCOUNT_PCT = 19.0
 
-CONTAMINATED_PRODUCT_ID = 26168142
-CONTAMINATED_CA_NETUID = "688b618c-6f5a-4bc0-9caf-6b2aac0c1c9c"
+CONTAMINATED_PRODUCT_ID = 29377180
 
 
-def test_unpriced_product_recommends_none_not_zero():
-    """An UNPRICED product×agreement (engine baseline 0) -> recommended_price is None (NOT 0.0),
-    rationale no-baseline, LOW confidence. Guards the >=0 short-circuit on the live engine."""
-    from app.services.pricing import recommend as engine
+def test_live_synthetic_debt_product_is_rejected_before_pricing():
+    """The dynamically re-minted «Ввід боргів» row is an identity reject, not 200/no-baseline."""
+    from app.data import pricing_repository as repo
     from app.services.pricing import service
 
+    synthetic_id = repo.synthetic_product_id()
+    assert repo.resolve_product(synthetic_id, None) is None
+    with pytest.raises(LookupError, match="product not found"):
+        service.recommend_price(
+            product_id=synthetic_id,
+            product_net_uid=None,
+            client_agreement_net_uid=NORMAL_CA_NETUID,
+            use_cache=False,
+        )
+
+
+def test_live_product_id_and_uid_must_describe_one_identity():
+    from app.data import pricing_repository as repo
+
+    normal = repo.resolve_product(NORMAL_PRODUCT_ID, None)
+    fallback = repo.resolve_product(FALLBACK_PRODUCT_ID, None)
+    assert normal is not None and fallback is not None
+    assert repo.resolve_product(NORMAL_PRODUCT_ID, normal["net_uid"]) == normal
+    assert repo.resolve_product(NORMAL_PRODUCT_ID, fallback["net_uid"]) is None
+
+
+def test_null_engine_baseline_uses_same_world_fallback():
+    """A live product with NULL engine baseline must use the positive, world-safe fallback."""
+    from app.data import pricing_repository as repo
+    from app.services.pricing import service
+
+    product = repo.resolve_product(FALLBACK_PRODUCT_ID, None)
+    assert product is not None
+    assert (
+        repo.baseline_price(
+            product["net_uid"],
+            FALLBACK_CA_NETUID,
+            "uk",
+            True,
+        )
+        is None
+    )
+
     out = service.recommend_price(
-        product_id=UNPRICED_PRODUCT_ID,
+        product_id=FALLBACK_PRODUCT_ID,
         product_net_uid=None,
-        client_agreement_net_uid=UNPRICED_CA_NETUID,
+        client_agreement_net_uid=FALLBACK_CA_NETUID,
         use_cache=False,
     )
-    assert out.baseline_price is None
-    assert out.recommended_price is None
-    assert out.recommended_price != 0.0
-    assert out.price_floor is None
-    assert out.rationale == engine.R_NO_BASELINE
-    assert out.confidence.value == "low"
+    assert out.baseline_source == "client_world_fallback"
+    assert out.baseline_price is not None and out.baseline_price > 0
+    assert out.recommended_price is not None and out.recommended_price > 0
 
 
 def test_normal_product_marked_up_reproduces_engine_baseline():
@@ -87,7 +122,9 @@ def test_normal_product_marked_up_reproduces_engine_baseline():
 
     marked_up = _marked_up_from_baseline(baseline, applied)
     assert marked_up is not None and marked_up > baseline
-    assert marked_up * (1.0 - applied / 100.0) == pytest.approx(baseline, rel=1e-9)
+    applied_decimal = Decimal(str(applied))
+    reproduced = marked_up * (Decimal(1) - applied_decimal / Decimal(100))
+    assert abs(reproduced - baseline) < Decimal("0.000000001")
 
 
 def test_normal_product_full_recommendation_is_sane():
@@ -110,14 +147,13 @@ def test_normal_product_full_recommendation_is_sane():
 def test_contaminated_cost_floor_not_inflated_by_debt_lots():
     """A CONTAMINATED-cost product: the unit cost (and thus the margin floor) must come from real
     supply lots, NOT the 1С balance-import debt lots. Asserts the debt-excluded cost is sane
-    (< 200 EUR) AND strictly far below the naive median that INCLUDES debt lots (~587 EUR), so a
-    reverted exclusion would explode the floor."""
+    and strictly below the naive median that includes the debt lot."""
     from app.data import pricing_repository as repo
     from app.data.db import query
 
     cost = repo.unit_cost_eur(CONTAMINATED_PRODUCT_ID)
     assert cost["unit_cost_eur"] is not None
-    assert cost["unit_cost_eur"] < 200.0
+    assert isinstance(cost["unit_cost_eur"], Decimal)
     assert cost["cost_source"] in ("median_onhand", "latest_lot")
 
     naive = query(
@@ -132,27 +168,29 @@ def test_contaminated_cost_floor_not_inflated_by_debt_lots():
         """,
         {"pid": CONTAMINATED_PRODUCT_ID},
     )
-    naive_median = float(naive[0]["naive_median"])
-    assert naive_median > 400.0
-    assert cost["unit_cost_eur"] < naive_median / 5.0
+    naive_median = Decimal(str(naive[0]["naive_median"]))
+    assert cost["unit_cost_eur"] < naive_median
 
 
-def test_contaminated_cost_floor_propagates_to_recommendation():
-    """End-to-end on the CONTAMINATED product: the live recommendation's price_floor reflects the
-    debt-EXCLUDED cost (cost*(1+target_margin)), never the debt-inflated naive cost — so the floor
-    does not become a loss flag above the baseline."""
+def test_decimal_cost_floor_propagates_to_recommendation():
+    """End-to-end floor uses the unrounded Decimal aggregate, then rounds HALF_UP at the API."""
     from app.core.config import get_settings
+    from app.data import pricing_repository as repo
+    from app.domain.money import HUNDRED, as_decimal, round_cent
     from app.services.pricing import service
 
+    raw_cost = repo.unit_cost_eur(NORMAL_PRODUCT_ID)["unit_cost_eur"]
+    assert raw_cost is not None
     out = service.recommend_price(
-        product_id=CONTAMINATED_PRODUCT_ID,
+        product_id=NORMAL_PRODUCT_ID,
         product_net_uid=None,
-        client_agreement_net_uid=CONTAMINATED_CA_NETUID,
+        client_agreement_net_uid=NORMAL_CA_NETUID,
         use_cache=False,
     )
     assert out.unit_cost_eur is not None
-    assert out.unit_cost_eur < 200.0
     assert out.price_floor is not None
-    margin = get_settings().target_margin_pct
-    assert out.price_floor == pytest.approx(out.unit_cost_eur * (1.0 + margin / 100.0), rel=1e-6)
+    margin = as_decimal(get_settings().target_margin_pct)
+    expected_floor = round_cent(raw_cost * (Decimal(1) + margin / HUNDRED))
+    assert Decimal(str(out.unit_cost_eur)) == round_cent(raw_cost)
+    assert Decimal(str(out.price_floor)) == expected_floor
     assert out.baseline_price is not None and out.price_floor < out.baseline_price

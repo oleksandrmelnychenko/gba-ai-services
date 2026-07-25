@@ -47,6 +47,10 @@ class Settings(BaseSettings):
         ]
     )
 
+    # Synthetic debt product («Ввід боргів») — resolved dynamically from dbo.Product
+    # when unset; set only to pin/override (unset survives future re-mints).
+    synthetic_product_id: int | None = None
+
     # Replenishment policy
     service_level: float = 0.99
     forecast_horizon_days: int = 30

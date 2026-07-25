@@ -49,14 +49,17 @@ class Settings(BaseSettings):
     repurchase_count: int = 20
     discovery_count: int = 5
     max_per_group: int = 3
+    # Health fails closed when the canonical valid-sales spine has not advanced for this long.
+    max_source_lag_days: int = Field(default=31, gt=0)
     # Exclude products bought by more than this share of clients — universal staples / synthetic
     # accounting lines (e.g. "Ввід боргів" = debt entry, ~75% of clients). Real parts top out ~14%,
     # so 0.20 cleanly isolates synthetic lines. They are not cross-sell candidates and skew popularity.
     ubiquity_exclude_pct: float = 0.20
-    # Synthetic accounting product(s) (e.g. debt-entry line 25422404) excluded unconditionally from
-    # all recommendation/candidate populations, independent of the rolling ubiquity window. The
-    # ubiquity threshold can drift below these depending on the 12-month window, so they are pinned.
-    synthetic_product_ids: frozenset[int] = frozenset({25422404})
+    # Synthetic accounting product override. Default EMPTY: catalog re-syncs re-mint the debt-entry
+    # row under a new ID (25422404 → 29555414 → ...), so the live id is resolved by Name
+    # («Ввід боргів») at runtime — sales_repository.synthetic_product_ids(). Set
+    # SYNTHETIC_PRODUCT_IDS in the env only to pin explicit ids over the dynamic resolution.
+    synthetic_product_ids: frozenset[int] = frozenset()
     # TTL (seconds) for the ubiquity set refresh — bounds staleness without process restart.
     ubiquity_cache_ttl: int = 3600
 
@@ -69,6 +72,10 @@ class Settings(BaseSettings):
     # Hour (local tz) the daily warm job fires; mirrors gba-nba's daily-generate cron.
     daily_warm_hour: int = 3
     timezone: str = "Europe/Kyiv"
+    # One-shot retry backoff after a failed warm run (base doubles per attempt, capped) — a
+    # failed 03:00/catch-up warm must not leave the cache cold until tomorrow's cron.
+    warm_retry_base_minutes: int = 10
+    warm_retry_max_minutes: int = 60
 
     @property
     def sqlalchemy_url(self) -> str:

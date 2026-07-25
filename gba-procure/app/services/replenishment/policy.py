@@ -15,12 +15,11 @@ from __future__ import annotations
 
 import math
 from datetime import date, datetime
+from decimal import ROUND_HALF_UP, Decimal
 
 from app.core.config import get_settings
-from app.data import cache
+from app.data import cache, feedback, masters
 from app.data import cost_repository as cost_repo
-from app.data import feedback
-from app.data import masters
 from app.data import supply_repository as repo
 from app.domain.models import (
     CartReplenishmentPlan,
@@ -39,13 +38,38 @@ from app.domain.models import (
 )
 from app.services.classify import segmentation
 from app.services.classify import service as classify_svc
-from app.services.optimization import milp as milp_opt
 from app.services.forecasting import demand as demand_svc
 from app.services.forecasting import lead_time as lead_time_svc
+from app.services.optimization import milp as milp_opt
 
 # Shared urgency ordering (critical first) for sorting and the mix histogram.
 _URGENCY_ORDER = {Urgency.CRITICAL: 0, Urgency.HIGH: 1, Urgency.NORMAL: 2, Urgency.NONE: 3}
 _URGENCY_WEIGHT = {Urgency.CRITICAL: 1.0, Urgency.HIGH: 0.7, Urgency.NORMAL: 0.4, Urgency.NONE: 0.1}
+_CENT = Decimal("0.01")
+_FOUR_DECIMALS = Decimal("0.0001")
+
+
+def _decimal(value: float | int | str | Decimal) -> Decimal:
+    return value if isinstance(value, Decimal) else Decimal(str(value))
+
+
+def _round_decimal(value: float | int | str | Decimal, quantum: Decimal) -> float:
+    return float(_decimal(value).quantize(quantum, rounding=ROUND_HALF_UP))
+
+
+def _line_cost(unit_cost: float, qty: float) -> float:
+    """Round supplier line totals like accounting money, never with binary float ties."""
+    return _round_decimal(_decimal(unit_cost) * _decimal(qty), _CENT)
+
+
+def _resolved_unit_cost(
+    factual_cost: float | None,
+    terms: dict | None,
+) -> float | None:
+    override = terms.get("unit_cost_override") if terms else None
+    if override is not None and float(override) > 0:
+        return float(override)
+    return factual_cost
 
 
 def _profit_at_risk(sug: ReorderSuggestion) -> float:
@@ -58,6 +82,49 @@ def _value_density(sug: ReorderSuggestion) -> float:
     if line_cost <= 0:
         return 0.0
     return _profit_at_risk(sug) / line_cost
+
+
+def _supplier_option_key(sug: ReorderSuggestion) -> tuple:
+    """Choose one deterministic, orderable supplier option for each product.
+
+    A cart is a product order, not a list of every historical producer-product
+    relationship. Prefer an option with a factual price, then the lowest EUR unit
+    cost. Stable operational tie-breakers make repeat builds byte-for-byte consistent.
+    """
+    return (
+        sug.unit_cost_eur is None or sug.unit_cost_eur <= 0,
+        _decimal(sug.unit_cost_eur) if sug.unit_cost_eur is not None else Decimal("Infinity"),
+        _URGENCY_ORDER[sug.urgency],
+        sug.days_of_cover,
+        sug.producer_id,
+    )
+
+
+def _deduplicate_supplier_options(
+    items: list[ReorderSuggestion],
+) -> tuple[list[ReorderSuggestion], int]:
+    by_product: dict[int, ReorderSuggestion] = {}
+    for item in items:
+        current = by_product.get(item.product_id)
+        if current is None or _supplier_option_key(item) < _supplier_option_key(current):
+            by_product[item.product_id] = item
+    return list(by_product.values()), len(items) - len(by_product)
+
+
+def _cart_totals(items: list[ReorderSuggestion]) -> dict:
+    total_qty = sum((_decimal(item.suggested_qty) for item in items), Decimal())
+    priced_cost = sum(
+        (_decimal(item.line_cost_eur) for item in items if item.line_cost_eur is not None),
+        Decimal(),
+    )
+    unpriced = sum(1 for item in items if item.line_cost_eur is None)
+    priced_cost_eur = _round_decimal(priced_cost, _CENT)
+    return {
+        "total_suggested_qty": _round_decimal(total_qty, _CENT),
+        "priced_cost_eur": priced_cost_eur,
+        "total_cost_eur": None if unpriced else priced_cost_eur,
+        "unpriced_item_count": unpriced,
+    }
 
 _ACKLAM_A = (-3.969683028665376e01, 2.209460984245205e02, -2.759285104469687e02,
              1.383577518672690e02, -3.066479806614716e01, 2.506628277459239e00)
@@ -188,7 +255,6 @@ def build_plan(producer_id: int, as_of: str, only_needed: bool = True,
                abc_map: dict[int, str] | None = None,
                producer_name=_UNSET) -> ProducerPurchasePlan:
     s = get_settings()
-    z_global = _z_for(s.service_level)
     lt_mean, lt_std, lt_source = lead_time_svc.producer_lead_time(producer_id, as_of)
     product_ids = repo.products_for_producer(producer_id, as_of, s.history_days)
 
@@ -241,7 +307,8 @@ def build_plan(producer_id: int, as_of: str, only_needed: bool = True,
                 forecast = forecast.model_copy(update={
                     "mean_daily": forecast.mean_daily * season_factor,
                     "forecast_units": forecast.forecast_units * season_factor})
-        cost = costs.get(pid)
+        t = terms.get(pid)
+        cost = _resolved_unit_cost(costs.get(pid), t)
         sale = sales.get(pid)
         if s.economic_service_level and cost is not None and cost > 0 and sale is not None:
             sl = _economic_service_level(sale, cost, lt_mean, s.forecast_horizon_days, s, abc)
@@ -260,7 +327,6 @@ def build_plan(producer_id: int, as_of: str, only_needed: bool = True,
         if factor is not None and factor != 1.0:
             sug.learned_factor = round(factor, 3)
             sug.suggested_qty = round(sug.suggested_qty * factor, 2)
-        t = terms.get(pid)
         if t:
             moq = t.get("moq")
             mult = t.get("order_multiple")
@@ -277,17 +343,27 @@ def build_plan(producer_id: int, as_of: str, only_needed: bool = True,
             sug.seasonal_factor = round(season_factor, 3)
         if cost is not None:
             sug.unit_cost_eur = cost
-            sug.line_cost_eur = round(cost * sug.suggested_qty, 2)
+            sug.line_cost_eur = _line_cost(cost, sug.suggested_qty)
         if sale is not None:
             sug.unit_sale_eur = sale
             if cost is not None:
-                sug.unit_margin_eur = round(sale - cost, 4)
+                sug.unit_margin_eur = _round_decimal(
+                    _decimal(sale) - _decimal(cost),
+                    _FOUR_DECIMALS,
+                )
         items.append(sug)
 
     _attach_cheaper_alt(producer_id, items, as_of)
 
     # urgency-first ordering
-    items.sort(key=lambda x: (_URGENCY_ORDER[x.urgency], -x.suggested_qty))
+    items.sort(
+        key=lambda x: (
+            _URGENCY_ORDER[x.urgency],
+            -x.suggested_qty,
+            x.product_id,
+            x.producer_id,
+        )
+    )
 
     resolved_name = repo.producer_name(producer_id) if producer_name is _UNSET else producer_name
     # Stamp producer_name onto every line so the warehouse lens (cart plan spanning all
@@ -315,20 +391,28 @@ def build_plan(producer_id: int, as_of: str, only_needed: bool = True,
 
 
 def _cart_producer_plan(producer_id: int, as_of: str, only_needed: bool,
-                        abc_map: dict[int, str], producer_name) -> ProducerPurchasePlan:
+                        abc_map: dict[int, str], producer_name,
+                        source_fingerprint: str | None = None) -> ProducerPurchasePlan:
     key = cache.make_key("producer", producer_id, as_of) if only_needed else None
     if key is not None:
         cached = cache.get(key)
-        if cached is not None:
+        if (
+            cached is not None
+            and (
+                source_fingerprint is None
+                or cached.get("_source_fingerprint") == source_fingerprint
+            )
+        ):
             return ProducerPurchasePlan.model_validate(cached)
     return build_plan(producer_id, as_of, only_needed=only_needed, abc_map=abc_map,
                       producer_name=producer_name)
 
 
-def build_cart_plan(as_of: str, only_needed: bool = True, limit: int = 200,
+def build_cart_plan(as_of: str, only_needed: bool = True, limit: int | None = None,
                     budget_eur: float | None = None,
                     method: str = "greedy",
-                    active_days: int | None = None) -> CartReplenishmentPlan:
+                    active_days: int | None = None,
+                    source_fingerprint: str | None = None) -> CartReplenishmentPlan:
     s = get_settings()
     producer_ids = repo.all_producers(as_of, active_days or s.history_days)
     abc_map = classify_svc.get_abc_map(as_of, s.history_days)
@@ -337,8 +421,15 @@ def build_cart_plan(as_of: str, only_needed: bool = True, limit: int = 200,
     items: list[ReorderSuggestion] = []
     for producer_id in producer_ids:
         plan = _cart_producer_plan(producer_id, as_of, only_needed, abc_map,
-                                   names.get(producer_id))
-        items.extend(sug for sug in plan.items if sug.suggested_qty > 0)
+                                   names.get(producer_id), source_fingerprint)
+        if only_needed:
+            items.extend(sug for sug in plan.items if sug.suggested_qty > 0)
+        else:
+            items.extend(plan.items)
+    items, duplicate_supplier_options_removed = _deduplicate_supplier_options(items)
+    items.sort(key=lambda item: (item.product_id, item.producer_id))
+    totals = _cart_totals(items)
+    total_item_count = len(items)
 
     if budget_eur is not None and budget_eur > 0:
         for it in items:
@@ -352,7 +443,14 @@ def build_cart_plan(as_of: str, only_needed: bool = True, limit: int = 200,
             method_used = "greedy"
             chosen = set()
             used_g = 0.0
-            for i in sorted(range(len(items)), key=lambda i: -(items[i].value_density or 0.0)):
+            for i in sorted(
+                range(len(items)),
+                key=lambda i: (
+                    -(items[i].value_density or 0.0),
+                    items[i].product_id,
+                    items[i].producer_id,
+                ),
+            ):
                 if costs[i] > 0 and used_g + costs[i] <= budget_eur:
                     chosen.add(i)
                     used_g += costs[i]
@@ -362,22 +460,44 @@ def build_cart_plan(as_of: str, only_needed: bool = True, limit: int = 200,
             if it.within_budget:
                 used += costs[i]
                 value += values[i]
-        items.sort(key=lambda x: (not x.within_budget, -(x.value_density or 0.0)))
+        items.sort(
+            key=lambda x: (
+                not x.within_budget,
+                -(x.value_density or 0.0),
+                x.product_id,
+                x.producer_id,
+            )
+        )
         return CartReplenishmentPlan(
             items=items, item_count=len(items), as_of_date=as_of,
-            budget_eur=budget_eur, budget_used_eur=round(used, 2),
-            value_captured_eur=round(value, 2),
+            total_item_count=total_item_count,
+            duplicate_supplier_options_removed=duplicate_supplier_options_removed,
+            **totals,
+            budget_eur=budget_eur,
+            budget_used_eur=_round_decimal(used, _CENT),
+            value_captured_eur=_round_decimal(value, _CENT),
             selected_count=len(chosen), deferred_count=len(items) - len(chosen),
             method_used=method_used,
         )
 
-    items.sort(key=lambda x: (_URGENCY_ORDER[x.urgency], x.days_of_cover))
+    items.sort(
+        key=lambda x: (
+            _URGENCY_ORDER[x.urgency],
+            x.days_of_cover,
+            x.product_id,
+            x.producer_id,
+        )
+    )
     if limit is not None and limit >= 0:
         items = items[:limit]
 
     return CartReplenishmentPlan(
         items=items,
         item_count=len(items),
+        total_item_count=total_item_count,
+        is_truncated=len(items) < total_item_count,
+        duplicate_supplier_options_removed=duplicate_supplier_options_removed,
+        **totals,
         as_of_date=as_of,
     )
 
@@ -423,6 +543,7 @@ def _as_date(value: str | date) -> date:
 def _demand_series_for(
     product_ids: list[int],
     forecasts: dict[int, DemandForecast],
+    suggestions: dict[int, ReorderSuggestion],
     as_of: str,
     history_days: int,
 ) -> list[DemandSeries]:
@@ -454,12 +575,27 @@ def _demand_series_for(
         points.append(
             DemandPoint(period=forecast_period, units=round(forecast_units, 2), is_forecast=True)
         )
-        series.append(DemandSeries(product_id=pid, points=points))
+        suggestion = suggestions.get(pid)
+        series.append(
+            DemandSeries(
+                product_id=pid,
+                product_name=suggestion.product_name if suggestion else None,
+                vendor_code=suggestion.vendor_code if suggestion else None,
+                oe_number=suggestion.oe_number if suggestion else None,
+                image_url=suggestion.image_url if suggestion else None,
+                producer_id=suggestion.producer_id if suggestion else None,
+                producer_name=suggestion.producer_name if suggestion else None,
+                points=points,
+            )
+        )
     return series
 
 
 def build_charts(
-    producer_id: int | None, as_of: str, top_n: int = 15
+    producer_id: int | None,
+    as_of: str,
+    top_n: int = 15,
+    source_fingerprint: str | None = None,
 ) -> PlanCharts:
     """Procurement-dashboard chart data for one producer (or the whole cart).
 
@@ -474,7 +610,12 @@ def build_charts(
         plan = build_plan(producer_id, as_of, only_needed=False)
         items = plan.items
     else:
-        items = build_cart_plan(as_of, only_needed=True, limit=-1).items
+        items = build_cart_plan(
+            as_of,
+            only_needed=True,
+            limit=-1,
+            source_fingerprint=source_fingerprint,
+        ).items
 
     # urgency_mix — count per urgency, critical-first, every bucket present.
     counts = {u: 0 for u in Urgency}
@@ -502,6 +643,12 @@ def build_charts(
     top_items = [
         TopItem(
             product_id=it.product_id,
+            product_name=it.product_name,
+            vendor_code=it.vendor_code,
+            oe_number=it.oe_number,
+            image_url=it.image_url,
+            producer_id=it.producer_id,
+            producer_name=it.producer_name,
             suggested_qty=it.suggested_qty,
             on_hand=it.inventory.on_hand,
             reorder_point=it.reorder_point,
@@ -514,7 +661,14 @@ def build_charts(
     series_n = min(top_n, _DEMAND_SERIES_MAX)
     series_ids = [it.product_id for it in ranked[:series_n]]
     forecasts = {it.product_id: it.forecast for it in ranked[:series_n]}
-    demand_series = _demand_series_for(series_ids, forecasts, as_of, s.history_days)
+    series_suggestions = {it.product_id: it for it in ranked[:series_n]}
+    demand_series = _demand_series_for(
+        series_ids,
+        forecasts,
+        series_suggestions,
+        as_of,
+        s.history_days,
+    )
 
     return PlanCharts(
         producer_id=producer_id,

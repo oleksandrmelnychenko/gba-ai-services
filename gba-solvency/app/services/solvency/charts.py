@@ -15,6 +15,7 @@ from app.domain.models import (
     TrendPoint,
     TurnoverExposurePoint,
 )
+from app.domain.money import round_cent
 from app.risk import dataset as risk_dataset
 from app.risk.score_current import score_current
 from app.services.solvency import score as scoring
@@ -62,7 +63,7 @@ def _aging_bars(buckets: list[dict]) -> list[AgingBar]:
         AgingBar(
             bucket=label,
             count=int(by_bucket.get(label, {}).get("count", 0)),
-            amount_eur=round(float(by_bucket.get(label, {}).get("amount_eur", 0.0)), 2),
+            amount_eur=round_cent(by_bucket.get(label, {}).get("amount_eur", 0)),
         )
         for label in sorted(_AGING_ORDER, key=_AGING_ORDER.get)
     ]
@@ -92,8 +93,8 @@ def _turnover_vs_exposure(
     return [
         TurnoverExposurePoint(
             period=m["period"],
-            turnover_eur=round(float(m.get("turnover_eur", 0.0)), 2),
-            exposure_eur=round(exposure, 2),
+            turnover_eur=round_cent(m.get("turnover_eur", 0)),
+            exposure_eur=round_cent(exposure),
         )
         for m in monthly
     ]
@@ -101,7 +102,7 @@ def _turnover_vs_exposure(
 
 def _turnover_trend(monthly: list[dict]) -> list[TrendPoint]:
     return [
-        TrendPoint(period=m["period"], turnover_eur=round(float(m.get("turnover_eur", 0.0)), 2))
+        TrendPoint(period=m["period"], turnover_eur=round_cent(m.get("turnover_eur", 0)))
         for m in monthly
     ]
 

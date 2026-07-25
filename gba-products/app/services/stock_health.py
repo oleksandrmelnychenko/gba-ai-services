@@ -5,6 +5,9 @@ the snapshot joins the canonical stock query with sales velocity over the live D
 """
 from __future__ import annotations
 
+from decimal import Decimal
+
+from app.core import exact_numbers as exact
 from app.core.config import Settings, get_settings
 from app.data import signals_repository as sig
 from app.domain.models import InventoryBand
@@ -33,39 +36,128 @@ def snapshot(as_of: str) -> dict:
     """Portfolio inventory-health snapshot over all on-hand sellable stock."""
     cfg = get_settings()
     stock = sig.on_hand_stock()
-    velocity = {int(r["product_id"]): float(r["sold_qty"] or 0)
-                for r in sig.sales_velocity(as_of, cfg.velocity_window_days)}
-    sold_recently = sig.sold_product_ids(as_of, cfg.dead_window_days)
+    velocity: dict[int, Decimal] = {}
+    for row in sig.sales_velocity(as_of, cfg.velocity_window_days):
+        pid = exact.positive_int(row.get("product_id"), "sales_velocity.product_id")
+        if pid in velocity:
+            raise ValueError(f"sales_velocity returned duplicate product_id {pid}")
+        velocity[pid] = exact.decimal_value(
+            row.get("sold_qty") or 0,
+            "sales_velocity.sold_qty",
+            non_negative=True,
+        )
+    sold_recently = {
+        exact.positive_int(product_id, "sold_product_ids.product_id")
+        for product_id in sig.sold_product_ids(as_of, cfg.dead_window_days)
+    }
 
-    bands: dict[str, dict] = {b.value: {"count": 0, "eur_value": 0.0, "qty": 0.0} for b in InventoryBand}
+    bands: dict[str, dict] = {
+        band.value: {"count": 0, "eur_value": Decimal("0"), "qty": Decimal("0")}
+        for band in InventoryBand
+    }
     rows: list[dict] = []
-    total_eur = total_qty = 0.0
+    product_ids: set[int] = set()
+    unvalued_skus = 0
     for r in stock:
-        pid = int(r["product_id"])
-        qty = float(r["qty_on_hand"] or 0)
-        eur = float(r["eur_value"] or 0)
-        daily_rate = velocity.get(pid, 0.0) / cfg.velocity_window_days
-        band = classify_band(qty, daily_rate, pid in sold_recently, cfg)
+        pid = exact.positive_int(r.get("product_id"), "stock.product_id")
+        if pid in product_ids:
+            raise ValueError(f"on_hand_stock returned duplicate product_id {pid}")
+        product_ids.add(pid)
+        qty = exact.decimal_value(
+            r.get("qty_on_hand") or 0,
+            "stock.qty_on_hand",
+            non_negative=True,
+        )
+        eur = exact.decimal_value(
+            r.get("eur_value") or 0,
+            "stock.eur_value",
+            non_negative=True,
+        )
+        valuation_available = r.get("unit_cost_eur") is not None
+        if valuation_available != (r.get("eur_value") is not None):
+            raise ValueError(f"stock valuation fields disagree for product {pid}")
+        if not valuation_available:
+            unvalued_skus += 1
+        daily_rate = velocity.get(pid, Decimal("0")) / Decimal(cfg.velocity_window_days)
+        band = classify_band(float(qty), float(daily_rate), pid in sold_recently, cfg)
         cover = (qty / daily_rate) if daily_rate > 0 else None
+        row_qty = exact.quantity(qty, "qty_on_hand")
+        row_eur = exact.money(eur, "eur_value")
         bands[band.value]["count"] += 1
-        bands[band.value]["eur_value"] += eur
-        bands[band.value]["qty"] += qty
-        total_eur += eur
-        total_qty += qty
-        rows.append({"product_id": pid, "qty_on_hand": qty, "eur_value": round(eur, 2),
-                     "cover_days": round(cover, 1) if cover is not None else None,
-                     "band": band.value})
+        bands[band.value]["eur_value"] += exact.decimal_value(row_eur, "row eur_value")
+        bands[band.value]["qty"] += exact.decimal_value(row_qty, "row qty_on_hand")
+        rows.append(
+            {
+                "product_id": pid,
+                "qty_on_hand": row_qty,
+                "eur_value": row_eur,
+                "valuation_available": valuation_available,
+                "cover_days": exact.cover_days(cover) if cover is not None else None,
+                "band": band.value,
+            }
+        )
 
-    for b in bands.values():
-        b["eur_value"] = round(b["eur_value"], 2)
-        b["qty"] = round(b["qty"], 2)
+    for values in bands.values():
+        values["eur_value"] = exact.money(values["eur_value"], "band eur_value")
+        values["qty"] = exact.quantity(values["qty"], "band qty")
     rows.sort(key=lambda x: x["eur_value"], reverse=True)
-    return {
+    total_eur = exact.decimal_sum(
+        [row["eur_value"] for row in rows],
+        "stock row eur_value",
+        non_negative=True,
+    )
+    total_qty = exact.decimal_sum(
+        [row["qty_on_hand"] for row in rows],
+        "stock row qty_on_hand",
+        non_negative=True,
+    )
+    result = {
         "as_of": as_of,
         "total_skus": len(stock),
-        "total_qty": round(total_qty, 2),
-        "total_eur_value": round(total_eur, 2),
+        "total_qty": exact.quantity(total_qty, "total_qty"),
+        "total_eur_value": exact.money(total_eur, "total_eur_value"),
+        "valued_skus": len(stock) - unvalued_skus,
+        "unvalued_skus": unvalued_skus,
         "bands": bands,
         "model_version": cfg.model_version,
         "rows": rows,
     }
+    _validate_snapshot(result)
+    return result
+
+
+def _validate_snapshot(snapshot: dict) -> None:
+    rows = snapshot["rows"]
+    product_ids = [
+        exact.positive_int(row.get("product_id"), "stock snapshot product_id")
+        for row in rows
+    ]
+    if len(product_ids) != len(set(product_ids)):
+        raise ValueError("stock snapshot contains duplicate product_id")
+    if snapshot["total_skus"] != len(rows):
+        raise ValueError("stock total_skus does not match rows")
+    if sum(values["count"] for values in snapshot["bands"].values()) != len(rows):
+        raise ValueError("stock band counts do not match rows")
+    if snapshot["valued_skus"] + snapshot["unvalued_skus"] != len(rows):
+        raise ValueError("stock valuation counts do not match rows")
+
+    band_value = exact.money(
+        exact.decimal_sum(
+            [values["eur_value"] for values in snapshot["bands"].values()],
+            "band eur_value",
+            non_negative=True,
+        ),
+        "band total_eur_value",
+    )
+    band_qty = exact.quantity(
+        exact.decimal_sum(
+            [values["qty"] for values in snapshot["bands"].values()],
+            "band qty",
+            non_negative=True,
+        ),
+        "band total_qty",
+    )
+    if band_value != snapshot["total_eur_value"]:
+        raise ValueError("stock band EUR total does not match rows")
+    if band_qty != snapshot["total_qty"]:
+        raise ValueError("stock band quantity total does not match rows")

@@ -36,6 +36,25 @@ def test_batch_request_rejects_malformed_date():
         BatchRequest(customer_ids=[1], as_of_date="2026-13-99")
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"customer_id": 0},
+        {"customer_id": -1},
+        {"customer_id": 1, "product_ids": [0]},
+        {"customer_id": 1, "product_ids": [7, 7]},
+    ],
+)
+def test_recommend_request_rejects_unsafe_or_duplicate_ids(payload):
+    with pytest.raises(ValidationError):
+        RecommendRequest(**payload)
+
+
+def test_batch_request_rejects_duplicate_customer_ids():
+    with pytest.raises(ValidationError):
+        BatchRequest(customer_ids=[1, 1])
+
+
 def test_recommend_endpoint_returns_422_for_malformed_date():
     client = TestClient(app)
     resp = client.post(

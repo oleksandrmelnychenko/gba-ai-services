@@ -158,7 +158,6 @@ def fit_woe(x: np.ndarray, y: np.ndarray, direction: str,
 
     def recompute(edges_):
         idx = _bin_index(x, edges_)
-        nb = len(edges_) + 1
         # reindex to contiguous present bins
         present = sorted(set(idx.tolist()))
         remap = {b: i for i, b in enumerate(present)}
@@ -360,7 +359,6 @@ def main() -> None:
     }
     tier_auc = {}
     for name, feats in tiers.items():
-        src = X_all if name == "with_tautological" else X_primary if name == "primary_full" else df
         e = cv_eval_gbm(df, y, feats)
         tier_auc[name] = {"n_features": len(feats), "auc_mean": round(e["auc_mean"], 4),
                           "ks_mean": round(e["ks_mean"], 4)}
@@ -433,7 +431,10 @@ def main() -> None:
         "risk_direction": {f: RISK_DIRECTION.get(f, "up") for f in PRIMARY_FEATURES},
         "woe_bins": binmap,
         "logistic": {
-            "coef": {f: float(c) for f, c in zip(PRIMARY_FEATURES, final_lr.coef_[0])},
+            "coef": {
+                f: float(c)
+                for f, c in zip(PRIMARY_FEATURES, final_lr.coef_[0], strict=True)
+            },
             "intercept": float(final_lr.intercept_[0]),
         },
         "calibration": {"a": float(calib.coef_[0][0]), "b": float(calib.intercept_[0])},
@@ -454,9 +455,11 @@ def main() -> None:
             ft, fp = calibration_curve(y, oof, n_bins=8, strategy="quantile")
             ax.plot(fp, ft, marker="o", label=name)
         ax.plot([0, 1], [0, 1], "k--", alpha=0.5, label="perfect")
-        ax.set_xlabel("Mean predicted PD"); ax.set_ylabel("Observed fraction positive")
+        ax.set_xlabel("Mean predicted PD")
+        ax.set_ylabel("Observed fraction positive")
         ax.set_title("Current-state SEV180 calibration (OOF)")
-        ax.legend(); fig.tight_layout()
+        ax.legend()
+        fig.tight_layout()
         fig.savefig(ART / "calibration_current.png", dpi=110)
         report["calibration_plot"] = str(ART / "calibration_current.png")
     except Exception as e:  # noqa: BLE001

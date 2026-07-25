@@ -39,3 +39,16 @@ def test_runtime_config_rejects_default_horizon_above_cap():
 
     with pytest.raises(RuntimeError, match="FORECAST_HORIZON_MONTHS"):
         settings.validate_runtime_configuration()
+
+
+def test_runtime_config_rejects_minimum_history_above_history_window():
+    settings = Settings(
+        _env_file=None,
+        internal_api_key="secret",
+        history_months=3,
+        min_history_months=4,
+        db_password="unused",
+    )
+
+    with pytest.raises(RuntimeError, match="MIN_HISTORY_MONTHS"):
+        settings.validate_runtime_configuration()

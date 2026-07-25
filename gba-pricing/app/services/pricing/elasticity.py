@@ -39,8 +39,11 @@ signal wins.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 
 import numpy as np
+
+from app.domain.money import MoneyValue, as_decimal
 
 MAD_CONSISTENCY = 1.4826
 
@@ -207,15 +210,22 @@ def _within_variance(lnp: np.ndarray, agr_labels: list, mon_labels: list) -> flo
     return float(np.var(x))
 
 
-def elastic_optimal_price(elasticity: float | None, unit_cost_eur: float | None) -> float | None:
+def elastic_optimal_price(
+    elasticity: float | None,
+    unit_cost_eur: MoneyValue | None,
+) -> float | None:
     """Constant-elasticity profit-max markup: p* = cost * e/(e-1) for e>1. None when e<=1 (optimum
     unbounded), no cost, or no elasticity. e exactly at/just above 1 explodes the markup, so callers
     confidence-gate this and the A+B price stays primary."""
     if elasticity is None or unit_cost_eur is None:
         return None
-    if elasticity <= 1.0:
+    elasticity_value = as_decimal(elasticity)
+    if elasticity_value <= Decimal(1):
         return None
-    return unit_cost_eur * elasticity / (elasticity - 1.0)
+    unit_cost = as_decimal(unit_cost_eur)
+    return float(
+        unit_cost * elasticity_value / (elasticity_value - Decimal(1))
+    )
 
 
 def is_sane_elasticity(

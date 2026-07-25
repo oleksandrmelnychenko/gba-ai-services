@@ -4,7 +4,9 @@ from __future__ import annotations
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from app.core.money import cents
 
 
 class TaskType(StrEnum):
@@ -22,6 +24,7 @@ class TaskStatus(StrEnum):
     DONE = "done"
     SNOOZED = "snoozed"
     DISMISSED = "dismissed"
+    ORPHANED = "orphaned"       # system-only: client row vanished from dbo.Client (re-mint/wipe)
 
 
 class Urgency(StrEnum):
@@ -39,9 +42,10 @@ ALLOWED_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
     TaskStatus.SNOOZED: {TaskStatus.OPEN, TaskStatus.DISMISSED},
     TaskStatus.DONE: set(),         # terminal
     TaskStatus.DISMISSED: set(),    # terminal
+    TaskStatus.ORPHANED: set(),     # terminal; entered only by the system sweep, never via the API
 }
 
-TERMINAL = {TaskStatus.DONE, TaskStatus.DISMISSED}
+TERMINAL = {TaskStatus.DONE, TaskStatus.DISMISSED, TaskStatus.ORPHANED}
 ACTIVE = {TaskStatus.GENERATED, TaskStatus.OPEN, TaskStatus.IN_PROGRESS, TaskStatus.SNOOZED}
 
 
@@ -63,9 +67,16 @@ class StatusChange(BaseModel):
 
 
 class Outcome(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
+
     sold: bool = False
-    amount: float | None = None
+    amount: float | None = Field(default=None, ge=0)
     note: str | None = None
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def quantize_amount(cls, value):
+        return None if value is None else cents(value)
 
 
 class Contact(BaseModel):
@@ -76,12 +87,16 @@ class Contact(BaseModel):
 
 
 class Explanation(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
+
     factors: list[str] = Field(default_factory=list)
     source_signal: str = ""
     confidence: float = 0.0
 
 
 class Task(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
+
     task_key: str                 # unique dedup key: mgr|client|type|window
     manager_id: int
     client_id: int

@@ -4,6 +4,7 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 
 from app.api import main
+from app.domain.models import ClientIdentityMismatchError
 
 
 def _headers() -> dict[str, str]:
@@ -26,6 +27,32 @@ def test_score_malformed_as_of_date_returns_422():
         "/score", json={"client_id": 7, "as_of_date": "garbage"}, headers=_headers()
     )
     assert resp.status_code == 422
+
+
+def test_score_requires_positive_client_id():
+    client = TestClient(main.app)
+    resp = client.post("/score", json={"client_id": 0}, headers=_headers())
+    assert resp.status_code == 422
+
+
+def test_score_dual_identity_mismatch_returns_422(monkeypatch):
+    class MismatchedService:
+        @staticmethod
+        def score_client(**_kwargs):
+            raise ClientIdentityMismatchError("client_id and client_net_uid do not match")
+
+    monkeypatch.setattr(main, "_service", lambda: MismatchedService)
+    client = TestClient(main.app)
+    resp = client.post(
+        "/score",
+        json={
+            "client_id": 7,
+            "client_net_uid": "11111111-1111-1111-1111-111111111111",
+        },
+        headers=_headers(),
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "client_id and client_net_uid do not match"
 
 
 def test_batch_malformed_as_of_date_returns_422():

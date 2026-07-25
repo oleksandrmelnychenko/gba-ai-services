@@ -9,8 +9,9 @@ Fixes guarded:
 - the validity filter migrated from the wrong/absent `o.Deleted = 0` order-level predicate
   to the correct item-level `oi.IsValidForCurrentSale = 1` (the actual sales-spine validity
   column) across every query that filters the rec population;
-- the synthetic accounting line (debt-entry ProductID 25422404) is excluded explicitly via a
-  config constant, not left to drift with the data-driven ubiquity threshold.
+- the synthetic accounting line (the debt-entry product «Ввід боргів») is excluded explicitly —
+  resolved by Name at runtime because catalog re-syncs re-mint its ProductID
+  (25422404 → 29555414 → ...) — not left to drift with the data-driven ubiquity threshold.
 """
 from __future__ import annotations
 
@@ -62,29 +63,65 @@ def test_ubiquity_query_uses_valid_population_not_deleted_flag():
     assert not _DELETED_PATTERN.search(src), "ubiquity query reintroduced o.Deleted = 0"
 
 
-def test_synthetic_product_exclusion_is_explicit_constant():
-    assert 25422404 in config.get_settings().synthetic_product_ids, (
-        "synthetic debt-entry line 25422404 must be pinned in Settings.synthetic_product_ids"
+def test_every_live_recommendation_history_query_uses_item_validity():
+    functions = (
+        sales_repository.count_orders_before,
+        sales_repository.repurchase_rate,
+        sales_repository.product_frequency,
+        sales_repository.product_last_purchase,
+        sales_repository.customer_products,
+        sales_repository.candidate_similar_customers,
+        sales_repository.customer_products_bulk,
+        sales_repository.collaborative_products,
+    )
+    for function in functions:
+        src = inspect.getsource(function)
+        assert _VALIDITY_PATTERN.search(src), (
+            f"{function.__name__}: recommendation history query lost "
+            "oi.IsValidForCurrentSale = 1"
+        )
+
+
+def test_stock_filter_is_scoped_to_operational_resale_storages():
+    src = inspect.getsource(sales_repository.in_stock_product_ids)
+    assert "JOIN dbo.Storage" in src
+    assert "s.Deleted = 0" in src
+    assert "s.AvailableForReSale = 1 OR s.IsResale = 1" in src
+    assert "CASE WHEN d.Deleted = 0 THEN d.ID ELSE MAX(l.ID) END" in src
+
+
+def test_synthetic_product_exclusion_resolves_live_row_by_name():
+    """Catalog re-syncs re-mint the debt-entry row under a NEW ProductID (25422404 → 29555414 →
+    ...), so a hardcoded pin goes stale. The live id must be resolved by Name at runtime; the
+    Settings field is an explicit env override only (default EMPTY, never a stale constant)."""
+    module_src = inspect.getsource(sales_repository)
+    fn_src = inspect.getsource(sales_repository.synthetic_product_ids)
+    assert "Ввід боргів" in module_src, (
+        "sales_repository lost the debt-entry Name key («Ввід боргів») used for dynamic resolution"
+    )
+    assert re.search(r"Deleted\s*=\s*0", fn_src) and "ORDER BY ID DESC" in fn_src, (
+        "synthetic_product_ids must resolve the LIVE debt-entry row "
+        "(WHERE Name = ... AND Deleted = 0 ORDER BY ID DESC)"
     )
     field = config.Settings.model_fields["synthetic_product_ids"]
-    assert 25422404 in field.default, (
-        "25422404 must be the *default* synthetic exclusion (pinned in source, "
-        "not only an env override)"
+    assert field.default == frozenset(), (
+        "Settings.synthetic_product_ids default must stay EMPTY — a hardcoded id goes stale on "
+        "the next catalog re-mint; the env var is an explicit override only"
     )
 
 
-def test_ubiquity_helper_references_synthetic_ids_constant():
+def test_ubiquity_helper_references_synthetic_ids_resolver():
     src = inspect.getsource(sales_repository.ubiquitous_product_ids)
     assert "synthetic_product_ids" in src, (
-        "ubiquitous_product_ids must UNION the explicit synthetic_product_ids constant so "
-        "exclusion never depends on the data-driven ubiquity threshold catching 25422404"
+        "ubiquitous_product_ids must UNION the explicit synthetic_product_ids resolver so "
+        "exclusion never depends on the data-driven ubiquity threshold catching the debt line"
     )
 
 
 def test_synthetic_exclusion_is_unconditional_in_ubiquity():
     src = inspect.getsource(sales_repository.ubiquitous_product_ids)
-    assert re.search(r"synthetic_product_ids\s*\|", src), (
-        "synthetic ids must be UNION'd unconditionally (s.synthetic_product_ids | <ubiquity set>), "
+    assert re.search(r"synthetic_product_ids\(\)\s*\|", src), (
+        "synthetic ids must be UNION'd unconditionally (synthetic_product_ids() | <ubiquity set>), "
         "so the pinned exclusion is independent of the rolling ubiquity window"
     )
 

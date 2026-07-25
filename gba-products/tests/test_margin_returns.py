@@ -40,6 +40,12 @@ def test_margin_leaders_by_euro_contribution():
     assert out[0]["margin_eur"] == 4000.0
 
 
+def test_margin_currency_uses_half_up_at_half_cent():
+    out = mr.margin_leaders([_row(1, 0.5, 2.01)], limit=1)
+
+    assert out[0]["margin_eur"] == 1.01
+
+
 def test_margin_leaders_respects_limit():
     assert len(mr.margin_leaders(_rows(), limit=2)) == 2
 

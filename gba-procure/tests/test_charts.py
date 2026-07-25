@@ -54,6 +54,11 @@ def test_build_charts_producer_uses_full_distribution(monkeypatch):
         _sug(3, 0.0, Urgency.NONE, 99999.0, on_hand=1000, rop=10.0, mean_daily=0.5),
         _sug(4, 6.0, Urgency.NORMAL, 45.0, on_hand=30, rop=12.0, mean_daily=1.0),
     ]
+    items[0].product_name = "Амортизатор"
+    items[0].vendor_code = "SEM18487"
+    items[0].oe_number = "81437026092"
+    items[0].image_url = "https://cdn.example.test/sem18487.jpg"
+    items[0].producer_name = "SEM"
     monkeypatch.setattr(policy, "build_plan",
                         lambda pid, as_of, only_needed=True: _plan(items))
     # demand_series bulk fetch mocked: product 1 has 2 months of history
@@ -82,12 +87,18 @@ def test_build_charts_producer_uses_full_distribution(monkeypatch):
     assert charts.top_items[0].on_hand == 0
     assert charts.top_items[0].reorder_point == 50.0
     assert charts.top_items[0].urgency == Urgency.CRITICAL
+    assert charts.top_items[0].vendor_code == "SEM18487"
+    assert charts.top_items[0].producer_id == 99
+    assert charts.top_items[0].producer_name == "SEM"
 
     # demand_series: history (sorted, monthly) THEN one is_forecast point
     s1 = next(s for s in charts.demand_series if s.product_id == 1)
     assert [p.period for p in s1.points] == ["2026-04", "2026-05", "2026-07"]
     assert [p.units for p in s1.points] == [5.0, 4.0, 60.0]  # forecast = mean_daily 2.0 * 30
     assert [p.is_forecast for p in s1.points] == [False, False, True]
+    assert s1.product_name == "Амортизатор"
+    assert s1.vendor_code == "SEM18487"
+    assert s1.producer_id == 99
 
 
 def test_build_charts_cart_wide_dedups_top_items(monkeypatch):
@@ -97,9 +108,14 @@ def test_build_charts_cart_wide_dedups_top_items(monkeypatch):
         _sug(1, 5.0, Urgency.HIGH, 2.0),
         _sug(2, 7.0, Urgency.HIGH, 1.0),
     ]
-    monkeypatch.setattr(policy, "build_cart_plan",
-                        lambda as_of, only_needed=True, limit=200:
-                        CartReplenishmentPlan(items=items, item_count=len(items)))
+    monkeypatch.setattr(
+        policy,
+        "build_cart_plan",
+        lambda as_of, only_needed=True, limit=200, **kwargs: CartReplenishmentPlan(
+            items=items,
+            item_count=len(items),
+        ),
+    )
     monkeypatch.setattr(policy.repo, "product_daily_demand_bulk", lambda ids, as_of, days: {})
 
     charts = policy.build_charts(None, "2026-06-15", top_n=15)
@@ -133,7 +149,7 @@ def test_build_charts_demand_series_capped_to_few(monkeypatch):
 def test_build_charts_cart_wide_uses_cart_plan(monkeypatch):
     seen = {}
 
-    def _cart(as_of, only_needed=True, limit=200):
+    def _cart(as_of, only_needed=True, limit=200, **kwargs):
         seen["limit"] = limit
         from app.domain.models import CartReplenishmentPlan
         return CartReplenishmentPlan(

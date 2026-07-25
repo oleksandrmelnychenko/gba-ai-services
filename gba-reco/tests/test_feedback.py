@@ -30,7 +30,10 @@ def test_feedback_endpoint_records_negatives(monkeypatch):
     monkeypatch.setattr(main.cache, "add_negatives", _add)
     monkeypatch.setattr(main.cache, "invalidate_copurchase",
                         lambda cid: captured.update(invalidated=cid) or 1)
-    monkeypatch.setattr(main.cache, "get_negatives", lambda cid: frozenset({11, 12, 13}))
+    monkeypatch.setattr(main.cache, "get_negative_vendor_codes",
+                        lambda cid: frozenset({"VC-11", "VC-12", "VC-13"}))
+    monkeypatch.setattr(main.repo, "client_exists", lambda cid: True)
+    monkeypatch.setattr(main.repo, "active_product_ids", lambda pids: set(pids))
 
     client = TestClient(main.app)
     resp = client.post(

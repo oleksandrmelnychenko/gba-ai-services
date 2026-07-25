@@ -250,6 +250,54 @@ def test_critical_debt_reserve_is_total_active_allowance_not_per_run(mongo_db, m
 
     assert first["persisted"] == 5
     assert first["crit_debt_reserved"] == 2
+    assert first["skipped_capped"] == 5
+    assert first["skipped_capped"] >= 0
     assert second["persisted"] == 0
     assert second["crit_debt_reserved"] == 0
+    assert second["skipped_capped"] == 10
     assert mongo_db["tasks"].count_documents({"manager_id": 1, "status": "open"}) == 5
+
+
+def test_reserve_never_decrements_an_uncounted_capacity_skip(monkeypatch):
+    """A task can disappear between the standard pass and reserve pass (concurrent expiry sweep).
+
+    It was refreshed, not counted as capacity-skipped, so reserve admission must not subtract one
+    from a global integer counter. The final per-task-key accounting remains exactly zero.
+    """
+    from app.services import orchestrator
+    from app.services.generators import churn_winback, cross_sell, debt_followup, reorder_due
+
+    critical = _mk(TaskType.DEBT_FOLLOWUP, 1, prio=90.0, ev_score=1000.0)
+    critical.urgency = Urgency.CRITICAL
+    monkeypatch.setattr(
+        debt_followup,
+        "generate",
+        lambda manager_id, as_of, window: [critical],
+    )
+    for module in (reorder_due, churn_winback, cross_sell):
+        monkeypatch.setattr(module, "generate", lambda manager_id, as_of, window: [])
+
+    monkeypatch.setattr(orchestrator, "get_settings", lambda: SimpleNamespace(
+        max_active_tasks_per_manager=0,
+        max_tasks_per_client_per_day=2,
+        crit_debt_reserve=1,
+        feedback_window_days=90,
+        max_pace_boost=1.0,
+        feedback_penalty_floor=0.5,
+        feedback_penalty_per_rejection=0.15,
+    ))
+    monkeypatch.setattr(orchestrator.lifecycle, "active_counts_by_client", lambda manager_id: {})
+    monkeypatch.setattr(orchestrator.lifecycle, "active_counts_by_type", lambda manager_id: {})
+    monkeypatch.setattr(orchestrator.lifecycle, "active_count", lambda manager_id: 0)
+    monkeypatch.setattr(orchestrator.lifecycle, "feedback_rejections", lambda manager_id, days: {})
+    monkeypatch.setattr(orchestrator.lifecycle, "is_muted", lambda manager_id, client_id, task_type: False)
+    monkeypatch.setattr(orchestrator.lifecycle, "upsert_generated", lambda task: task.task_key)
+    task_reads = iter(({"task_key": critical.task_key}, None))
+    monkeypatch.setattr(orchestrator.lifecycle, "get_task", lambda task_key: next(task_reads))
+
+    stats = orchestrator.generate_for_manager(1, "2026-06-07")
+
+    assert stats["refreshed"] == 1
+    assert stats["persisted"] == 1
+    assert stats["crit_debt_reserved"] == 1
+    assert stats["skipped_capped"] == 0

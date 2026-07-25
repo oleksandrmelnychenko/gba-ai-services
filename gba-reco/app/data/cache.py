@@ -21,9 +21,9 @@ from app.core.metrics import METRICS
 
 log = get_logger("cache")
 
-# v34: recs remapped onto live catalog rows (live_remap) — bump kills warm-cached
-# entries that still carry dead product ids.
-_MODEL_VERSION = "v34-liveremap-202607"
+# v36: every recommendation (including repurchase) is scoped to operational resale stock;
+# strict cached-response invariants reject partial/duplicate/stale payloads.
+_MODEL_VERSION = "v36-operational-stock-202607"
 _RETRY_COOLDOWN_S = 30.0
 _client: redis.Redis | None = None
 _unavailable_until = 0.0
@@ -120,19 +120,62 @@ def invalidate_copurchase(customer_id: int) -> int:
         return 0
 
 
-def _neg_key(customer_id: int) -> str:
-    return f"reco:neg:{customer_id}"
+_ACTIVE_CLIENTS_KEY = "reco:worker:active_clients"
+
+
+def get_active_client_snapshot() -> frozenset[int]:
+    """Active-client id set persisted by the last warm run — churn detection baseline."""
+    client = _get_client()
+    if client is None:
+        return frozenset()
+    try:
+        raw = client.get(_ACTIVE_CLIENTS_KEY)
+        return frozenset(int(x) for x in json.loads(raw)) if raw else frozenset()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("active_snapshot_get_failed", error=str(exc))
+        return frozenset()
+
+
+def set_active_client_snapshot(client_ids: frozenset[int] | set[int]) -> None:
+    client = _get_client()
+    if client is None:
+        return
+    try:
+        client.set(_ACTIVE_CLIENTS_KEY, json.dumps(sorted(int(c) for c in client_ids)))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("active_snapshot_set_failed", error=str(exc))
+
+
+def _neg_key(net_uid: str) -> str:
+    return f"reco:neg:{net_uid.lower()}"
 
 
 def add_negatives(customer_id: int, product_ids: list[int], ttl: int) -> int:
     """Record products a downstream consumer (e.g. NBA: manager dismissed / sold=False) judged a
-    bad recommendation for this customer. Stored as a TTL'd set; the recommender excludes them."""
+    bad recommendation for this customer. Stored as a TTL'd set; the recommender excludes them.
+
+    Keyed by Client.NetUID with Product.VendorCode members — the natural keys survive the
+    catalog/client re-syncs that mint new integer ids (a re-mint used to orphan
+    reco:neg:{client_id} sets full of dead product ids). The caller still passes live ids;
+    translation happens here."""
+    from app.data import sales_repository as repo
+
     client = _get_client()
     if client is None or not product_ids:
         return 0
-    key = _neg_key(customer_id)
     try:
-        n = client.sadd(key, *[int(p) for p in product_ids])
+        net_uid = repo.client_net_uid(customer_id)
+        codes = repo.product_vendor_codes(product_ids)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("neg_translate_failed", customer_id=customer_id, error=str(exc))
+        return 0
+    if net_uid is None or not codes:
+        log.warning("neg_add_unresolved", customer_id=customer_id,
+                    client_found=net_uid is not None, vendor_codes=len(codes))
+        return 0
+    key = _neg_key(net_uid)
+    try:
+        n = client.sadd(key, *codes)
         client.expire(key, ttl)
         return int(n)
     except Exception as exc:  # noqa: BLE001
@@ -140,14 +183,36 @@ def add_negatives(customer_id: int, product_ids: list[int], ttl: int) -> int:
         return 0
 
 
-def get_negatives(customer_id: int) -> frozenset[int]:
+def get_negative_vendor_codes(customer_id: int) -> frozenset[str]:
+    """The stored negative set as VendorCodes — one entry per distinct product natural key."""
+    from app.data import sales_repository as repo
+
     client = _get_client()
     if client is None:
         return frozenset()
     try:
-        return frozenset(int(x) for x in client.smembers(_neg_key(customer_id)))
+        net_uid = repo.client_net_uid(customer_id)
+        if net_uid is None:
+            return frozenset()
+        return frozenset(str(x) for x in client.smembers(_neg_key(net_uid)))
     except Exception as exc:  # noqa: BLE001
         log.warning("neg_get_failed", customer_id=customer_id, error=str(exc))
+        return frozenset()
+
+
+def get_negatives(customer_id: int) -> frozenset[int]:
+    """Negative product ids for exclusion — the stored VendorCodes expanded to EVERY catalog
+    generation (live and soft-deleted), because candidate pools carry historical ids that only
+    collapse onto live rows in live_remap at the end of the pipeline."""
+    from app.data import sales_repository as repo
+
+    codes = get_negative_vendor_codes(customer_id)
+    if not codes:
+        return frozenset()
+    try:
+        return frozenset(repo.product_ids_for_vendor_codes(sorted(codes)))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("neg_expand_failed", customer_id=customer_id, error=str(exc))
         return frozenset()
 
 

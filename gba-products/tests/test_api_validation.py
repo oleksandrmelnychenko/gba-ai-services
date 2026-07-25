@@ -19,3 +19,15 @@ def test_unknown_band_returns_422():
 def test_unknown_abc_returns_422():
     resp = client.get("/assortment/health", params={"abc": "bogus"}, headers=_headers)
     assert resp.status_code == 422
+
+
+def test_product_routes_reject_non_positive_identity_before_dependencies():
+    paths = [
+        "/product/0",
+        "/product/0/analytics",
+        "/product/0/regions",
+        "/product/0/substitutes",
+    ]
+
+    for path in paths:
+        assert client.get(path, headers=_headers).status_code == 422

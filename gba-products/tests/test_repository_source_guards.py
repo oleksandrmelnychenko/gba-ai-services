@@ -18,16 +18,65 @@ def test_never_converts_already_eur_sale_price():
     assert "GetExchangedToEuroValue" not in _SRC
 
 
-def test_eur_value_uses_consignment_price_directly_no_fx_divide():
-    # ci.Price is ALREADY EUR (== ci.AccountingPrice on every on-hand lot; gba-pricing uses
-    # AccountingPrice with no conversion). Dividing by rsa.ExchangeRate mis-scaled the EUR value ~50x.
-    # The EUR value must be RemainingQty * ci.Price with NO /ExchangeRate and NOT the UAH PricePerItem.
-    assert "rsa.RemainingQty * ci.Price" in _SRC
-    assert "ci.Price / NULLIF(rsa.ExchangeRate" not in _SRC
-    assert "rsa.PricePerItem" not in _SRC
+def test_all_load_bearing_quantity_and_money_aggregates_cast_before_arithmetic():
+    # Qty/Amount are legacy SQL float columns. Leaving any of these expressions raw reintroduces
+    # binary-float accumulation and can move an accounting half-cent.
+    assert "SUM(oi.Qty)" not in _SRC
+    assert "SUM(pa.Amount)" not in _SRC
+    assert "SUM(sri.Qty)" not in _SRC
+    assert "oi.Qty * oi.PricePerItem" not in _SRC
+    assert "ci.RemainingQty * ci.AccountingPrice" not in _SRC
+    assert "_SALE_AMOUNT = f" in _SRC
+
+
+def test_price_and_regional_queries_return_decimal_revenue_aggregates():
+    price = _function_source("avg_sale_price_eur")
+    assert "SUM({_SALE_AMOUNT}) AS revenue_eur" in price
+    assert "SUM({_SALE_QTY}) AS sold_qty" in price
+    assert "CAST(revenue_eur / NULLIF(sold_qty, 0) AS decimal(28, 8))" in price
+
+    regional_product = _function_source("regional_product_sales")
+    regional_summary = _function_source("regional_demand_summary")
+    assert "SUM({_SALE_AMOUNT}) AS regional_revenue_eur" in regional_product
+    assert "SUM({_SALE_QTY}) AS regional_units" in regional_product
+    assert "SUM({_SALE_AMOUNT}) AS revenue_eur" in regional_summary
+    assert "SUM({_SALE_QTY}) AS units" in regional_summary
+
+
+def _function_source(name: str) -> str:
+    start = _SRC.index(f"def {name}")
+    end = _SRC.find("\ndef ", start + 1)
+    return _SRC[start:] if end == -1 else _SRC[start:end]
+
+
+def _sql_after_docstring(name: str) -> str:
+    return "".join(_function_source(name).split('"""')[2:])
+
+
+def test_stock_quantity_is_exact_productavailability_amount_without_reservation_replay():
+    sql = _sql_after_docstring("on_hand_stock")
+    assert "FROM dbo.ProductAvailability pa" in sql
+    assert "SUM({_PA_QTY}) AS qty_on_hand" in sql
+    assert '_PA_QTY = "CAST(pa.Amount AS decimal(18, 8))"' in _SRC
+    assert "dbo.ReSaleAvailability" not in sql
+    assert "dbo.ProductReservation" not in sql
+    assert "pa.Amount +" not in sql
+    assert "pa.Amount -" not in sql
+
+
+def test_eur_value_uses_accounting_eur_cost_without_fx_conversion():
+    sql = _sql_after_docstring("on_hand_stock")
+    assert "SUM({_COST_QTY} * {_COST_PRICE}) AS cost_value_eur" in sql
+    assert '_COST_QTY = "CAST(ci.RemainingQty AS decimal(18, 8))"' in _SRC
+    assert '_COST_PRICE = "CAST(ci.AccountingPrice AS decimal(28, 14))"' in _SRC
+    assert "GetExchangedToEuroValue" not in sql
+    assert "ExchangeRate" not in sql
+    assert "PricePerItem" not in sql
 
 
 def test_stock_scope_excludes_defective_and_requires_resale():
+    sql = _sql_after_docstring("on_hand_stock")
+    assert "_SELLABLE_STORAGE" in sql
     assert "s.ForDefective = 0" in _SRC
     assert "s.AvailableForReSale = 1 OR s.IsResale = 1" in _SRC
 
@@ -37,16 +86,26 @@ def test_stock_excludes_1c_debt_import_lots():
     # AccountingPrice (== ci.Price, ~55x real cost) on BOTH IsImportedFromOneC and IsVirtual lots, so
     # neither Consignment flag isolates them. They otherwise ~3x the on-hand EUR value (€985k vs €323k
     # real, 67.2% contamination) and overstate the unit_cost the margin layer derives (eur_value/qty)
-    # up to 11.5x. The stock FROM block MUST join the lot's ProductIncome via Consignment and exclude
+    # up to 11.5x. The cost CTE MUST join the lot's ProductIncome via Consignment and exclude
     # SourceDocumentType=1 — mirroring gba-pricing unit_cost_eur. A lot with no ProductIncome (pure
     # transfer) is kept (pi.ID IS NULL). The filter must be parameterized, not a literal.
-    assert "dbo.Consignment" in _SRC  # ci -> Consignment FK hop
-    assert "ci.ConsignmentID" in _SRC
-    assert "dbo.ProductIncome" in _SRC  # Consignment -> ProductIncome FK hop
-    assert "c.ProductIncomeID" in _SRC
-    assert "pi.ID IS NULL OR pi.SourceDocumentType IS NULL OR pi.SourceDocumentType <> :debt_doc_type" in _SRC
+    sql = _sql_after_docstring("on_hand_stock")
+    assert "dbo.Consignment" in sql  # ci -> Consignment FK hop
+    assert "ci.ConsignmentID" in sql
+    assert "dbo.ProductIncome" in sql  # Consignment -> ProductIncome FK hop
+    assert "c.ProductIncomeID" in sql
+    assert "pi.SourceDocumentType <> :debt_doc_type" in sql
     # mirror gba-pricing's exact intent: the debt document type is 1 and parameter-bound.
     assert "_DEBT_IMPORT_SOURCE_DOCUMENT_TYPE = 1" in _SRC
+
+
+def test_stock_readiness_detects_populated_global_but_empty_sellable_scope():
+    ready = _function_source("_stock_readiness_reason")
+    assert "global_availability_row_count" in ready
+    assert "global_available_qty" in ready
+    assert "role_marked_storage_count" in ready
+    assert "sellable_availability_row_count" in ready
+    assert "sellable_available_qty" in ready
 
 
 def test_windows_are_parameterized():
@@ -55,9 +114,7 @@ def test_windows_are_parameterized():
 
 def _returns_fn() -> str:
     """The body of returns_for_products (so guards target the returns query specifically)."""
-    start = _SRC.index("def returns_for_products")
-    end = _SRC.index("\ndef ", start)
-    return _SRC[start:end]
+    return _function_source("returns_for_products")
 
 
 def test_returns_window_on_fromdate_not_sync_created():
@@ -68,16 +125,19 @@ def test_returns_window_on_fromdate_not_sync_created():
     assert "sr.Created" not in body
 
 
-def test_returns_qty_not_read_from_dead_columns():
-    # SaleReturnItem.Qty / .Amount and OrderItem.ReturnedQty are all-zero in this sync — reading
-    # them makes the returns factor a dead constant. Returned qty is reconstructed from OrderItem.Qty.
-    # Check the SQL column references (the alias.Column form), not prose in the docstring.
+def test_returns_sum_canonical_item_qty_preserving_partial_and_multiple_rows():
+    # gba-server persists SaleReturnItem.Qty and groups SUM(Qty) by OrderItemID. Grouping the
+    # return/order key prevents price/flag multiplication, while SUM preserves partial quantities
+    # and multiple active return rows. MAX(OrderItem.Qty) would replace both with the sold quantity.
     parts = _returns_fn().split('"""')  # [code, docstring, code-with-f-string-SQL, sql, tail]
     sql = "".join(parts[2:])  # everything after the docstring (the f-string SQL + trailers)
-    assert "sri.Qty" not in sql
+    assert "SUM({_RETURN_QTY}) AS returned_qty" in sql
+    assert "SUM(returned_qty) AS returned_qty" in sql
+    assert "GROUP BY oi.ProductID, sri.SaleReturnID, sri.OrderItemID" in sql
+    assert '_RETURN_QTY = "CAST(sri.Qty AS decimal(18, 8))"' in _SRC
+    assert "MAX(oi.Qty)" not in sql
     assert "sri.Amount" not in sql
     assert "oi.ReturnedQty" not in sql
-    assert "MAX(oi.Qty)" in sql  # returned qty is reconstructed from the sold OrderItem.Qty
 
 
 def test_returns_honor_active_set_and_exclude_synthetic():
@@ -115,7 +175,8 @@ def test_sales_spine_uses_validity_flag_not_deleted():
 
 
 def test_aggregating_spine_excludes_synthetic_debt_entry():
-    # The synthetic "Ввід боргів" product (ID 25422404) is a 1С debt-injection line that ranks #1
+    # The synthetic "Ввід боргів" product (dynamically resolved; the 1С sync re-mints its row so
+    # a hardcoded ID goes stale) is a debt-injection line that ranks #1
     # by revenue (~€7.4M) and would pollute velocity / avg sale price / monthly units. The three
     # AGGREGATING spine queries must exclude it; sold_product_ids is only a membership set (never
     # aggregated) so it is intentionally left without the filter.
@@ -125,6 +186,34 @@ def test_aggregating_spine_excludes_synthetic_debt_entry():
     src = _SRC
     sold = src[src.index("def sold_product_ids"):src.index("def sales_velocity")]
     assert "<> :synth" not in sold
+
+
+def test_synthetic_debt_product_id_resolved_dynamically_not_hardcoded():
+    # The 1С sync re-mints the «Ввід боргів» Product row, so any hardcoded ID (e.g. the dead
+    # 25422404) silently stops filtering after a re-mint. The ID must be resolved from the live
+    # table by name (latest non-deleted row wins).
+    assert "25422404" not in _SRC
+    assert "N'Ввід боргів'" in _SRC
+    assert "ORDER BY ID DESC" in _SRC
+    assert 'def synthetic_product_id' in _SRC
+
+
+def test_product_monthly_analytics_uses_canonical_sales_spine_and_actual_eur_revenue():
+    start = _SRC.index("def monthly_product_sales")
+    end = _SRC.index("\ndef ", start)
+    body = _SRC[start:end]
+
+    assert "oi.IsValidForCurrentSale = 1" in body
+    assert "o.Created >= :window_start" in body
+    assert "o.Created < :asof" in body
+    assert "oi.ProductID = :product_id" in body
+    assert "oi.ProductID <> :synth" in body
+    assert "COUNT(DISTINCT o.ID) AS order_count" in body
+    assert "SUM({_SALE_AMOUNT}) AS revenue_eur" in body
+    assert "CAST(revenue_eur / NULLIF(units, 0) AS decimal(28, 8))" in body
+    assert '_SALE_QTY = "CAST(oi.Qty AS decimal(18, 8))"' in _SRC
+    assert '_SALE_PRICE = "CAST(oi.PricePerItem AS decimal(28, 14))"' in _SRC
+    assert "GetExchangedToEuroValue" not in body
 
 
 def test_regional_demand_uses_client_region_id_not_region_code():
@@ -142,16 +231,13 @@ def test_regional_demand_uses_client_region_id_not_region_code():
     assert "oi.ProductID <> :synth" in body
 
 
-def test_product_monthly_analytics_uses_canonical_sales_spine_and_actual_eur_revenue():
-    start = _SRC.index("def monthly_product_sales")
-    end = _SRC.index("\ndef ", start)
-    body = _SRC[start:end]
-
-    assert "oi.IsValidForCurrentSale = 1" in body
-    assert "o.Created >= :window_start AND o.Created < :asof" in body
-    assert "oi.ProductID = :product_id" in body
-    assert "oi.ProductID <> :synth" in body
-    assert "COUNT(DISTINCT o.ID) AS order_count" in body
-    assert "SUM(oi.Qty * oi.PricePerItem) AS revenue_eur" in body
-    assert "SUM(oi.Qty * oi.PricePerItem) / NULLIF(SUM(oi.Qty), 0) AS avg_price_eur" in body
-    assert "GetExchangedToEuroValue" not in body
+def test_latest_producer_uses_factual_invoice_and_ukraine_item_spines():
+    body = _function_source("product_meta")
+    assert "dbo.SupplyInvoiceOrderItem" in body
+    assert "sioi.SupplyInvoiceID = si.ID" in body
+    assert "si.DateFrom AS source_date" in body
+    assert "dbo.SupplyOrderUkraineItem" in body
+    assert "COALESCE(soui.SupplierID, sou.SupplierID)" in body
+    assert "sou.FromDate AS source_date" in body
+    assert "sou.IsFromCockpit = 1 AND sou.IsPlaced = 0" in body
+    assert "JOIN dbo.SupplyOrderItem soi" not in body

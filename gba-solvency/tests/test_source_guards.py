@@ -20,6 +20,7 @@ import inspect
 import textwrap
 
 from app.data import solvency_repository as repo
+from app.risk import dataset
 
 _TURNOVER_FNS = (
     repo.turnover_eur,
@@ -56,7 +57,8 @@ def _sql_body(fn) -> str:
 def test_turnover_functions_do_not_euro_convert_priceperitem():
     for fn in _TURNOVER_FNS:
         body = _sql_body(fn)
-        assert "oi.Qty * oi.PricePerItem" in body, fn.__name__
+        assert "CAST(oi.Qty AS decimal(19, 6))" in body, fn.__name__
+        assert "CAST(oi.PricePerItem AS decimal(19, 6))" in body, fn.__name__
         assert "GetExchangedToEuroValue(oi" not in body, (
             f"{fn.__name__} re-introduced the x52 over-conversion of already-EUR PricePerItem"
         )
@@ -65,7 +67,7 @@ def test_turnover_functions_do_not_euro_convert_priceperitem():
 
 def test_overdue_still_euro_converts_debt_total():
     body = _sql_body(repo.overdue_amount_eur)
-    assert "GetExchangedToEuroValue(d.Total" in body, (
+    assert "GetExchangedToEuroValue(" in body and "d.Total" in body, (
         "overdue_amount_eur must keep converting Debt.Total to EUR"
     )
 
@@ -87,3 +89,20 @@ def test_asof_anchored_never_clock_calls():
         assert "GETUTCDATE()" not in body, (
             f"{fn.__name__} must anchor on :asof, not the non-deterministic GETUTCDATE()"
         )
+
+
+def test_all_return_feature_paths_sum_canonical_salereturnitem_qty():
+    functions = (
+        repo.return_qty_rate,
+        dataset.feat_returns,
+        dataset.features_one,
+        dataset.features_many,
+    )
+    for fn in functions:
+        body = _sql_body(fn)
+        assert "SUM(sri.Qty) AS returned_qty" in body, fn.__name__
+        assert "sri.SaleReturnID, sri.OrderItemID" in body, fn.__name__
+        assert "MAX(oi.Qty)" not in body, (
+            f"{fn.__name__} replaced partial/multiple returns with original sold quantity"
+        )
+        assert "oi.ReturnedQty" not in body, fn.__name__

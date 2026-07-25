@@ -67,8 +67,12 @@ class ProductAnalyticsDataQuality(BaseModel):
         "OrderItem.IsValidForCurrentSale = 1"
     )
     sales_window_end: Literal["exclusive"] = "exclusive"
-    revenue_basis: Literal["SUM(OrderItem.Qty * OrderItem.PricePerItem); PricePerItem is EUR"] = (
-        "SUM(OrderItem.Qty * OrderItem.PricePerItem); PricePerItem is EUR"
+    revenue_basis: Literal[
+        "SUM(CAST(OrderItem.Qty AS decimal) * CAST(OrderItem.PricePerItem AS decimal)); "
+        "PricePerItem is EUR"
+    ] = (
+        "SUM(CAST(OrderItem.Qty AS decimal) * CAST(OrderItem.PricePerItem AS decimal)); "
+        "PricePerItem is EUR"
     )
     avg_price_basis: Literal["revenue_eur / units (quantity-weighted)"] = (
         "revenue_eur / units (quantity-weighted)"

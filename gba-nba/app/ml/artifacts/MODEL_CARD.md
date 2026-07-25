@@ -31,11 +31,11 @@ manager filter dropped.
 
 Current artifact metrics:
 
-- Rows: 63,378.
-- Clients: 862.
-- Base rate: 29.2%.
+- Rows: 23,197.
+- Clients: 710.
+- Base rate: 26.6%.
 - Features: 21 shared/type-signal/one-hot columns.
-- Production model: calibrated HGB.
+- Production model: calibrated LOGIT.
 - Temporal OOT split: train vintages `<= 2026-01-01`, test `2026-02-01..2026-04-01`.
 
 ## Model
@@ -49,28 +49,28 @@ Stratified Group CV, grouped by client:
 
 | metric | HGB | Logit |
 |---|---:|---:|
-| AUC | 0.698 | 0.696 |
-| KS | 0.283 | 0.272 |
-| Brier | 0.186 | 0.183 |
+| AUC | 0.703 | 0.700 |
+| KS | 0.292 | 0.294 |
+| Brier | 0.175 | 0.175 |
 
 Temporal out-of-time split:
 
 | metric | HGB | Logit |
 |---|---:|---:|
-| AUC | 0.704 | 0.702 |
-| KS | 0.280 | 0.279 |
-| Brier | 0.177 | 0.178 |
+| AUC | 0.712 | 0.724 |
+| KS | 0.310 | 0.330 |
+| Brier | 0.178 | 0.175 |
 
-OOT per type, production HGB:
+OOT per type, production LOGIT:
 
 | task_type | n | pos | AUC | KS | Brier |
 |---|---:|---:|---:|---:|---:|
-| reorder_due | 22,508 | 6,499 | 0.670 | 0.235 | 0.188 |
-| debt_followup | 632 | 384 | 0.902 | 0.653 | 0.131 |
-| churn_winback | 858 | 255 | 0.815 | 0.496 | 0.149 |
-| cross_sell | 1,750 | 145 | 0.725 | 0.375 | 0.074 |
+| reorder_due | 7,653 | 2,264 | 0.702 | 0.297 | 0.186 |
+| debt_followup | 14 | 0 | n/a | n/a | 0.000 |
+| churn_winback | 639 | 234 | 0.819 | 0.482 | 0.166 |
+| cross_sell | 1,200 | 159 | 0.705 | 0.363 | 0.110 |
 
-Reliability bins are in `metrics.json` under `oot_per_type.hgb[*].reliability`.
+Reliability bins are in `metrics.json` under `oot_per_type.logit[*].reliability`.
 
 ## Benchmark vs Old Priority
 
@@ -78,12 +78,12 @@ AUC on the same outcome label:
 
 | scope | old | model | delta |
 |---|---:|---:|---:|
-| overall CV | 0.556 | 0.698 | 0.141 |
-| OOT future | 0.549 | 0.704 | 0.155 |
-| reorder_due CV | 0.528 | 0.661 | 0.133 |
-| debt_followup CV | 0.323 | 0.905 | 0.583 |
-| churn_winback CV | 0.589 | 0.793 | 0.204 |
-| cross_sell CV | 0.705 | 0.726 | 0.020 |
+| overall CV | 0.591 | 0.703 | 0.112 |
+| OOT future | 0.596 | 0.724 | 0.128 |
+| reorder_due CV | 0.554 | 0.672 | 0.118 |
+| debt_followup CV | n/a | n/a | n/a |
+| churn_winback CV | 0.499 | 0.765 | 0.267 |
+| cross_sell CV | 0.725 | 0.727 | 0.002 |
 
 The model beats old priority overall, out-of-time, and on the modeled task types. This card is
 generated from `metrics.json` by `app/ml/train.py`; if the metrics change, the card changes with

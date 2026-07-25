@@ -39,6 +39,8 @@ class Settings(BaseSettings):
     # Daily generation schedule — every manager has a fresh inbox before they log in.
     timezone: str = "Europe/Kyiv"
     daily_generate_hour: int = 9   # 09:00 local time (Mon–Sat handled by working-day pace, not here)
+    max_generation_lag_hours: int = Field(default=36, gt=0)
+    max_source_lag_days: int = Field(default=31, gt=0)
     # Shared secret the trusted gba-server proxy must present (X-Internal-Api-Key).
     # Empty = open (dev only); set in every non-local deployment.
     internal_api_key: str = ""
@@ -64,13 +66,12 @@ class Settings(BaseSettings):
     # Exclude products bought by >this share of clients — synthetic accounting lines ("Ввід боргів"
     # = debt entry, ~75% of clients) that aren't real products. Real parts top out ~14%.
     ubiquity_exclude_pct: float = 0.20
-    # Synthetic accounting product(s) (e.g. debt-entry line 25422404 "Ввід боргів з 1С") excluded
-    # UNCONDITIONALLY from turnover/feature signals, independent of the rolling ubiquity window.
-    # 25422404 is today the only product clearing ubiquity_exclude_pct (~0.77), so it would be the
-    # only one silently re-absorbed if its 12-month ubiquity ever dipped below the threshold — pin
-    # it here so the exclusion is a hard guard, not a side effect of the data-driven ubiquity set.
-    # Mirrors gba-reco/gba-products' synthetic-id hard exclusion.
-    synthetic_product_ids: frozenset[int] = frozenset({25422404})
+    # Synthetic accounting product(s) (debt-entry «Ввід боргів») excluded UNCONDITIONALLY from
+    # turnover/feature signals, independent of the rolling ubiquity window. Empty (the default) =
+    # resolve the live id dynamically at runtime (signals_repository.synthetic_product_ids — the
+    # dev DB re-mints product ids, so a pinned id goes stale, e.g. the dead 25422404); set via env
+    # only as an explicit override. Mirrors gba-reco/gba-products' synthetic-id hard exclusion.
+    synthetic_product_ids: frozenset[int] = frozenset()
 
     # Scoring / model knobs — tunable WITHOUT redeploy (env-driven); bump model_version on change so
     # outcomes can be sliced/A-B'd by scoring generation.

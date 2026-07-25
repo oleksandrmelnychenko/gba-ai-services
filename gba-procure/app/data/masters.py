@@ -141,6 +141,53 @@ def seed_derived_terms(min_orders: int = 3, overwrite: bool = False) -> dict:
     return {"seeded": seeded, "skipped": skipped, "candidates": len(terms)}
 
 
+def orphan_report() -> dict[str, dict] | None:
+    """Per-collection count of docs keyed on producer/product IDs absent from the source DB.
+
+    The DB periodically re-mints reference rows under new IDs (pre-wipe generations die);
+    procure docs carry no natural keys (names/vendor codes), so dead-ID docs cannot be
+    remapped to the re-minted rows — they are retained and surfaced via a startup warning.
+    """
+    from app.data.db import in_clause, query
+
+    client = _get_client()
+    if client is None:
+        return None
+    db = client[get_settings().mongo_db]
+
+    def _alive(table: str, ids: list[int]) -> set[int]:
+        alive: set[int] = set()
+        for i in range(0, len(ids), 1000):
+            chunk = ids[i:i + 1000]
+            if not chunk:
+                continue
+            ph, params = in_clause("p", chunk)
+            rows = query(f"SELECT ID FROM dbo.{table} WHERE ID IN {ph}", params)
+            alive.update(int(r["ID"]) for r in rows)
+        return alive
+
+    out: dict[str, dict] = {}
+    for name in ("procure_product_terms", "procure_feedback"):
+        coll = db[name]
+        producers = [int(p) for p in coll.distinct("producer_id")]
+        products = [int(p) for p in coll.distinct("product_id")]
+        dead_producers = sorted(set(producers) - _alive("Client", producers))
+        dead_products = sorted(set(products) - _alive("Product", products))
+        orphaned = 0
+        if dead_producers or dead_products:
+            orphaned = coll.count_documents({"$or": [
+                {"producer_id": {"$in": dead_producers}},
+                {"product_id": {"$in": dead_products}},
+            ]})
+        out[name] = {
+            "total": coll.count_documents({}),
+            "orphaned": orphaned,
+            "dead_producer_ids": len(dead_producers),
+            "dead_product_ids": len(dead_products),
+        }
+    return out
+
+
 def ping() -> bool:
     client = _get_client()
     if client is None:

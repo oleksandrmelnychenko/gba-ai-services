@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.domain.models import ForwardRiskBand, Rating
+from app.domain.models import ClientIdentityMismatchError, ForwardRiskBand, Rating
 from app.services.solvency import service
 
 
@@ -72,6 +72,26 @@ def test_score_client_resolves_net_uid(monkeypatch):
     assert out.rating == Rating.A
 
 
+def test_score_client_both_identities_must_resolve_to_same_client(monkeypatch):
+    monkeypatch.setattr(service.repo, "resolve_client_id", lambda uid: 777)
+    _wire_v3(monkeypatch)
+
+    out = service.score_client(777, "matching-uid", "2026-06-01", 12, use_cache=False)
+
+    assert out.client_id == 777
+
+
+def test_score_client_rejects_mismatched_dual_identity_before_compute(monkeypatch):
+    monkeypatch.setattr(service.repo, "resolve_client_id", lambda uid: 778)
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("must not score a mismatched client identity")
+
+    monkeypatch.setattr(service.risk_dataset, "features_one", boom)
+    with pytest.raises(ClientIdentityMismatchError, match="do not match"):
+        service.score_client(777, "different-uid", "2026-06-01", 12, use_cache=False)
+
+
 def test_score_client_unknown_net_uid_raises_lookup(monkeypatch):
     monkeypatch.setattr(service.repo, "resolve_client_id", lambda uid: None)
     with pytest.raises(LookupError):
@@ -121,6 +141,27 @@ def test_score_client_no_debt_forward_low_band(monkeypatch):
     assert out.forward_risk is not None
     assert out.forward_risk.band == ForwardRiskBand.LOW
     assert out.forward_risk.pd > 0  # ~ forward base rate
+
+
+def test_score_client_already_sev180_has_no_out_of_population_forward_risk(monkeypatch):
+    features = _stub_features()
+    features["overdue_eur_180plus"] = 100.0
+    features["total_debt_eur"] = 100.0
+    monkeypatch.setattr(service.risk_dataset, "features_one", lambda *a, **k: features)
+    monkeypatch.setattr(service, "score_current", lambda f: _stub_current(band="D", score=55.0))
+    monkeypatch.setattr(
+        service,
+        "score_forward",
+        lambda f: (_ for _ in ()).throw(
+            AssertionError("already-SEV180 clients are outside the forward model population")
+        ),
+    )
+    monkeypatch.setattr(service.repo, "turnover_eur_by_currency", lambda *a, **k: [])
+
+    out = service.score_client(5, None, "2026-06-01", 12, use_cache=False)
+
+    assert out.rating == Rating.D
+    assert out.forward_risk is None
 
 
 def test_score_client_provider_only_not_applicable_no_compute(monkeypatch):
@@ -200,6 +241,24 @@ def test_score_client_cache_hit_hydrates(monkeypatch):
     assert out.pd == 0.65
     assert out.forward_risk.band == ForwardRiskBand.HIGH
     assert out.contributions[0].feature == "n_open_debt_lines"
+
+
+def test_score_client_ignores_cache_entry_for_another_client(monkeypatch):
+    from app.domain.models import Contribution, ForwardRisk, SolvencyScore
+
+    cached_obj = SolvencyScore(
+        client_id=99, applicable=True, score=46, rating=Rating.D, pd=0.65,
+        contributions=[Contribution(feature="n_open_debt_lines", value=2.0, points=3.7)],
+        forward_risk=ForwardRisk(band=ForwardRiskBand.HIGH, pd=0.8),
+        sub_factors=None, as_of_date="2026-06-01", window_months=12,
+    ).model_dump(mode="json")
+    monkeypatch.setattr(service.cache, "get", lambda *a, **k: cached_obj)
+    _wire_v3(monkeypatch)
+
+    out = service.score_client(9, None, "2026-06-01", 12, use_cache=True)
+
+    assert out.client_id == 9
+    assert out.score == 100
 
 
 def test_build_charts_assembles_from_repo(monkeypatch):

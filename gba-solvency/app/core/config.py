@@ -49,15 +49,19 @@ class Settings(BaseSettings):
     # Solvency model
     model_version: str = "creditscore-v3"
     window_months: int = 12
+    # A healthy service must see a current canonical sales spine, not just an open DB socket.
+    max_source_lag_days: int = 31
 
     # FX snapshot date — GetExchangedToEuroValue revalues at call time, so a run MUST pin a
     # fixed date to stay deterministic. Empty => the engine uses the request's as_of_date.
     fx_snapshot_date: str = ""
 
     # Synthetic 1С debt-entry line ('Ввід боргів з 1С'): excluded from turnover/activity but
-    # represents real carried debt, so it is KEPT in debt/exposure signals.
+    # represents real carried debt, so it is KEPT in debt/exposure signals. The row is re-minted
+    # by catalog re-syncs, so the live ID is ALSO resolved dynamically by name at runtime
+    # (app.data.synthetic_product); these env IDs are unioned in as an override/safety net.
     synthetic_line_product_ids: set[int] = Field(
-        default_factory=lambda: {25422404},
+        default_factory=lambda: {29555414},
         validation_alias=AliasChoices("synthetic_line_product_ids", "synthetic_line_product_id"),
     )
 
@@ -68,7 +72,7 @@ class Settings(BaseSettings):
     @classmethod
     def _coerce_synthetic_ids(cls, v: object) -> object:
         if v is None or v == "":
-            return {25422404}
+            return {29555414}
         if isinstance(v, int):
             return {v}
         if isinstance(v, str):

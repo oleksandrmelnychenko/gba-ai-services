@@ -4,6 +4,7 @@ from __future__ import annotations
 from app.core.config import Settings
 from app.data.db import in_clause
 from app.domain.models import (
+    AgingBar,
     CapType,
     DebtLoadSource,
     Rating,
@@ -12,6 +13,8 @@ from app.domain.models import (
     SolvencyScore,
     SubFactor,
     SubFactors,
+    TrendPoint,
+    TurnoverExposurePoint,
 )
 
 
@@ -47,8 +50,8 @@ def test_config_solvency_defaults():
     assert s.redis_db == 2
     assert s.model_version == "creditscore-v3"
     assert s.window_months == 12
-    assert s.synthetic_line_product_ids == {25422404}
-    assert s.synthetic_line_product_id == 25422404  # back-compat single-value accessor
+    assert s.synthetic_line_product_ids == {29555414}
+    assert s.synthetic_line_product_id == 29555414  # back-compat single-value accessor
 
 
 def test_synthetic_ids_coerce_from_env_forms():
@@ -116,3 +119,15 @@ def test_cache_key_stable_and_versioned():
     assert "creditscore-v3" in k1
     ck = make_charts_key(123, "2026-06-01", 12)
     assert ck.startswith("solvchart:")
+
+
+def test_api_money_uses_half_up_and_rounds_only_after_aggregate():
+    assert AgingBar(bucket="0-30", count=1, amount_eur="1.005").amount_eur == 1.01
+    assert TrendPoint(period="2026-07", turnover_eur="2.675").turnover_eur == 2.68
+    point = TurnoverExposurePoint(
+        period="2026-07",
+        turnover_eur="1.005",
+        exposure_eur="10.005",
+    )
+    assert point.turnover_eur == 1.01
+    assert point.exposure_eur == 10.01

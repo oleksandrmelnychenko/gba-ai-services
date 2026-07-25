@@ -26,10 +26,9 @@ def select_within_budget(values: list[float], costs: list[float], budget: float,
         prob += pulp.lpSum(values[i] * x[i] for i in range(n))
         prob += pulp.lpSum(costs[i] * x[i] for i in range(n)) <= budget
         status = prob.solve(pulp.PULP_CBC_CMD(msg=0, timeLimit=time_limit))
-        if pulp.LpStatus[status] in ("Optimal", "Not Solved"):
+        if pulp.LpStatus[status] == "Optimal":
             chosen = {i for i in range(n) if (x[i].value() or 0) > 0.5}
-            if chosen or pulp.LpStatus[status] == "Optimal":
-                return chosen, True
+            return chosen, True
         log.warning("milp_non_optimal", status=pulp.LpStatus[status])
     except Exception as exc:  # noqa: BLE001
         log.warning("milp_failed_fallback_greedy", error=str(exc))
@@ -38,7 +37,10 @@ def select_within_budget(values: list[float], costs: list[float], budget: float,
 
 def _greedy(values: list[float], costs: list[float], budget: float) -> set[int]:
     order = sorted(range(len(values)),
-                   key=lambda i: (values[i] / costs[i]) if costs[i] > 0 else 0.0, reverse=True)
+                   key=lambda i: (
+                       -((values[i] / costs[i]) if costs[i] > 0 else 0.0),
+                       i,
+                   ))
     used = 0.0
     chosen: set[int] = set()
     for i in order:

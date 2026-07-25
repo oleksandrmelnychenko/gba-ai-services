@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import calendar
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from app.core.config import get_settings
+from app.core.money import cents, cents_decimal, decimal_value, tenths
 from app.data import signals_repository as sig
 
 _SUNDAY = 6
@@ -30,7 +32,7 @@ def working_days_elapsed(as_of: date) -> int:
     return sum(1 for d in range(1, as_of.day + 1) if date(as_of.year, as_of.month, d).weekday() != _SUNDAY)
 
 
-def run_rate(series: dict[str, float], current_month: str, n: int = 3) -> float:
+def run_rate(series: dict[str, object], current_month: str, n: int = 3) -> Decimal:
     """Average of the n most-recent COMPLETED months (current partial month excluded).
 
     This is the conservative 'minimum' floor: you've recently been selling this much, at minimum
@@ -38,38 +40,49 @@ def run_rate(series: dict[str, float], current_month: str, n: int = 3) -> float:
     """
     completed = sorted(k for k in series if k < current_month)
     recent = completed[-n:]
-    return sum(series[k] for k in recent) / len(recent) if recent else 0.0
+    if not recent:
+        return Decimal("0")
+    total = sum((decimal_value(series[key]) for key in recent), start=Decimal("0"))
+    return total / Decimal(len(recent))
 
 
-def _pace_status(actual: float, expected: float) -> str:
+def _pace_status(actual: Decimal, expected: Decimal) -> str:
     if expected <= 0:
         return "on"
     ratio = actual / expected
-    if ratio >= 1.05:
+    if ratio >= Decimal("1.05"):
         return "ahead"
-    if ratio < 0.95:
+    if ratio < Decimal("0.95"):
         return "behind"
     return "on"
 
 
-def _metric(series: dict[str, float], current_month: str, mtd: float,
+def _metric(series: dict[str, object], current_month: str, mtd: object,
             wd: int, wd_elapsed: int, n: int) -> dict:
-    target = run_rate(series, current_month, n)
-    daily_pace = target / wd if wd else 0.0
-    expected_to_date = daily_pace * wd_elapsed
-    remaining_target = max(target - mtd, 0.0)
+    # Target and MTD are the canonical cent values exposed by the API. Every derived field is
+    # calculated from those same values so the C# proxy and console can recompute the contract
+    # exactly; hidden sub-cent inputs must not make the displayed fields disagree.
+    target = cents_decimal(run_rate(series, current_month, n))
+    mtd_value = cents_decimal(decimal_value(mtd))
+    daily_pace = target / Decimal(wd) if wd else Decimal("0")
+    expected_to_date = daily_pace * Decimal(wd_elapsed)
+    remaining_target = max(target - mtd_value, Decimal("0"))
     remaining_wd = max(wd - wd_elapsed, 0)
-    today_needed = remaining_target / remaining_wd if remaining_wd else remaining_target
+    today_needed = (
+        remaining_target / Decimal(remaining_wd) if remaining_wd else remaining_target
+    )
     return {
-        "target": round(target, 2),
-        "mtd": round(mtd, 2),
-        "daily_pace": round(daily_pace, 2),
-        "expected_to_date": round(expected_to_date, 2),
-        "gap": round(expected_to_date - mtd, 2),     # positive = behind pace
-        "today_needed": round(today_needed, 2),
-        "attainment_pct": round(100.0 * mtd / target, 1) if target else 0.0,
+        "target": cents(target),
+        "mtd": cents(mtd_value),
+        "daily_pace": cents(daily_pace),
+        "expected_to_date": cents(expected_to_date),
+        "gap": cents(expected_to_date - mtd_value),     # positive = behind pace
+        "today_needed": cents(today_needed),
+        "attainment_pct": tenths(Decimal("100") * mtd_value / target) if target else 0.0,
         # new/<trailing-window managers have no run-rate yet -> "no_target", not a misleading "on"
-        "pace_status": _pace_status(mtd, expected_to_date) if target > 0 else "no_target",
+        "pace_status": (
+            _pace_status(mtd_value, expected_to_date) if target > 0 else "no_target"
+        ),
     }
 
 

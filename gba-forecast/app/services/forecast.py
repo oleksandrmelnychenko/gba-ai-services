@@ -7,12 +7,15 @@ Output points are { "SaleAmount": <float EUR>, "MonthNameUK": "<Укр short mon
 from __future__ import annotations
 
 from datetime import date
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from math import isfinite
 
 from app.core.config import Settings
 from app.services.forecasting import demand, selection
 
 # month (1-12) -> Ukrainian short month label, per the spec mapping.
 MONTHS_UK = ["Січ", "Лют", "Бер", "Кві", "Тра", "Чер", "Лип", "Сер", "Вер", "Жов", "Лис", "Гру"]
+_EUR_CENT = Decimal("0.01")
 
 
 def month_name_uk(year: int, month: int) -> str:
@@ -57,6 +60,31 @@ def _non_zero_months(series: list[float]) -> int:
     return sum(1 for v in series if v > 0)
 
 
+def eur_cents(value: object) -> float:
+    """Accounting round a finite EUR value to non-negative cents.
+
+    Python's built-in ``round`` uses bankers' rounding and binary floats, which makes exact
+    half-cent outcomes disagree with accounting/UI totals. Decimal(str(value)) plus
+    ROUND_HALF_UP is the fleet-wide money boundary.
+    """
+    try:
+        amount = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError("forecast amount is not a finite number") from exc
+    if not amount.is_finite():
+        raise ValueError("forecast amount is not a finite number")
+    if amount < 0:
+        amount = Decimal("0")
+    try:
+        rounded = amount.quantize(_EUR_CENT, rounding=ROUND_HALF_UP)
+    except InvalidOperation as exc:
+        raise ValueError("forecast amount is outside the supported EUR range") from exc
+    result = float(rounded)
+    if not isfinite(result):
+        raise ValueError("forecast amount is outside the supported EUR range")
+    return result
+
+
 def forecast_points(
     history: dict[str, float], as_of: date, cfg: Settings, horizon: int | None = None
 ) -> list[dict]:
@@ -83,5 +111,5 @@ def forecast_points(
     projected = demand.forecast_series(series, horizon, method, cfg.croston_alpha)
     points: list[dict] = []
     for (y, m), amount in zip(future_months(as_of, horizon), projected, strict=True):
-        points.append({"SaleAmount": round(float(amount), 2), "MonthNameUK": month_name_uk(y, m)})
+        points.append({"SaleAmount": eur_cents(amount), "MonthNameUK": month_name_uk(y, m)})
     return points

@@ -30,7 +30,8 @@ def test_debt_followup_builds_task(monkeypatch):
     t = tasks[0]
     assert t.task_key == "mgr:1|client:10|type:debt_followup|win:2026-06"
     assert t.task_type.value == "debt_followup" and t.manager_id == 1 and t.client_id == 10
-    assert t.contact.phone == "+380" and t.priority > 0
+    assert t.contact.phone == "+380"
+    assert 0.0 <= t.priority <= 100.0
     assert t.urgency.value in {"critical", "high", "normal", "low"}
     # model-scored fields are stamped and consistent: priority == 100*p_outcome, ev_score ~= p*ev
     # (ev_score is computed from the unrounded probability inside score_task, hence approx).

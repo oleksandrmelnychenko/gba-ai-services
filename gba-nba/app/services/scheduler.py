@@ -9,6 +9,7 @@ Run as a dedicated process:  python -m app.services.scheduler
 """
 from __future__ import annotations
 
+import time
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.blocking import BlockingScheduler
@@ -29,13 +30,35 @@ def _job() -> None:
         log.error("daily_generation_failed", error=str(exc))
 
 
+_CATCHUP_MAX_BACKOFF_S = 600.0
+
+
+def _startup_catchup() -> None:
+    """Catch-up run on startup so the inbox isn't empty until the first scheduled fire.
+    Unlike the scheduled _job, a failure here (e.g. MSSQL still coming up after a host reboot)
+    is RETRIED with exponential backoff capped at 10 min, until a run succeeds — otherwise a
+    boot-order race would silently leave every inbox empty until 09:00."""
+    delay = 60.0
+    while True:
+        try:
+            stats = worker.run()
+        except Exception as exc:  # noqa: BLE001
+            log.error("startup_catchup_failed", error=str(exc), retry_in_s=int(delay))
+        else:
+            if stats["managers"] == 0 or stats["ok"] > 0:
+                log.info("startup_catchup_done", **stats)
+                return
+            log.error("startup_catchup_all_managers_failed", retry_in_s=int(delay), **stats)
+        time.sleep(delay)
+        delay = min(delay * 2, _CATCHUP_MAX_BACKOFF_S)
+
+
 def main() -> None:
     s = get_settings()
     tz = ZoneInfo(s.timezone)
     log.info("scheduler_starting", hour=s.daily_generate_hour, tz=s.timezone)
 
-    # catch-up run on startup so the inbox isn't empty until the first scheduled fire
-    _job()
+    _startup_catchup()
 
     scheduler = BlockingScheduler(timezone=tz)
     scheduler.add_job(

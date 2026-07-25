@@ -17,12 +17,15 @@ from app.core.metrics import METRICS
 
 log = get_logger("cache")
 
+# v7: canonical cart is full, product-deduplicated and Decimal-cent reconciled;
+# v6: readiness is input-aware and cached plans carry a source-state fingerprint;
 # v5: ReorderSuggestion gained product meta (name/oe/image);
 # v4: ReorderSuggestion gained proof fields (lead_demand/order_up_to/producer_name);
 # v3: /plan/cart keys became only_needed-aware (a shared v2 key could hold either
 # variant's plan for 8 days) — the bump kills all stale entries; scheduler re-warms.
-_VER = "v5"
+_VER = "v7"
 _RETRY_COOLDOWN_S = 30.0
+_CART_NOT_READY_TTL_S = 60
 _client: redis.Redis | None = None
 _unavailable_until = 0.0
 
@@ -85,6 +88,68 @@ def set(key: str, value: dict[str, Any], ttl: int | None = None) -> None:
         log.warning("cache_set_failed", error=str(exc))
 
 
+def delete(key: str) -> bool:
+    client = _get_client()
+    if client is None:
+        return False
+    try:
+        return bool(client.delete(key))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("cache_delete_failed", key=key, error=str(exc))
+        return False
+
+
+def cart_not_ready_key(as_of: str) -> str:
+    return make_key("cartguard", "canonical", as_of)
+
+
+def mark_cart_not_ready(
+    as_of: str,
+    reason: str,
+    *,
+    candidate_count: int,
+    item_count: int,
+) -> None:
+    """Short negative-cache marker for broken canonical data.
+
+    It protects the database from repeated cold rebuilds while keeping the actual
+    canonical plan key absent. The scheduler can retry independently on its next pass.
+    """
+    set(
+        cart_not_ready_key(as_of),
+        {
+            "business_ready": False,
+            "reason": reason,
+            "candidate_count": candidate_count,
+            "item_count": item_count,
+            "recorded_at_unix": int(time.time()),
+        },
+        ttl=_CART_NOT_READY_TTL_S,
+    )
+
+
+def get_cart_not_ready(as_of: str) -> dict[str, Any] | None:
+    marker = get(cart_not_ready_key(as_of))
+    if marker is None or marker.get("business_ready") is not False:
+        return None
+    return marker
+
+
+def clear_cart_not_ready(as_of: str) -> bool:
+    return delete(cart_not_ready_key(as_of))
+
+
+def exists(key: str) -> bool:
+    client = _get_client()
+    if client is None:
+        return False
+    try:
+        return bool(client.exists(key))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("cache_exists_failed", error=str(exc))
+        return False
+
+
 def invalidate_plans(producer_id: int | None = None) -> int:
     """Drop cached plans so masters/feedback edits reach the very next request.
 
@@ -99,6 +164,7 @@ def invalidate_plans(producer_id: int | None = None) -> int:
         f"procure:{_VER}:producer:{producer_part}:*",
         f"procure:{_VER}:cart:*",
         f"procure:{_VER}:cartbudget:*",
+        f"procure:{_VER}:cartguard:*",
         f"procure:{_VER}:charts:*",
     )
     try:

@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from app.clients import reco_client
 from app.core.config import get_settings
 from app.core.logging import get_logger
+from app.data import mongo
 from app.data import signals_repository as sig
 from app.services import lifecycle, orchestrator
 
@@ -42,6 +43,14 @@ def run(as_of: str | None = None, limit: int | None = None) -> dict:
         managers = managers[:limit]
     log.info("regen_start", managers=len(managers), as_of=as_of)
 
+    # close orphans BEFORE generating: dead-client tasks otherwise keep consuming the
+    # per-manager active cap and starve regeneration after a wipe/re-mint.
+    try:
+        orphaned = lifecycle.sweep_orphaned()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("orphan_sweep_skipped", error=str(exc))
+        orphaned = 0
+
     try:
         fb = push_reco_feedback()
     except Exception as exc:  # noqa: BLE001
@@ -67,10 +76,12 @@ def run(as_of: str | None = None, limit: int | None = None) -> dict:
 
     stats = {"managers": len(managers), "ok": ok, "failed": failed,
              "tasks_persisted": total_persisted, "snoozed_woken": woken,
+             "orphaned_closed": orphaned,
              "sla_breached": sla["flagged"], "sla_escalated": sla["escalated"],
              "expired_purged": expired, "reco_feedback_clients": fb["clients"],
              "reco_feedback_products": fb["products"],
              "duration_s": round(time.time() - started, 1), "as_of": as_of}
+    mongo.record_generation_run(stats, full_run=limit is None)
     log.info("regen_done", **stats)
     return stats
 

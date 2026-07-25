@@ -6,7 +6,7 @@ EUR-correct debt aggregation (value_at_risk + aging buckets) the manager DTO is 
 from __future__ import annotations
 
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import mongomock
 import pytest
@@ -92,7 +92,8 @@ def test_manager_dashboard_shape_and_mix(client):
     assert resp.status_code == 200
     body = resp.json()
     assert body["manager_id"] == 1
-    assert set(body) == {"manager_id", "as_of", "task_type_mix", "urgency_mix",
+    assert body["manager_net_uid"] == MGR_UID.lower()
+    assert set(body) == {"manager_id", "manager_net_uid", "as_of", "task_type_mix", "urgency_mix",
                          "value_at_risk_eur", "debt_aging", "completed_vs_open"}
 
     type_mix = {r["type"]: r["count"] for r in body["task_type_mix"]}
@@ -144,11 +145,40 @@ def test_manager_dashboard_malformed_as_of_date_422(client):
     assert resp.status_code == 422
 
 
-def test_manager_dashboard_iso_as_of_date_ok(client):
+def test_manager_dashboard_rejects_historical_as_of_date(client):
     resp = client.get("/cockpit/dashboard",
                       params={"manager_net_uid": MGR_UID, "as_of_date": "2026-06-15"})
-    assert resp.status_code == 200
-    assert resp.json()["as_of"] == "2026-06-15"
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "historical_as_of_not_supported_for_current_task_state"
+
+
+def test_manager_dashboard_passes_resolved_kyiv_date_to_task_month(client, monkeypatch):
+    from app.api import main
+
+    captured = {}
+    monkeypatch.setattr(main, "_kyiv_today", lambda: date(2026, 8, 1))
+    monkeypatch.setattr(
+        main.lifecycle,
+        "dashboard_counts",
+        lambda manager_id, as_of: captured.update(
+            {"manager_id": manager_id, "as_of": as_of}
+        )
+        or {
+            "task_type_mix": [],
+            "urgency_mix": [],
+            "completed_vs_open": [],
+        },
+    )
+    monkeypatch.setattr(main, "_debt_dashboards_cached", lambda as_of: {})
+
+    response = client.get(
+        "/cockpit/dashboard",
+        params={"manager_net_uid": MGR_UID, "as_of_date": "2026-08-01"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["as_of"] == "2026-08-01"
+    assert captured == {"manager_id": 1, "as_of": "2026-08-01"}
 
 
 def test_debt_dashboard_cache_never_reuses_another_as_of(monkeypatch):
@@ -185,7 +215,9 @@ def test_head_dashboard_shape(client):
     assert resp.status_code == 200
     body = resp.json()
     assert body["is_head"] is True
-    assert set(body) == {"is_head", "as_of", "teams", "escalated_count", "total_value_at_risk_eur"}
+    assert body["requested_manager_net_uid"] == HEAD_UID.lower()
+    assert set(body) == {"is_head", "requested_manager_net_uid", "as_of", "teams",
+                         "escalated_count", "total_value_at_risk_eur"}
     teams = {t["manager_id"]: t for t in body["teams"]}
     assert set(teams[1]) == {"manager_id", "open_tasks", "critical", "value_at_risk_eur"}
     assert teams[1]["open_tasks"] == 2
@@ -203,6 +235,7 @@ def test_head_dashboard_non_head_benign(client):
     assert resp.status_code == 200
     body = resp.json()
     assert body["is_head"] is False
+    assert body["requested_manager_net_uid"] == MGR_UID.lower()
     assert body["teams"] == []
     assert body["escalated_count"] == 0
     assert body["total_value_at_risk_eur"] == 0.0

@@ -3,6 +3,8 @@ resolution helpers' return shapes; the SQL strings themselves are exercised live
 """
 from __future__ import annotations
 
+from decimal import Decimal
+
 from app.data import pricing_repository as repo
 
 
@@ -10,7 +12,7 @@ def test_unit_cost_prefers_median_onhand(monkeypatch):
     monkeypatch.setattr(repo, "query", lambda *a, **k: [
         {"median_cost": 10.5, "lot_count": 4, "latest_cost": 99.0}])
     out = repo.unit_cost_eur(123)
-    assert out["unit_cost_eur"] == 10.5
+    assert out["unit_cost_eur"] == Decimal("10.5")
     assert out["cost_source"] == "median_onhand"
     assert out["lot_count"] == 4
 
@@ -19,7 +21,7 @@ def test_unit_cost_falls_back_to_latest_lot(monkeypatch):
     monkeypatch.setattr(repo, "query", lambda *a, **k: [
         {"median_cost": None, "lot_count": 0, "latest_cost": 22.0}])
     out = repo.unit_cost_eur(123)
-    assert out["unit_cost_eur"] == 22.0
+    assert out["unit_cost_eur"] == Decimal("22.0")
     assert out["cost_source"] == "latest_lot"
 
 
@@ -32,6 +34,7 @@ def test_unit_cost_none_when_no_lot(monkeypatch):
 
 
 def test_resolve_product_by_id(monkeypatch):
+    monkeypatch.setattr(repo, "synthetic_product_id", lambda: 999)
     monkeypatch.setattr(repo, "query", lambda *a, **k: [
         {"ID": 5, "NetUID": "abc"}])
     out = repo.resolve_product(5, None)
@@ -39,6 +42,7 @@ def test_resolve_product_by_id(monkeypatch):
 
 
 def test_resolve_product_missing(monkeypatch):
+    monkeypatch.setattr(repo, "synthetic_product_id", lambda: 999)
     monkeypatch.setattr(repo, "query", lambda *a, **k: [])
     assert repo.resolve_product(None, "missing") is None
     assert repo.resolve_product(None, None) is None
@@ -65,7 +69,12 @@ def test_peer_band_shape(monkeypatch):
     monkeypatch.setattr(repo, "query", lambda *a, **k: [
         {"p25": 8.35, "p50": 8.64, "p75": 8.91, "n": 66}])
     out = repo.peer_band(25348486, "2026-06-15", 12, "2026-06-15")
-    assert out == {"p25": 8.35, "p50": 8.64, "p75": 8.91, "n": 66}
+    assert out == {
+        "p25": Decimal("8.35"),
+        "p50": Decimal("8.64"),
+        "p75": Decimal("8.91"),
+        "n": 66,
+    }
 
 
 def test_peer_band_passes_mad_params(monkeypatch):
@@ -97,7 +106,7 @@ def test_base_list_markup_reads_agreement_tier_extra_charge(monkeypatch):
         "base_price": 32.22, "extra_charge": 30.0,
         "base_pricing_id": 845, "culture": "uk"}])
     out = repo.base_list_price_and_markup(26161448, 22)
-    assert out["base_price"] == 32.22
+    assert out["base_price"] == Decimal("32.22")
     assert out["extra_charge"] == 30.0
     assert out["base_pricing_id"] == 845
     assert out["culture"] == "uk"
@@ -126,3 +135,41 @@ def test_active_group_discount(monkeypatch):
     assert repo.active_group_discount(11, 106) == 8.5
     monkeypatch.setattr(repo, "query", lambda *a, **k: [])
     assert repo.active_group_discount(11, 106) is None
+
+
+def test_resolve_product_requires_live_matching_non_synthetic_identity(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(repo, "synthetic_product_id", lambda: 777)
+
+    def fake_query(sql, params=None):
+        captured["sql"] = sql
+        captured["params"] = params
+        return [{"ID": 5, "NetUID": "abc"}]
+
+    monkeypatch.setattr(repo, "query", fake_query)
+    assert repo.resolve_product(5, "abc") == {"id": 5, "net_uid": "abc"}
+    assert "p.Deleted = 0" in captured["sql"]
+    assert "p.ID <> :synthetic" in captured["sql"]
+    assert "p.ID = :pid" in captured["sql"]
+    assert "p.NetUID = :uid" in captured["sql"]
+    assert captured["params"] == {"pid": 5, "uid": "abc", "synthetic": 777}
+
+
+def test_resolve_product_defensively_rejects_dynamic_synthetic_row(monkeypatch):
+    monkeypatch.setattr(repo, "synthetic_product_id", lambda: 777)
+    monkeypatch.setattr(
+        repo,
+        "query",
+        lambda *a, **k: [{"ID": 777, "NetUID": "debt-uid"}],
+    )
+    assert repo.resolve_product(777, None) is None
+
+
+def test_repository_money_aggregates_remain_decimal(monkeypatch):
+    monkeypatch.setattr(repo, "synthetic_product_id", lambda: 999)
+    monkeypatch.setattr(
+        repo,
+        "query",
+        lambda *a, **k: [{"baseline_price": 1.005}],
+    )
+    assert repo.baseline_price("p", "ca", "uk", True) == Decimal("1.005")

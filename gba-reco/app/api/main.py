@@ -6,16 +6,18 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import date
+from typing import Annotated, Literal, Self
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Path, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.core.metrics import METRICS
 from app.data import cache
+from app.data import sales_repository as repo
 from app.data.db import dispose, get_engine
 from app.domain.models import ProductRec, RecommendationResult, RecSource
 from app.services.recommendations import copurchase, service
@@ -27,6 +29,7 @@ _COPURCHASE_TTL = 24 * 3600
 
 # Routes reachable without the internal key (operational endpoints).
 _OPEN_PATHS = {"/health"}
+PositiveId = Annotated[int, Field(gt=0)]
 
 
 @asynccontextmanager
@@ -67,7 +70,7 @@ async def timing(request: Request, call_next):
 
 
 class RecommendRequest(BaseModel):
-    customer_id: int = Field(..., description="dbo.ClientAgreement.ClientID")
+    customer_id: PositiveId = Field(..., description="dbo.Client.ID")
     top_n: int = Field(default=25, ge=1, le=200)
     as_of_date: date | None = None
     include_discovery: bool = True
@@ -78,26 +81,44 @@ class RecommendRequest(BaseModel):
         "(Client.RegionID). Opt-in; off = identical to prior behaviour. Measured neutral on "
         "the offline eval (see docs/eval-baseline.md) — do not enable as a default.",
     )
-    product_ids: list[int] | None = Field(
+    product_ids: list[PositiveId] | None = Field(
         default=None, max_length=50,
         description="copurchase only: explicit co-occurrence seeds (per-cart-line cross-sell) "
         "instead of the client's own purchase history",
     )
 
+    @model_validator(mode="after")
+    def unique_product_ids(self) -> Self:
+        if self.product_ids and len(self.product_ids) != len(set(self.product_ids)):
+            raise ValueError("product_ids must be unique")
+        return self
+
 
 class BatchRequest(BaseModel):
-    customer_ids: list[int] = Field(..., min_length=1, max_length=500)
+    customer_ids: list[PositiveId] = Field(..., min_length=1, max_length=500)
     top_n: int = Field(default=25, ge=1, le=200)
     as_of_date: date | None = None
     include_discovery: bool = True
     use_cache: bool = True
     region_scope: bool = False
 
+    @model_validator(mode="after")
+    def unique_customer_ids(self) -> Self:
+        if len(self.customer_ids) != len(set(self.customer_ids)):
+            raise ValueError("customer_ids must be unique")
+        return self
+
 
 class FeedbackRequest(BaseModel):
-    customer_id: int = Field(..., description="dbo.ClientAgreement.ClientID")
-    product_ids: list[int] = Field(..., min_length=1, max_length=200)
-    kind: str = Field(default="reject", description="negative feedback signal type")
+    customer_id: PositiveId = Field(..., description="dbo.Client.ID")
+    product_ids: list[PositiveId] = Field(..., min_length=1, max_length=200)
+    kind: Literal["reject"] = Field(default="reject", description="negative feedback signal type")
+
+    @model_validator(mode="after")
+    def unique_product_ids(self) -> Self:
+        if len(self.product_ids) != len(set(self.product_ids)):
+            raise ValueError("product_ids must be unique")
+        return self
 
 
 @app.get("/health")
@@ -108,13 +129,38 @@ def health() -> dict:
             c.exec_driver_sql("SELECT 1")
     except Exception:
         db_ok = False
+    redis_ok = cache.health()
+    source = {
+        "business_ready": False,
+        "reasons": ["database_unavailable"],
+        "latest_sale_at": None,
+        "stocked_product_count": 0,
+        "sellable_storage_count": 0,
+        "synthetic_product_count": 0,
+    }
+    if db_ok:
+        try:
+            source = repo.source_readiness(settings.max_source_lag_days)
+        except Exception as exc:  # noqa: BLE001
+            log.error("source_readiness_failed", error=str(exc))
+            source["reasons"] = ["source_readiness_failed"]
+    healthy = db_ok and redis_ok and bool(source["business_ready"])
     return {
-        "status": "healthy" if db_ok else "degraded",
+        "status": "healthy" if healthy else "degraded",
         "db_connected": db_ok,
-        "redis_connected": cache.health(),
+        "redis_connected": redis_ok,
+        **source,
         "version": "0.1.0",
         "model_version": cache._MODEL_VERSION,
     }
+
+
+@app.get("/ready")
+def ready() -> JSONResponse:
+    payload = health()
+    is_ready = payload["status"] == "healthy"
+    payload["status"] = "ready" if is_ready else "not_ready"
+    return JSONResponse(status_code=200 if is_ready else 503, content=payload)
 
 
 @app.get("/metrics")
@@ -132,6 +178,8 @@ def recommend(req: RecommendRequest) -> RecommendationResult:
             include_discovery=req.include_discovery, use_cache=req.use_cache,
             region_scope=req.region_scope,
         )
+    except service.UnknownCustomerError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         error_id = uuid.uuid4().hex
         log.error("recommend_failed", customer_id=req.customer_id, error_id=error_id, error=str(exc))
@@ -143,7 +191,16 @@ def recommend_copurchase(req: RecommendRequest) -> RecommendationResult:
     """Item-item co-purchase recommender — the discovery source for cross-sell (faster than the
     v3.2 user-Jaccard and competitive in eval). Synthetic/ubiquitous lines already excluded."""
     as_of = req.as_of_date.isoformat() if req.as_of_date else time.strftime("%Y-%m-%d")
+    if not repo.client_exists(req.customer_id):
+        raise HTTPException(status_code=404, detail=f"customer {req.customer_id} was not found")
     seeds = sorted(set(req.product_ids)) if req.product_ids else None
+    if seeds:
+        missing = sorted(set(seeds) - repo.active_product_ids(seeds))
+        if missing:
+            raise HTTPException(
+                status_code=404,
+                detail={"message": "seed products were not found", "product_ids": missing},
+            )
     key = cache.make_copurchase_key(req.customer_id, as_of, req.top_n)
     if seeds:
         key = f"{key}:s{','.join(map(str, seeds))}"
@@ -156,7 +213,10 @@ def recommend_copurchase(req: RecommendRequest) -> RecommendationResult:
                            segment=r["segment"], source=RecSource(r["source"]))
                 for r in cached["recommendations"]
             ]
-            return RecommendationResult(**cached)
+            result = RecommendationResult(**cached)
+            if result.customer_id != req.customer_id or result.as_of_date != as_of:
+                raise HTTPException(status_code=503, detail="cached recommendation identity mismatch")
+            return result
     try:
         result = copurchase.recommend(req.customer_id, as_of, top_n=req.top_n, include_owned=False,
                                       seed_product_ids=seeds)
@@ -208,15 +268,26 @@ def feedback(req: FeedbackRequest) -> dict:
     """Record negative feedback (products a downstream consumer judged a bad recommendation for a
     customer) so the recommender excludes them. Invalidates the customer's copurchase cache so the
     exclusion takes effect on the next call. Used by gba-nba when a manager dismisses / fails to
-    sell a cross-sell task."""
+    sell a cross-sell task.
+
+    Stored under the Client.NetUID / Product.VendorCode natural keys (survives catalog re-mints);
+    `added`/`total_negatives` therefore count distinct VendorCodes, not raw ids."""
+    if not repo.client_exists(req.customer_id):
+        raise HTTPException(status_code=404, detail=f"customer {req.customer_id} was not found")
+    missing = sorted(set(req.product_ids) - repo.active_product_ids(req.product_ids))
+    if missing:
+        raise HTTPException(
+            status_code=404,
+            detail={"message": "products were not found", "product_ids": missing},
+        )
     added = cache.add_negatives(req.customer_id, req.product_ids, ttl=settings.feedback_ttl)
     cache.invalidate_copurchase(req.customer_id)
     log.info("feedback", customer_id=req.customer_id, kind=req.kind,
              products=len(req.product_ids), added=added)
-    total = len(cache.get_negatives(req.customer_id))
+    total = len(cache.get_negative_vendor_codes(req.customer_id))
     return {"customer_id": req.customer_id, "added": added, "total_negatives": total}
 
 
 @app.delete("/cache/{customer_id}")
-def clear_cache(customer_id: int) -> dict:
+def clear_cache(customer_id: int = Path(gt=0)) -> dict:
     return {"deleted": cache.invalidate_customer(customer_id)}

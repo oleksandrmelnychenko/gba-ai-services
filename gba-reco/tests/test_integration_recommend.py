@@ -7,7 +7,8 @@ after exporting DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD (+ REDIS_DB).
 These assert the just-fixed correctness behaviour against real entities — the failures the
 mocked unit tests could never catch:
 - a HEAVY client and a LIGHT client both reach top_n real recommendations (count == top_n);
-- the synthetic debt-entry line 25422404 never appears in results (explicit exclusion);
+- the synthetic debt-entry line («Ввід боргів», resolved by name — re-syncs re-mint its id)
+  never appears in results (explicit exclusion);
 - the co-purchase recommender returns sane, real, non-synthetic items.
 """
 from __future__ import annotations
@@ -21,13 +22,19 @@ pytestmark = pytest.mark.integration
 if not os.getenv("DB_PASSWORD"):
     pytest.skip("integration: DB env not configured", allow_module_level=True)
 
-from app.core.config import get_settings  # noqa: E402
+from app.data import sales_repository  # noqa: E402
 from app.data.db import query  # noqa: E402
 from app.services.recommendations import copurchase, recommender  # noqa: E402
 
 AS_OF = "2026-06-15"
 TOP_N = 10
-SYNTHETIC_ID = 25422404
+
+
+@pytest.fixture(scope="module")
+def synthetic_id() -> int:
+    ids = sales_repository.synthetic_product_ids()
+    assert ids, "debt-entry line («Ввід боргів») could not be resolved by name in dev DB"
+    return max(ids)
 
 
 def _clients_by_order_volume() -> list[dict]:
@@ -57,7 +64,7 @@ def clients() -> dict[str, int]:
     return {"heavy": int(heavy), "light": int(light_rows[0]["cid"])}
 
 
-def test_synthetic_id_is_load_bearing_in_dev_db():
+def test_synthetic_id_is_load_bearing_in_dev_db(synthetic_id):
     rows = query(
         """
         SELECT COUNT(DISTINCT ca.ClientID) AS clients
@@ -66,40 +73,54 @@ def test_synthetic_id_is_load_bearing_in_dev_db():
         JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
         WHERE oi.IsValidForCurrentSale = 1 AND oi.ProductID = :pid
         """,
-        {"pid": SYNTHETIC_ID},
+        {"pid": synthetic_id},
     )
     assert rows[0]["clients"] > 100, (
-        "25422404 should be a widely-bought synthetic line — if it isn't, the exclusion "
-        "assertions below are no longer load-bearing and the fixture must be revisited"
+        "the debt-entry line should be a widely-bought synthetic line — if it isn't, the "
+        "exclusion assertions below are no longer load-bearing and the fixture must be revisited"
     )
-    assert SYNTHETIC_ID in get_settings().synthetic_product_ids
 
 
-def test_heavy_client_reaches_top_n_and_excludes_synthetic(clients):
+def test_heavy_client_reaches_top_n_and_excludes_synthetic(clients, synthetic_id):
     res = recommender.recommend(clients["heavy"], as_of_date=AS_OF, top_n=TOP_N)
     assert res.segment == "HEAVY", f"expected HEAVY, got {res.segment}"
     assert res.count == TOP_N, f"HEAVY client must reach top_n; got {res.count}"
     pids = [r.product_id for r in res.recommendations]
-    assert SYNTHETIC_ID not in pids, "synthetic line 25422404 leaked into HEAVY recs"
+    assert synthetic_id not in pids, "synthetic debt-entry line leaked into HEAVY recs"
     assert len(set(pids)) == len(pids), "duplicate product ids in recs"
     assert all(r.product_id > 0 for r in res.recommendations)
+    assert sales_repository.in_stock_product_ids(pids) == set(pids)
 
 
-def test_light_client_reaches_top_n_and_excludes_synthetic(clients):
+def test_light_client_reaches_top_n_and_excludes_synthetic(clients, synthetic_id):
     res = recommender.recommend(clients["light"], as_of_date=AS_OF, top_n=TOP_N)
     assert res.segment == "LIGHT", f"expected LIGHT, got {res.segment}"
     assert res.count == TOP_N, f"LIGHT client must reach top_n via backfill; got {res.count}"
     pids = [r.product_id for r in res.recommendations]
-    assert SYNTHETIC_ID not in pids, "synthetic line 25422404 leaked into LIGHT recs"
+    assert synthetic_id not in pids, "synthetic debt-entry line leaked into LIGHT recs"
     assert len(set(pids)) == len(pids), "duplicate product ids in recs"
+    assert sales_repository.in_stock_product_ids(pids) == set(pids)
 
 
-def test_copurchase_returns_sane_items(clients):
+def test_copurchase_returns_sane_items(clients, synthetic_id):
     res = copurchase.recommend(clients["heavy"], AS_OF, top_n=TOP_N, include_owned=False)
     assert res.count > 0, "copurchase returned nothing for a HEAVY client"
     pids = [r.product_id for r in res.recommendations]
-    assert SYNTHETIC_ID not in pids, "synthetic line 25422404 leaked into copurchase items"
+    assert synthetic_id not in pids, "synthetic debt-entry line leaked into copurchase items"
     assert len(set(pids)) == len(pids), "duplicate product ids in copurchase items"
+    assert sales_repository.in_stock_product_ids(pids) == set(pids)
     scores = [r.score for r in res.recommendations]
     assert all(s > 0 for s in scores), "copurchase scores must be positive"
     assert scores == sorted(scores, reverse=True), "copurchase items must be score-ranked"
+
+
+def test_recommendation_is_deterministic_for_same_snapshot(clients):
+    first = recommender.recommend(clients["heavy"], as_of_date=AS_OF, top_n=TOP_N)
+    second = recommender.recommend(clients["heavy"], as_of_date=AS_OF, top_n=TOP_N)
+    assert [
+        (item.product_id, item.score, item.rank, item.source)
+        for item in first.recommendations
+    ] == [
+        (item.product_id, item.score, item.rank, item.source)
+        for item in second.recommendations
+    ]

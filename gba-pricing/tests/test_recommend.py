@@ -3,6 +3,8 @@ assembler against the LOCKED spec (clamp, loss flag, discount cap, confidence ba
 peer-only path)."""
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 
 from app.domain.models import Confidence
@@ -10,8 +12,8 @@ from app.services.pricing import recommend as engine
 
 
 def test_price_floor_applies_target_margin():
-    assert engine.price_floor(10.0, 12.0) == pytest.approx(11.2)
-    assert engine.price_floor(10.0, 0.0) == 10.0
+    assert engine.price_floor(10.0, 12.0) == Decimal("11.2")
+    assert engine.price_floor(10.0, 0.0) == Decimal("10")
 
 
 def test_price_floor_none_when_no_cost():
@@ -53,7 +55,7 @@ def test_recommended_no_cost_peer_only_capped_at_baseline():
 
 def test_recommended_no_peer_falls_back_to_floor_or_baseline():
     rec = engine.recommended_price(floor=11.2, peer_p50=None, baseline=20.0)
-    assert rec.value == 11.2
+    assert rec.value == Decimal("11.2")
     assert rec.rationale == engine.R_MARGIN_FLOOR
     rec2 = engine.recommended_price(floor=None, peer_p50=None, baseline=20.0)
     assert rec2.value == 20.0
@@ -73,8 +75,8 @@ def test_recommended_no_baseline_returns_none():
 
 
 def test_discount_from_price_reproduces_engine_lever():
-    assert engine.discount_from_price(18.5, 20.0) == pytest.approx(7.5)
-    assert engine.discount_from_price(20.0, 20.0) == pytest.approx(0.0)
+    assert engine.discount_from_price(18.5, 20.0) == Decimal("7.5")
+    assert engine.discount_from_price(20.0, 20.0) == Decimal("0")
 
 
 def test_discount_from_price_guards_bad_denominator():
@@ -135,10 +137,15 @@ def test_confidence_low_when_baseline_missing_or_nonpositive():
 
 
 def test_margin_pct_at_recommended():
-    assert engine.margin_pct_at(20.0, 10.0) == pytest.approx(50.0)
+    assert engine.margin_pct_at(20.0, 10.0) == Decimal("50")
     assert engine.margin_pct_at(None, 10.0) is None
     assert engine.margin_pct_at(20.0, None) is None
     assert engine.margin_pct_at(0.0, 10.0) is None
+
+
+def test_accounting_rounding_is_half_up_not_binary_bankers_rounding():
+    assert engine._round2(Decimal("1.005")) == 1.01
+    assert engine._round2(1.005) == 1.01
 
 
 def test_rationale_surfaces_discount_cap_over_peer_median():
@@ -191,6 +198,19 @@ def test_assembler_happy_path_peer_median():
         <= reco.discount_band.target_pct
         <= reco.discount_band.max_pct
     )
+
+
+def test_assembler_rounds_every_money_field_half_up_at_api_boundary():
+    reco = _build(
+        baseline=Decimal("1.005"),
+        marked_up=Decimal("1.005"),
+        cost={"unit_cost_eur": None, "lot_count": 0, "cost_source": "none"},
+        peer={"p25": None, "p50": None, "p75": None, "n": 0},
+        segment={"p75": None, "p90": None, "n": 0},
+        target_margin_pct=Decimal("0"),
+    )
+    assert reco.baseline_price == 1.01
+    assert reco.recommended_price == 1.01
 
 
 def test_assembler_loss_flag_when_floor_above_baseline():

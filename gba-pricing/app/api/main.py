@@ -18,6 +18,7 @@ from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.core.metrics import METRICS
 from app.data import cache
+from app.data import pricing_repository as repo
 from app.data.db import dispose, get_engine
 from app.domain.models import (
     BatchPriceRequest,
@@ -28,7 +29,7 @@ from app.domain.models import (
 settings = get_settings()
 log = get_logger("api")
 
-_OPEN_PATHS = {"/health"}
+_OPEN_PATHS = {"/health", "/ready"}
 
 
 def _is_valid_uid(value: str | None) -> bool:
@@ -53,6 +54,8 @@ def _service():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     get_engine()  # warm pool
+    from app.data import pricing_repository as repo
+    repo.synthetic_product_id()
     if not settings.internal_api_key:
         log.warning("internal_api_key_not_set", note="gba-pricing running OPEN — set INTERNAL_API_KEY")
     log.info("service_starting", model_version=settings.model_version, port=settings.api_port)
@@ -91,19 +94,51 @@ async def timing(request: Request, call_next):
 
 @app.get("/health")
 def health() -> dict:
+    return _health_snapshot()
+
+
+def _health_snapshot() -> dict:
     db_ok = True
     try:
         with get_engine().connect() as c:
             c.exec_driver_sql("SELECT 1")
     except Exception:
         db_ok = False
+    redis_ok = cache.health()
+    source = {
+        "business_ready": False,
+        "reasons": ["database_unavailable"],
+    }
+    if db_ok:
+        try:
+            source = repo.source_readiness(settings.max_source_lag_days)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("source_readiness_failed", error=str(exc))
+            source = {
+                "business_ready": False,
+                "reasons": ["source_query_failed"],
+            }
+    business_ready = source.get("business_ready") is True
+    healthy = db_ok and redis_ok and business_ready
     return {
-        "status": "healthy" if db_ok else "degraded",
+        "status": "healthy" if healthy else "degraded",
+        "business_ready": business_ready,
         "db_connected": db_ok,
-        "redis_connected": cache.health(),
+        "redis_connected": redis_ok,
+        "source": source,
         "version": "0.1.0",
         "model_version": settings.model_version,
     }
+
+
+@app.get("/ready")
+def ready() -> JSONResponse:
+    snapshot = _health_snapshot()
+    is_ready = snapshot["status"] == "healthy"
+    return JSONResponse(
+        status_code=200 if is_ready else 503,
+        content={**snapshot, "status": "ready" if is_ready else "not_ready"},
+    )
 
 
 @app.get("/metrics")

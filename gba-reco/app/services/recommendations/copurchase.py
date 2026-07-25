@@ -76,7 +76,7 @@ def _cooccurring_products(seed_products: list[int], as_of: str, limit_seed: int 
         JOIN cand c ON c.cid = sc.cid
         GROUP BY sc.seed, c.cand
         HAVING COUNT(DISTINCT sc.cid) >= 2
-        ORDER BY COUNT(DISTINCT sc.cid) DESC
+        ORDER BY COUNT(DISTINCT sc.cid) DESC, sc.seed ASC, c.cand ASC
         """,
         {"asof": as_of, "cap": _COOC_ROW_CAP, **seed_params},
     )
@@ -154,7 +154,7 @@ def recommend(
         src = RecSource.REPURCHASE if pid in own_n else RecSource.DISCOVERY
         combined[pid] = (prev[0] + 0.4 * s, src)
 
-    ranked = sorted(combined.items(), key=lambda x: x[1][0], reverse=True)
+    ranked = sorted(combined.items(), key=lambda item: (-item[1][0], item[0]))
     if not include_owned:
         # discovery-only (new-to-client co-purchase items) — the cross-sell use case
         ranked = [item for item in ranked if item[1][1] == RecSource.DISCOVERY]
@@ -162,7 +162,11 @@ def recommend(
         # never recommend the seed itself (it is already in the caller's cart)
         seed_set = set(seed_product_ids)
         ranked = [item for item in ranked if item[0] not in seed_set]
-    ranked = ranked[:top_n]
+    # Every result must be actionable, including repurchase. One set-membership query over a
+    # bounded top-of-ranking window checks the canonical operational resale stock.
+    window = ranked[: max(top_n * 4, 100)]
+    stocked = repo.in_stock_product_ids([pid for pid, _ in window])
+    ranked = [item for item in window if item[0] in stocked][:top_n]
     recs = [
         ProductRec(product_id=pid, score=round(score, 4), rank=i + 1,
                    segment="COPURCHASE", source=src)
@@ -171,6 +175,10 @@ def recommend(
     # Translate dead catalog-generation ids onto live rows (see live_remap docstring).
     from app.services.recommendations import live_remap
     recs = live_remap.remap_recs_to_live(recs)
+    final_stock = repo.in_stock_product_ids([item.product_id for item in recs])
+    recs = [item for item in recs if item.product_id in final_stock]
+    for index, item in enumerate(recs, start=1):
+        item.rank = index
     discovery = sum(1 for r in recs if r.source == RecSource.DISCOVERY)
     latency = (datetime.now() - started).total_seconds() * 1000
     return RecommendationResult(

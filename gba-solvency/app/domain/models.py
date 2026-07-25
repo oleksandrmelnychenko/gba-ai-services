@@ -7,8 +7,11 @@ from __future__ import annotations
 import uuid
 from datetime import date
 from enum import IntEnum, StrEnum
+from typing import Self
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from app.domain.money import round_cent
 
 
 class SalePaymentStatusType(IntEnum):
@@ -45,6 +48,15 @@ class DebtLoadSource(StrEnum):
     LIVE_PROXY = "live_proxy"
 
 
+class DataSufficiency(StrEnum):
+    OK = "ok"
+    INSUFFICIENT = "insufficient"
+
+
+class ClientIdentityMismatchError(ValueError):
+    """Both supplied client identities exist but resolve to different entities."""
+
+
 class CapType(StrEnum):
     UTILIZATION_HARD_40 = "utilization_hard_40"
     UTILIZATION_SOFT_60 = "utilization_soft_60"
@@ -67,16 +79,21 @@ class SubFactors(BaseModel):
 
 
 class CurrencyExposure(BaseModel):
-    currency_id: int
-    turnover_eur: float
-    exposure_eur: float
+    currency_id: int = Field(gt=0)
+    turnover_eur: float = Field(ge=0.0, allow_inf_nan=False)
+    exposure_eur: float = Field(ge=0.0, allow_inf_nan=False)
+
+    @field_validator("turnover_eur", "exposure_eur", mode="before")
+    @classmethod
+    def _round_money(cls, value):
+        return float(round_cent(value))
 
 
 class Contribution(BaseModel):
     """One feature's signed points in the current-state scorecard (explainability)."""
     feature: str
-    value: float | None = None
-    points: float
+    value: float | None = Field(default=None, allow_inf_nan=False)
+    points: float = Field(allow_inf_nan=False)
 
 
 class ForwardRiskBand(StrEnum):
@@ -89,15 +106,25 @@ class ForwardRiskBand(StrEnum):
 class ForwardRisk(BaseModel):
     """6-month forward (early-warning) risk: band + PD from the forward scorecard."""
     band: ForwardRiskBand
-    pd: float
+    pd: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
 
 
 class SolvencyScore(BaseModel):
     client_id: int
+    client_net_uid: str | None = Field(
+        default=None,
+        description="canonical requested dbo.Client.NetUID for proxy identity validation",
+    )
     applicable: bool = True
     score: int | None = Field(default=None, ge=0, le=100)
     rating: Rating | None = None
-    pd: float | None = Field(default=None, description="current-state PD (0..1)")
+    pd: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        allow_inf_nan=False,
+        description="current-state PD (0..1)",
+    )
     contributions: list[Contribution] | None = None
     forward_risk: ForwardRisk | None = None
     sub_factors: SubFactors | None = None
@@ -107,15 +134,17 @@ class SolvencyScore(BaseModel):
         default=None, description="weighted sum * 100 before caps/rounding"
     )
     currency_breakdown: list[CurrencyExposure] | None = None
+    data_sufficiency: DataSufficiency = DataSufficiency.OK
+    data_sufficiency_reason: str | None = None
     as_of_date: str | None = None
     window_months: int = 12
     model_version: str = "creditscore-v3"
 
 
 class GaugeChart(BaseModel):
-    value: float
-    threshold_soft: float = 0.9
-    threshold_hard: float = 1.0
+    value: float = Field(ge=0.0, allow_inf_nan=False)
+    threshold_soft: float = Field(default=0.9, ge=0.0, allow_inf_nan=False)
+    threshold_hard: float = Field(default=1.0, ge=0.0, allow_inf_nan=False)
     label: str = "limit_utilization"
 
 
@@ -127,13 +156,23 @@ class DonutSlice(BaseModel):
 class AgingBar(BaseModel):
     bucket: str
     count: int
-    amount_eur: float | None = None
+    amount_eur: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+
+    @field_validator("amount_eur", mode="before")
+    @classmethod
+    def _round_money(cls, value):
+        return None if value is None else float(round_cent(value))
 
 
 class TurnoverExposurePoint(BaseModel):
     period: str
-    turnover_eur: float
-    exposure_eur: float
+    turnover_eur: float = Field(ge=0.0, allow_inf_nan=False)
+    exposure_eur: float = Field(ge=0.0, allow_inf_nan=False)
+
+    @field_validator("turnover_eur", "exposure_eur", mode="before")
+    @classmethod
+    def _round_money(cls, value):
+        return float(round_cent(value))
 
 
 class ScorePoint(BaseModel):
@@ -143,7 +182,12 @@ class ScorePoint(BaseModel):
 
 class TrendPoint(BaseModel):
     period: str
-    turnover_eur: float
+    turnover_eur: float = Field(ge=0.0, allow_inf_nan=False)
+
+    @field_validator("turnover_eur", mode="before")
+    @classmethod
+    def _round_money(cls, value):
+        return float(round_cent(value))
 
 
 class SolvencyCharts(BaseModel):
@@ -165,11 +209,19 @@ class SolvencyCharts(BaseModel):
 
 
 class ScoreRequest(BaseModel):
-    client_id: int | None = Field(default=None, description="dbo.ClientAgreement.ClientID")
+    client_id: int | None = Field(
+        default=None, gt=0, description="dbo.ClientAgreement.ClientID"
+    )
     client_net_uid: str | None = Field(default=None, description="dbo.Client.NetUID alternative")
     as_of_date: date | None = None
     window_months: int = Field(default=12, ge=1, le=60)
     use_cache: bool = True
+
+    @model_validator(mode="after")
+    def _require_client_identity(self) -> Self:
+        if self.client_id is None and self.client_net_uid is None:
+            raise ValueError("client_id or client_net_uid required")
+        return self
 
     @field_validator("client_net_uid")
     @classmethod
@@ -188,3 +240,12 @@ class BatchScoreRequest(BaseModel):
     as_of_date: date | None = None
     window_months: int = Field(default=12, ge=1, le=60)
     use_cache: bool = True
+
+    @field_validator("client_ids")
+    @classmethod
+    def _validate_client_ids(cls, values: list[int]) -> list[int]:
+        if any(value <= 0 for value in values):
+            raise ValueError("client_ids must contain only positive IDs")
+        if len(values) != len(set(values)):
+            raise ValueError("client_ids must not contain duplicates")
+        return values

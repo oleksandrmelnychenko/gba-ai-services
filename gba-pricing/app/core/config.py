@@ -25,7 +25,9 @@ class Settings(BaseSettings):
     redis_host: str = "127.0.0.1"
     redis_port: int = 6379
     redis_db: int = 3
-    cache_ttl: int = 3600
+    # Price-hint entries are as_of-keyed (the date is in the cache key), so the date rolls the
+    # cache daily on its own; ~25h TTL keeps a full day warm with overlap.
+    cache_ttl: int = 90000
 
     # API — port 8004 (8000 reco, 8001 procure, 8002 nba, 8003 solvency, 8004 pricing)
     api_host: str = "0.0.0.0"
@@ -45,6 +47,10 @@ class Settings(BaseSettings):
 
     # Pricing model (A+B: margin-floor + peer-price-band discount governor)
     model_version: str = "pricing-ab-v2"
+    # A green health/readiness response means the canonical sales source is present and current,
+    # not merely that MSSQL accepts connections. 31 days tolerates quiet holiday periods while
+    # still failing closed on a stopped 1C/sales synchronization.
+    max_source_lag_days: int = 31
     # Margin floor: recommended price never below unit_cost_eur*(1+target_margin_pct/100).
     target_margin_pct: float = 12.0
     # Peer band + cost lots are sampled over a trailing window by Sale.Created.
@@ -55,8 +61,10 @@ class Settings(BaseSettings):
     fx_snapshot_date: str = ""
 
     # Synthetic 1С debt-entry line ('Ввід боргів з 1С'): contaminates cost lots and realized
-    # price; EXCLUDED everywhere (cost, peer band, discount distribution).
-    synthetic_line_product_id: int = 25422404
+    # price; EXCLUDED everywhere (cost, peer band, discount distribution). The live ID is
+    # resolved dynamically (pricing_repository.synthetic_product_id, 1h cache — the row gets
+    # re-minted); this value is only the fallback when that lookup fails.
+    synthetic_line_product_id: int = 29555414
 
     # 1С debt/balance-import document type on dbo.ProductIncome.SourceDocumentType. These lots
     # carry inflated balance-import AccountingPrice (~800-26683 EUR) across BOTH

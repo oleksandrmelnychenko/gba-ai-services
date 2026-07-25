@@ -10,6 +10,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from app.core import exact_numbers as exact
 from app.domain.models import (
     MonthlySalesPoint,
     ProductAnalyticsDataQuality,
@@ -65,6 +66,8 @@ def build_product_analytics(
     monthly_rows: list[dict[str, Any]],
 ) -> ProductAnalyticsResponse:
     """Build a validated dense analytics response from sparse repository aggregates."""
+    if product_id <= 0:
+        raise ValueError("product_id must be positive")
     if not 1 <= months <= 24:
         raise ValueError("months must be between 1 and 24")
 
@@ -82,10 +85,19 @@ def build_product_analytics(
         if label in seen:
             raise ValueError(f"duplicate monthly sales bucket: {label}")
         seen.add(label)
+        units = _number(row.get("units"), "units")
+        order_count = _order_count(row.get("order_count"))
+        revenue = _number(row.get("revenue_eur"), "revenue_eur")
+        if units < 0 or revenue < 0:
+            raise ValueError("monthly sales quantities and revenue must be non-negative")
+        if order_count == 0 and (units != 0 or revenue != 0):
+            raise ValueError("monthly sales aggregate has values without an order")
+        if units == 0 and revenue != 0:
+            raise ValueError("monthly sales aggregate has revenue without quantity")
         buckets[label] = {
-            "units": _number(row.get("units"), "units"),
-            "order_count": _order_count(row.get("order_count")),
-            "revenue_eur": _number(row.get("revenue_eur"), "revenue_eur"),
+            "units": units,
+            "order_count": order_count,
+            "revenue_eur": revenue,
         }
 
     current_label = as_of[:7]
@@ -104,10 +116,14 @@ def build_product_analytics(
                 period_start=period_start.isoformat(),
                 period_end_exclusive=period_end.isoformat(),
                 is_complete=is_complete,
-                units=round(float(units), 2),
+                units=exact.quantity(units, "monthly units"),
                 order_count=bucket["order_count"],
-                revenue_eur=round(float(revenue), 2),
-                avg_price_eur=round(float(avg_price), 4) if avg_price is not None else None,
+                revenue_eur=exact.money(revenue, "monthly revenue_eur"),
+                avg_price_eur=(
+                    exact.unit_price(avg_price, "monthly avg_price_eur")
+                    if avg_price is not None
+                    else None
+                ),
             )
         )
 

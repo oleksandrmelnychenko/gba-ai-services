@@ -14,10 +14,16 @@ The window is bounded by Sale.Created in [as_of - window_months, as_of].
 """
 from __future__ import annotations
 
+import threading
+import time
+from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 from app.core.config import get_settings
 from app.data.db import in_clause, query
+from app.data.synthetic_product import synthetic_product_ids
+from app.domain.money import as_decimal, round_cent
 
 # Regular-sale payment statuses (SalePaymentStatusType). Mapped, never hardcoded inline.
 _SALE_PAID = (1, 2)          # Paid, Overpaid
@@ -25,13 +31,103 @@ _SALE_PARTIAL = (3,)         # PartialPaid
 _SALE_NOTPAID = (0,)         # NotPaid
 _SALE_REFUND = (4,)          # Refund -> EXCLUDED from the discipline ratio
 _SALE_OPEN_UNPAID = (0, 3)   # NotPaid + PartialPaid -> open exposure proxy
+_READINESS_TTL_S = 60.0
+_readiness_lock = threading.Lock()
+_readiness_state: dict[int, tuple[float, dict[str, Any]]] = {}
 
 
 def _synthetic_not_in() -> tuple[str, dict[str, Any]]:
-    """Parameterized 'NOT IN (...)' over every configured synthetic 1С debt-entry ProductID."""
-    ids = sorted(get_settings().synthetic_line_product_ids)
+    """Parameterized 'NOT IN (...)' over every effective synthetic 1С debt-entry ProductID."""
+    ids = sorted(synthetic_product_ids())
     placeholder, params = in_clause("synthetic", ids)
     return placeholder, params
+
+
+def source_readiness(max_lag_days: int) -> dict[str, Any]:
+    """Factual source probe used by health/readiness.
+
+    It verifies a current canonical sales spine, buyer population, the live debt source and
+    exactly one dynamically resolved synthetic debt-entry product.
+    """
+    now_mono = time.monotonic()
+    with _readiness_lock:
+        cached = _readiness_state.get(max_lag_days)
+        if cached is not None and now_mono - cached[0] < _READINESS_TTL_S:
+            return dict(cached[1])
+
+    settings = get_settings()
+    synthetic_ids = synthetic_product_ids()
+    synthetic_ph, synthetic_params = in_clause(
+        "readiness_synthetic", sorted(synthetic_ids) or [0]
+    )
+    rows = query(
+        f"""
+        SELECT
+            (
+                SELECT TOP 1 o.Created
+                FROM dbo.[Order] o
+                JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
+                WHERE oi.IsValidForCurrentSale = 1
+                      AND oi.ProductID IS NOT NULL
+                      AND oi.ProductID NOT IN {synthetic_ph}
+                ORDER BY o.Created DESC, o.ID DESC
+            ) AS latest_sale_at,
+            (
+                SELECT COUNT_BIG(DISTINCT cir.ClientID)
+                FROM dbo.ClientInRole cir
+                JOIN dbo.ClientType ct ON ct.ID = cir.ClientTypeID
+                JOIN dbo.Client c ON c.ID = cir.ClientID
+                WHERE cir.Deleted = 0 AND ct.[Type] = 0 AND c.Deleted = 0
+            ) AS buyer_count,
+            (
+                SELECT COUNT_BIG(*)
+                FROM dbo.Debt d
+                WHERE d.Deleted = 0 AND d.Created > '2000-01-01'
+            ) AS live_debt_count,
+            (
+                SELECT COUNT_BIG(*)
+                FROM dbo.Product p
+                WHERE p.Deleted = 0 AND p.Name = :synthetic_name
+                      AND p.ID IN {synthetic_ph}
+            ) AS synthetic_product_count
+        """,
+        {
+            **synthetic_params,
+            "synthetic_name": settings.synthetic_line_product_name,
+        },
+    )
+    row = rows[0] if rows else {}
+    latest = row.get("latest_sale_at")
+    source_fresh = isinstance(latest, datetime) and latest >= datetime.now() - timedelta(
+        days=max_lag_days
+    )
+    buyer_count = int(row.get("buyer_count") or 0)
+    debt_count = int(row.get("live_debt_count") or 0)
+    synthetic_count = int(row.get("synthetic_product_count") or 0)
+    reasons: list[str] = []
+    if latest is None:
+        reasons.append("canonical_sales_missing")
+    elif not source_fresh:
+        reasons.append("canonical_sales_stale")
+    if buyer_count <= 0:
+        reasons.append("buyers_missing")
+    if debt_count <= 0:
+        reasons.append("live_debt_missing")
+    if synthetic_count != 1:
+        reasons.append("synthetic_product_unresolved")
+    result = {
+        "business_ready": not reasons,
+        "reasons": reasons,
+        "latest_sale_at": latest.isoformat() if isinstance(latest, datetime) else None,
+        "max_source_lag_days": max_lag_days,
+        "buyer_count": buyer_count,
+        "live_debt_count": debt_count,
+        "synthetic_product_count": synthetic_count,
+        "synthetic_product_ids": sorted(synthetic_ids),
+    }
+    with _readiness_lock:
+        _readiness_state[max_lag_days] = (time.monotonic(), dict(result))
+    return result
 
 
 def resolve_client_id(client_net_uid: str) -> int | None:
@@ -215,7 +311,9 @@ def debt_aging_buckets_truth(client_id: int, as_of_date: str,
             e
             FROM (
                 SELECT DATEDIFF(day, d.Created, :asof) - a.NumberDaysDebt AS od,
-                       dbo.GetExchangedToEuroValue(d.Total, a.CurrencyID, :fxdate) AS e
+                       CAST(dbo.GetExchangedToEuroValue(
+                           d.Total, a.CurrencyID, :fxdate
+                       ) AS decimal(38, 6)) AS e
                 FROM dbo.ClientInDebt cid
                 JOIN dbo.Debt d ON d.ID = cid.DebtID
                 JOIN dbo.Agreement a ON a.ID = cid.AgreementID
@@ -234,7 +332,7 @@ def debt_aging_buckets_truth(client_id: int, as_of_date: str,
         {
             "bucket": r["bucket"],
             "count": int(r["cnt"] or 0),
-            "amount_eur": float(r["amount_eur"] or 0.0),
+            "amount_eur": round_cent(r["amount_eur"] or Decimal(0)),
         }
         for r in rows
     ]
@@ -264,7 +362,9 @@ def debt_exposure_donut_truth(client_id: int, as_of_date: str, window_months: in
             ISNULL(SUM(CASE WHEN od >  0 THEN e ELSE 0 END), 0) AS overdue_eur
         FROM (
             SELECT DATEDIFF(day, d.Created, :asof) - a.NumberDaysDebt AS od,
-                   dbo.GetExchangedToEuroValue(d.Total, a.CurrencyID, :fxdate) AS e
+                   CAST(dbo.GetExchangedToEuroValue(
+                       d.Total, a.CurrencyID, :fxdate
+                   ) AS decimal(38, 6)) AS e
             FROM dbo.ClientInDebt cid
             JOIN dbo.Debt d ON d.ID = cid.DebtID
             JOIN dbo.Agreement a ON a.ID = cid.AgreementID
@@ -284,8 +384,8 @@ def debt_exposure_donut_truth(client_id: int, as_of_date: str, window_months: in
         "settled": settled,
         "current": current_lines,
         "overdue": overdue_lines,
-        "current_eur": float(r.get("current_eur") or 0.0),
-        "overdue_eur": float(r.get("overdue_eur") or 0.0),
+        "current_eur": round_cent(r.get("current_eur") or Decimal(0)),
+        "overdue_eur": round_cent(r.get("overdue_eur") or Decimal(0)),
     }
 
 
@@ -362,7 +462,8 @@ def turnover_eur(client_id: int, as_of_date: str, window_months: int,
     rows = query(
         f"""
         SELECT ISNULL(SUM(
-            oi.Qty * oi.PricePerItem
+            CAST(oi.Qty AS decimal(19, 6))
+            * CAST(oi.PricePerItem AS decimal(19, 6))
         ), 0) AS turnover
         FROM dbo.Sale s
         JOIN dbo.[Order] o ON o.ID = s.OrderID
@@ -381,7 +482,7 @@ def turnover_eur(client_id: int, as_of_date: str, window_months: int,
             "fxdate": fx_date, **syn,
         },
     )
-    return float(rows[0]["turnover"]) if rows else 0.0
+    return float(round_cent(rows[0]["turnover"])) if rows else 0.0
 
 
 def turnover_eur_by_currency(client_id: int, as_of_date: str, window_months: int,
@@ -392,7 +493,8 @@ def turnover_eur_by_currency(client_id: int, as_of_date: str, window_months: int
         f"""
         SELECT a.CurrencyID AS currency_id,
                ISNULL(SUM(
-                   oi.Qty * oi.PricePerItem
+                   CAST(oi.Qty AS decimal(19, 6))
+                   * CAST(oi.PricePerItem AS decimal(19, 6))
                ), 0) AS turnover_eur
         FROM dbo.Sale s
         JOIN dbo.[Order] o ON o.ID = s.OrderID
@@ -415,7 +517,7 @@ def turnover_eur_by_currency(client_id: int, as_of_date: str, window_months: int
     return [
         {
             "currency_id": int(r["currency_id"]) if r["currency_id"] is not None else None,
-            "turnover_eur": float(r["turnover_eur"] or 0.0),
+            "turnover_eur": round_cent(r["turnover_eur"] or Decimal(0)),
         }
         for r in rows
     ]
@@ -477,22 +579,20 @@ def activity_stats(client_id: int, as_of_date: str, window_months: int) -> dict[
 def return_qty_rate(client_id: int, as_of_date: str, window_months: int) -> float:
     """(5) return_qty_rate = returned qty / sold qty over the window.
 
-    Returned qty is reconstructed the SAME faithful way gba-products does (verified on
-    ConcordDb_V5): the 1С DataSync write path omits SaleReturnItem.Qty (14/19,969 nonzero ~0), so
-    SUM(sri.Qty) is a dead constant. Instead each non-deleted SaleReturnItem means "this OrderItem
-    line came back", so we take the line's sold OrderItem.Qty once per distinct
-    (SaleReturnID, OrderItemID) and sum. Window on SaleReturn.FromDate (sr.Created is a bulk-sync
-    mirror stamp that mis-dates returns); active returns only (sr.Deleted=0 AND sr.IsCanceled=0);
-    oi.Deleted is NOT filtered (processing a return marks the sale line Deleted=1, ~73% of returned
-    lines); exclude the synthetic 1С product. Sold qty: valid OrderItem.Qty (synthetic excluded).
+    Returned qty follows gba-server's canonical model: SUM(SaleReturnItem.Qty), grouped first by
+    (SaleReturnID, OrderItemID). This preserves partial returns and sums multiple active item rows;
+    using MAX(OrderItem.Qty) incorrectly replaces both with the original sold quantity. Window on
+    SaleReturn.FromDate (sr.Created is a bulk-sync mirror stamp); active returns only
+    (sr.Deleted=0 AND sr.IsCanceled=0); oi.Deleted is intentionally not filtered; synthetic 1С
+    products are excluded. Sold qty is valid OrderItem.Qty over the same business window.
     """
     ph, syn = _synthetic_not_in()
     rows = query(
         f"""
         SELECT
-            (SELECT ISNULL(SUM(line.oi_qty), 0)
+            (SELECT ISNULL(SUM(line.returned_qty), 0)
              FROM (
-                SELECT MAX(oi.Qty) AS oi_qty
+                SELECT SUM(sri.Qty) AS returned_qty
                 FROM dbo.SaleReturnItem sri
                 JOIN dbo.OrderItem oi ON oi.ID = sri.OrderItemID
                 JOIN dbo.SaleReturn sr ON sr.ID = sri.SaleReturnID
@@ -555,42 +655,51 @@ def debt_sync_is_live() -> bool:
 def synthetic_line_drift_check() -> dict[str, Any]:
     """Drift insurance for the synthetic 1С debt-entry line(s) (config trap b).
 
-    Verifies (1) exactly one Product is named the configured synthetic name and that every such
-    Product is in the configured exclusion set, and (2) no UNLISTED ProductID dominates turnover
-    — its turnover must not exceed `synthetic_drift_turnover_ratio` x the 2nd-ranked product. A
-    new synthetic SKU that escaped the set would top this ranking and silently re-inflate
-    turnover, so it is flagged here. Read-only; never raises (callers decide on `ok`).
+    Verifies (1) exactly one live Product is named the configured synthetic name and that every
+    such Product is in the EFFECTIVE exclusion set (env IDs ∪ the dynamically-resolved live ID),
+    and (2) no UNLISTED ProductID dominates turnover — its turnover must not exceed
+    `synthetic_drift_turnover_ratio` x the 2nd-ranked product. A new synthetic SKU that escaped
+    the set would top this ranking and silently re-inflate turnover, so it is flagged here.
+    Read-only; never raises (callers decide on `ok`).
     """
     s = get_settings()
-    listed = sorted(s.synthetic_line_product_ids)
+    listed = sorted(synthetic_product_ids())
     ph, syn = in_clause("synthetic", listed)
 
     named = query(
-        "SELECT ID FROM dbo.Product WHERE Name = :nm",
+        "SELECT ID FROM dbo.Product WHERE Name = :nm AND Deleted = 0",
         {"nm": s.synthetic_line_product_name},
     )
     named_ids = [int(r["ID"]) for r in named]
 
     ranked = query(
         """
-        SELECT TOP 2 oi.ProductID AS product_id, SUM(oi.Qty * oi.PricePerItem) AS turnover
+        SELECT TOP 2 oi.ProductID AS product_id,
+               SUM(
+                   CAST(oi.Qty AS decimal(19, 6))
+                   * CAST(oi.PricePerItem AS decimal(19, 6))
+               ) AS turnover
         FROM dbo.OrderItem oi
         WHERE oi.IsValidForCurrentSale = 1
               AND oi.ProductID NOT IN """ + ph + """
         GROUP BY oi.ProductID
-        ORDER BY SUM(oi.Qty * oi.PricePerItem) DESC
+        ORDER BY SUM(
+            CAST(oi.Qty AS decimal(19, 6))
+            * CAST(oi.PricePerItem AS decimal(19, 6))
+        ) DESC
         """,
         syn,
     )
     top = ranked[0] if ranked else None
     second = ranked[1] if len(ranked) > 1 else None
-    top_turnover = float(top["turnover"]) if top else 0.0
-    second_turnover = float(second["turnover"]) if second else 0.0
+    top_turnover = as_decimal(top["turnover"]) if top else Decimal(0)
+    second_turnover = as_decimal(second["turnover"]) if second else Decimal(0)
     dominates = (
         top is not None
         and second is not None
         and second_turnover > 0
-        and top_turnover > s.synthetic_drift_turnover_ratio * second_turnover
+        and top_turnover
+        > as_decimal(s.synthetic_drift_turnover_ratio) * second_turnover
     )
 
     name_ok = len(named_ids) == 1 and set(named_ids).issubset(set(listed))
@@ -600,8 +709,12 @@ def synthetic_line_drift_check() -> dict[str, Any]:
         "configured_ids": listed,
         "name_ok": name_ok,
         "unlisted_dominant_product_id": (int(top["product_id"]) if dominates else None),
-        "top_unlisted_turnover": top_turnover if dominates else None,
-        "second_turnover": second_turnover if dominates else None,
+        "top_unlisted_turnover": (
+            float(round_cent(top_turnover)) if dominates else None
+        ),
+        "second_turnover": (
+            float(round_cent(second_turnover)) if dominates else None
+        ),
     }
 
 
@@ -618,7 +731,9 @@ def overdue_amount_eur(client_id: int, as_of_date: str, fx_date: str) -> float:
     rows = query(
         """
         SELECT ISNULL(SUM(
-            dbo.GetExchangedToEuroValue(d.Total, a.CurrencyID, :fxdate)
+            CAST(dbo.GetExchangedToEuroValue(
+                d.Total, a.CurrencyID, :fxdate
+            ) AS decimal(38, 6))
         ), 0) AS overdue
         FROM dbo.ClientInDebt cid
         JOIN dbo.Debt d ON d.ID = cid.DebtID
@@ -631,7 +746,7 @@ def overdue_amount_eur(client_id: int, as_of_date: str, fx_date: str) -> float:
         """,
         {"cid": client_id, "asof": as_of_date, "fxdate": fx_date},
     )
-    return float(rows[0]["overdue"]) if rows else 0.0
+    return float(round_cent(rows[0]["overdue"])) if rows else 0.0
 
 
 def monthly_turnover_series(client_id: int, as_of_date: str, window_months: int,
@@ -642,7 +757,8 @@ def monthly_turnover_series(client_id: int, as_of_date: str, window_months: int,
         f"""
         SELECT FORMAT(s.Created, 'yyyy-MM') AS period,
                ISNULL(SUM(
-                   oi.Qty * oi.PricePerItem
+                   CAST(oi.Qty AS decimal(19, 6))
+                   * CAST(oi.PricePerItem AS decimal(19, 6))
                ), 0) AS turnover_eur
         FROM dbo.Sale s
         JOIN dbo.[Order] o ON o.ID = s.OrderID
@@ -664,6 +780,9 @@ def monthly_turnover_series(client_id: int, as_of_date: str, window_months: int,
         },
     )
     return [
-        {"period": r["period"], "turnover_eur": float(r["turnover_eur"] or 0.0)}
+        {
+            "period": r["period"],
+            "turnover_eur": round_cent(r["turnover_eur"] or Decimal(0)),
+        }
         for r in rows
     ]

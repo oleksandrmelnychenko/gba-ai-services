@@ -6,7 +6,6 @@ If Redis is down, every call is a no-op miss — service keeps working.
 from __future__ import annotations
 
 import json
-import time
 from typing import Any
 
 import redis
@@ -17,14 +16,13 @@ from app.core.metrics import METRICS
 
 log = get_logger("cache")
 
-_RETRY_COOLDOWN_S = 30.0
 _client: redis.Redis | None = None
-_unavailable_until = 0.0
+_unavailable = False
 
 
 def _get_client() -> redis.Redis | None:
-    global _client, _unavailable_until
-    if _unavailable_until and time.monotonic() < _unavailable_until:
+    global _client, _unavailable
+    if _unavailable:
         return None
     if _client is None:
         s = get_settings()
@@ -34,14 +32,11 @@ def _get_client() -> redis.Redis | None:
                 decode_responses=True, socket_connect_timeout=2, socket_timeout=2,
             )
             _client.ping()
-            _unavailable_until = 0.0
             log.info("redis_connected", host=s.redis_host, port=s.redis_port, db=s.redis_db)
         except Exception as exc:  # noqa: BLE001
-            # Cool-down, not a permanent flag: a Redis blip must not force every
-            # request onto the full portfolio build for the process lifetime.
-            log.warning("redis_unavailable", error=str(exc), retry_in_s=_RETRY_COOLDOWN_S)
+            log.warning("redis_unavailable", error=str(exc))
             _client = None
-            _unavailable_until = time.monotonic() + _RETRY_COOLDOWN_S
+            _unavailable = True
     return _client
 
 
@@ -62,13 +57,7 @@ def get(key: str) -> dict[str, Any] | None:
         METRICS.record_cache(hit=False)
         return None
     METRICS.record_cache(hit=True)
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError as exc:
-        # Treat a corrupt value as a miss — otherwise one bad key 500s every
-        # request that touches it until TTL expiry (get raises before rebuild).
-        log.warning("cache_decode_failed", key=key, error=str(exc))
-        return None
+    return json.loads(raw)
 
 
 def set(key: str, value: dict[str, Any], ttl: int | None = None) -> None:

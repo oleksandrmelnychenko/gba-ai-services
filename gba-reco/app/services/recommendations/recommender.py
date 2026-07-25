@@ -30,6 +30,9 @@ _WEIGHTS: dict[Segment, tuple[float, float]] = {
 _RECENCY_HALFLIFE_DAYS = 21
 _MIN_SIMILARITY = 0.05
 _MAX_SIMILAR = 100
+# Top-of-ranking window sent to the single in_stock_product_ids set-membership query — bounds
+# the IN-clause parameter count while leaving ample slack over discovery_n after filtering.
+_STOCK_POOL_CAP = 1000
 
 
 def classify(customer_id: int, as_of_date: str) -> Segment:
@@ -80,7 +83,7 @@ def _similar_customers(customer_id: int, as_of_date: str,
         jac = len(target & other) / union
         if jac >= _MIN_SIMILARITY:
             sims.append((cid, jac))
-    sims.sort(key=lambda x: x[1], reverse=True)
+    sims.sort(key=lambda item: (-item[1], item[0]))
     return sims[:_MAX_SIMILAR]
 
 
@@ -107,8 +110,11 @@ def _backfill(
 ) -> list[ProductRec]:
     """Fill the gap to top_n when V3.2 discovery under-delivers (HEAVY/LIGHT clients with weak
     Jaccard neighbourhoods). Source order: co-purchase item-CF discovery, then ubiquity-filtered
-    global popularity. Everything is filtered against the rec exclusion set, negatives, and the ids
-    already in `combined`, so synthetic/ubiquitous lines and dupes never leak in.
+    global popularity. Everything is filtered against the rec exclusion set (which folds in the
+    client's negative-feedback set) and the ids already in `combined`, so synthetic/ubiquitous
+    lines, negatived products and dupes never leak in. Zero-stock
+    candidates are dropped: copurchase filters its discovery output internally; the popularity
+    pool is checked here with one in_stock_product_ids set-membership query.
 
     Backfilled items are appended below the existing ranking with monotonically decreasing scores,
     preserving the primary V3.2 ordering."""
@@ -117,15 +123,15 @@ def _backfill(
 
     if len(combined) >= top_n:
         return combined
-    blocked = set(excl) | set(cache.get_negatives(customer_id)) | {r.product_id for r in combined}
-    base_score = min((r.score for r in combined), default=0.0)
+    blocked = set(excl) | {r.product_id for r in combined}
+    base_score = min((r.score for r in combined), default=1.0)
     step = 1e-4
     rank_offset = 1
 
     def _emit(pid: int) -> ProductRec:
         nonlocal rank_offset
         rec = ProductRec(
-            product_id=pid, score=round(base_score - step * rank_offset, 6),
+            product_id=pid, score=round(max(base_score - step * rank_offset, 0.0), 6),
             rank=len(combined) + rank_offset, segment=segment.value, source=RecSource.DISCOVERY,
         )
         rank_offset += 1
@@ -145,10 +151,12 @@ def _backfill(
 
     if len(combined) < top_n:
         need = top_n - len(combined)
-        for pid in baselines.global_popular(as_of, need + len(blocked), exclude=excl):
+        popular = baselines.global_popular(as_of, need + len(blocked), exclude=excl)
+        stocked = repo.in_stock_product_ids(popular)
+        for pid in popular:
             if len(combined) >= top_n:
                 break
-            if pid in blocked:
+            if pid in blocked or pid not in stocked:
                 continue
             blocked.add(pid)
             combined.append(_emit(pid))
@@ -178,7 +186,7 @@ def recommend(
     # Fail-open when the client has no region set.
     region_id = repo.client_region_id(customer_id) if region_scope else None
 
-    excl = repo.ubiquitous_product_ids(s.ubiquity_exclude_pct)
+    excl = repo.ubiquitous_product_ids(s.ubiquity_exclude_pct) | cache.get_negatives(customer_id)
     freq = _normalize({pid: float(c) for pid, c in repo.product_frequency(customer_id, as_of).items()
                        if pid not in excl})
     rec = _normalize({pid: v for pid, v in _recency_scores(customer_id, as_of).items()
@@ -186,13 +194,19 @@ def recommend(
     owned = set(freq) | set(rec)
 
     repurchase_scores = {pid: w_freq * freq.get(pid, 0.0) + w_rec * rec.get(pid, 0.0) for pid in owned}
-    ranked = sorted(repurchase_scores.items(), key=lambda x: x[1], reverse=True)
+    ranked = sorted(repurchase_scores.items(), key=lambda item: (-item[1], item[0]))
 
-    # over-fetch to survive diversity filtering
+    # Repurchase must be actionable too: over-fetch, then require the same operational resale
+    # stock used for discovery before diversity filtering.
+    repurchase_pool = ranked[:_STOCK_POOL_CAP]
+    stocked_repurchase = repo.in_stock_product_ids([pid for pid, _ in repurchase_pool])
+    repurchase_pool = [
+        (pid, score) for pid, score in repurchase_pool if pid in stocked_repurchase
+    ]
     repurchase = [
         ProductRec(product_id=pid, score=float(sc), rank=i + 1, segment=segment.value,
                    source=RecSource.REPURCHASE)
-        for i, (pid, sc) in enumerate(ranked[: repurchase_n + 10])
+        for i, (pid, sc) in enumerate(repurchase_pool[: repurchase_n + 10])
     ]
     repurchase = _diversity_filter(repurchase, s.max_per_group)[:repurchase_n]
 
@@ -202,7 +216,11 @@ def recommend(
             sims = _similar_customers(customer_id, as_of, region_id=region_id)
             collab = {pid: v for pid, v in repo.collaborative_products(sims, as_of, customer_id).items()
                       if pid not in excl}
-            d_ranked = sorted(collab.items(), key=lambda x: x[1], reverse=True)
+            d_ranked = sorted(
+                collab.items(), key=lambda item: (-item[1], item[0])
+            )[:_STOCK_POOL_CAP]
+            stocked = repo.in_stock_product_ids([pid for pid, _ in d_ranked])
+            d_ranked = [(pid, sc) for pid, sc in d_ranked if pid in stocked]
             discovery = [
                 ProductRec(product_id=pid, score=float(sc), rank=i + 1, segment=segment.value,
                            source=RecSource.DISCOVERY)
@@ -219,6 +237,10 @@ def recommend(
     # History carries product ids of soft-deleted catalog generations (re-syncs mint new
     # rows); translate onto live rows so the gba-server hydration doesn't drop the list.
     combined = live_remap.remap_recs_to_live(combined)
+    # Defense in depth: the exact live ids returned to the caller must still be in operational
+    # resale stock. The repository uses the same remap rule, so this should remove nothing.
+    final_stock = repo.in_stock_product_ids([item.product_id for item in combined])
+    combined = [item for item in combined if item.product_id in final_stock]
     for i, r in enumerate(combined):
         r.rank = i + 1
 
