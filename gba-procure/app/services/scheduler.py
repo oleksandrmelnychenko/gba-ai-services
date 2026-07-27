@@ -5,11 +5,10 @@ Modern cron via APScheduler. Jobs:
   * cart_warm     (06:00 local) — cart plan + cart-wide charts into the EXACT keys
                                    /plan/cart and /plan/charts read, so the API serves a
                                    cache hit (<1s) instead of recomputing live.
-  * startup_catchup — retries every 10 min until today's cart + charts + per-producer keys
-                      are warm, then removes itself; the producer pass skips already-warm
-                      keys so a partial pass resumes instead of restarting; a boot-time
-                      DB/Redis outage (or a missed producer cron) self-heals instead of
-                      leaving the cache cold until the next cron fire.
+  * cache_watchdog  — every 10 min verifies today's cart + charts against the current
+                      source fingerprint and resumes missing per-producer keys. It stays
+                      active after success because cache keys roll over at midnight and
+                      source data changes during the day.
 All are idempotent (key carries as_of=today); safe to run more than once. Cron jobs carry a
 24h misfire grace so multi-hour scheduler stalls still fire the missed daily pass once.
 
@@ -35,6 +34,11 @@ _MISFIRE_GRACE_S = 86400
 _CATCHUP_RETRY_MIN = 10
 
 
+def _today() -> str:
+    tz = ZoneInfo(get_settings().timezone)
+    return datetime.now(tz).strftime("%Y-%m-%d")
+
+
 def _producer_job() -> None:
     try:
         stats = worker.run(warm_cart_key=False)
@@ -56,6 +60,59 @@ def _cart_job() -> None:
         log.error("charts_warm_failed", error=str(exc))
 
 
+def _cache_watchdog_job(as_of: str | None = None) -> dict:
+    """Continuously prove and repair the current canonical cache generation."""
+    as_of = as_of or _today()
+    if not cache.health():
+        raise RuntimeError("redis_unavailable")
+
+    source = worker.require_source_readiness(as_of, force=True)
+    source_fingerprint = source.get("source_fingerprint")
+    cart_key = worker.cart_cache_key(as_of)
+    cached_cart = cache.get(cart_key)
+    if not worker.canonical_cart_payload_is_ready(
+        cached_cart,
+        source_fingerprint=source_fingerprint,
+    ):
+        if cached_cart is not None:
+            cache.delete(cart_key)
+        worker.warm_cart(as_of=as_of, cart_limit=worker.CART_LIMIT)
+
+    charts_key = cache.make_key("charts", f"all:{worker.CHARTS_TOP_N}", as_of)
+    cached_charts = cache.get(charts_key)
+    if not worker.canonical_charts_payload_is_ready(
+        cached_charts,
+        source_fingerprint=source_fingerprint,
+    ):
+        if cached_charts is not None:
+            cache.delete(charts_key)
+        worker.warm_charts(as_of=as_of, top_n=worker.CHARTS_TOP_N)
+
+    stats = worker.run(as_of=as_of, warm_cart_key=False, skip_existing=True)
+    if stats["failed"]:
+        raise RuntimeError(f"producers_failed:{stats['failed']}")
+    result = {
+        "as_of": as_of,
+        "cart_key": cart_key,
+        "charts_key": charts_key,
+        "producers_warmed": stats["ok"],
+        "producers_skipped": stats["skipped"],
+    }
+    log.info("cache_watchdog_done", **result)
+    return result
+
+
+def _safe_cache_watchdog_job() -> None:
+    try:
+        _cache_watchdog_job()
+    except Exception as exc:  # noqa: BLE001
+        log.error(
+            "cache_watchdog_failed",
+            error=str(exc),
+            retry_in_min=_CATCHUP_RETRY_MIN,
+        )
+
+
 def main() -> None:
     s = get_settings()
     tz = ZoneInfo(s.timezone)
@@ -64,30 +121,10 @@ def main() -> None:
 
     scheduler = BlockingScheduler(timezone=tz)
 
-    def _startup_catchup() -> None:
-        as_of = datetime.now().strftime("%Y-%m-%d")
-        try:
-            if not cache.health():
-                raise RuntimeError("redis_unavailable")
-            if cache.get(worker.cart_cache_key(as_of)) is None:
-                worker.warm_cart(as_of=as_of)
-            if cache.get(cache.make_key("charts", f"all:{worker.CHARTS_TOP_N}", as_of)) is None:
-                worker.warm_charts(as_of=as_of)
-            stats = worker.run(as_of=as_of, warm_cart_key=False, skip_existing=True)
-            if stats["failed"]:
-                raise RuntimeError(f"producers_failed:{stats['failed']}")
-        except Exception as exc:  # noqa: BLE001
-            log.error("startup_catchup_failed", error=str(exc),
-                      retry_in_min=_CATCHUP_RETRY_MIN)
-            return
-        scheduler.remove_job("startup_catchup")
-        log.info("startup_catchup_done", as_of=as_of, producers_warmed=stats["ok"],
-                 producers_skipped=stats["skipped"])
-
     scheduler.add_job(
-        _startup_catchup,
+        _safe_cache_watchdog_job,
         IntervalTrigger(minutes=_CATCHUP_RETRY_MIN, timezone=tz),
-        id="startup_catchup",
+        id="cache_watchdog",
         next_run_time=datetime.now(tz),
         misfire_grace_time=None,
         coalesce=True,

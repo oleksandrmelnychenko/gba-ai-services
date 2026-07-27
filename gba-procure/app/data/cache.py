@@ -78,15 +78,22 @@ def get(key: str) -> dict[str, Any] | None:
         return None
 
 
-def set(key: str, value: dict[str, Any], ttl: int | None = None) -> None:
+def set(key: str, value: dict[str, Any], ttl: int | None = None) -> bool:
+    """Store a value and report whether Redis confirmed the write.
+
+    Callers that build canonical business artifacts must be able to distinguish a
+    durable warm-up from graceful cache degradation. Read-only API paths may still
+    ignore the return value and serve their freshly computed response.
+    """
     client = _get_client()
     if client is None:
-        return
+        return False
     ttl = ttl or get_settings().cache_ttl
     try:
-        client.setex(key, ttl, json.dumps(value, default=str))
+        return bool(client.set(key, json.dumps(value, default=str), ex=ttl))
     except Exception as exc:  # noqa: BLE001
-        log.warning("cache_set_failed", error=str(exc))
+        log.warning("cache_set_failed", key=key, error=str(exc))
+        return False
 
 
 def delete(key: str) -> bool:

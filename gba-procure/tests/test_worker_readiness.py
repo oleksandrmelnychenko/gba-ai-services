@@ -94,11 +94,19 @@ def test_warm_cart_persists_an_evaluated_zero_item_plan_when_inputs_are_ready(
     monkeypatch.setattr(worker, "get_source_readiness", lambda *args, **kwargs: _source())
     monkeypatch.setattr(worker.policy, "build_cart_plan", lambda *args, **kwargs: empty_plan)
     writes = []
+    stored = {}
+
+    def persist(key, value, ttl=None):
+        writes.append((key, value, ttl))
+        stored[key] = value
+        return True
+
     monkeypatch.setattr(
         worker.cache,
         "set",
-        lambda key, value, ttl=None: writes.append((key, value, ttl)),
+        persist,
     )
+    monkeypatch.setattr(worker.cache, "get", stored.get)
     monkeypatch.setattr(worker.cache, "clear_cart_not_ready", lambda as_of: True)
 
     result = worker.warm_cart(as_of="2026-06-15")
@@ -172,7 +180,7 @@ def test_full_producer_warm_accepts_zero_suggestions_when_inputs_are_ready(monke
     monkeypatch.setattr(
         worker.cache,
         "set",
-        lambda key, value, ttl=None: writes.append((key, value, ttl)),
+        lambda key, value, ttl=None: writes.append((key, value, ttl)) or True,
     )
 
     result = worker.run(
@@ -312,16 +320,55 @@ def test_warm_charts_accepts_evaluated_zero_cart_from_same_source_epoch(monkeypa
     )
     monkeypatch.setattr(worker.policy, "build_charts", lambda *args, **kwargs: charts)
     writes = []
+    stored = {worker.cart_cache_key("2026-06-15"): _canonical_zero_payload()}
+
+    def get_cached(key):
+        return stored.get(key)
+
+    def persist(key, value, ttl=None):
+        writes.append((key, value, ttl))
+        stored[key] = value
+        return True
+
+    monkeypatch.setattr(worker.cache, "get", get_cached)
     monkeypatch.setattr(
         worker.cache,
         "set",
-        lambda key, value, ttl=None: writes.append((key, value, ttl)),
+        persist,
     )
 
     result = worker.warm_charts(as_of="2026-06-15")
 
     assert result["top_items"] == 0
     assert writes[0][1]["_source_fingerprint"] == "source-fp"
+
+
+def test_warm_cart_fails_closed_when_redis_does_not_confirm_write(monkeypatch):
+    empty_plan = CartReplenishmentPlan(
+        items=[],
+        item_count=0,
+        total_item_count=0,
+        total_cost_eur=0.0,
+        as_of_date="2026-06-15",
+    )
+    monkeypatch.setattr(worker, "get_source_readiness", lambda *args, **kwargs: _source())
+    monkeypatch.setattr(worker.policy, "build_cart_plan", lambda *args, **kwargs: empty_plan)
+    monkeypatch.setattr(worker.cache, "set", lambda *args, **kwargs: False)
+    monkeypatch.setattr(worker.cache, "delete", lambda key: False)
+    markers = []
+    monkeypatch.setattr(
+        worker.cache,
+        "mark_cart_not_ready",
+        lambda as_of, reason, **kwargs: markers.append((as_of, reason)),
+    )
+
+    with pytest.raises(
+        worker.ProcurementBusinessReadinessError,
+        match="canonical_cart_cache_write_failed",
+    ):
+        worker.warm_cart(as_of="2026-06-15")
+
+    assert markers == [("2026-06-15", "canonical_cart_cache_write_failed")]
 
 
 def test_warm_charts_refuses_stale_canonical_cart(monkeypatch):

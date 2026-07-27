@@ -6,8 +6,9 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, datetime
 from typing import Literal
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -593,5 +594,4 @@ def get_learned_factors(producer_id: int = Query(gt=0)) -> dict:
 
 
 def _today() -> str:
-    from datetime import datetime
-    return datetime.now().strftime("%Y-%m-%d")
+    return datetime.now(ZoneInfo(settings.timezone)).strftime("%Y-%m-%d")

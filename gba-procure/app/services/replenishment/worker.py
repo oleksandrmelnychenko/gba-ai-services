@@ -10,12 +10,13 @@ import argparse
 import time
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from zoneinfo import ZoneInfo
 
 from app.core.config import get_settings
 from app.core.history import rolling_coverage
 from app.core.logging import get_logger
 from app.data import cache, masters
-from app.domain.models import MODEL_VERSION, CartReplenishmentPlan
+from app.domain.models import MODEL_VERSION, CartReplenishmentPlan, PlanCharts
 from app.services.replenishment import policy
 
 log = get_logger("procure_worker")
@@ -52,6 +53,10 @@ CART_LIMIT: int | None = None
 CHARTS_TOP_N = 15
 SOURCE_READINESS_TTL_S = 60
 _CENT = Decimal("0.01")
+
+
+def _today() -> str:
+    return datetime.now(ZoneInfo(get_settings().timezone)).strftime("%Y-%m-%d")
 
 
 def cart_cache_key(as_of: str, limit: int | None = CART_LIMIT) -> str:
@@ -171,6 +176,37 @@ def canonical_cart_payload_is_ready(
     return source_fingerprint is None or payload.get("_source_fingerprint") == source_fingerprint
 
 
+def canonical_charts_payload_is_ready(
+    payload: dict | None,
+    *,
+    source_fingerprint: str | None = None,
+    top_n: int = CHARTS_TOP_N,
+) -> bool:
+    """Validate canonical charts, their history contract and source epoch."""
+    if not isinstance(payload, dict):
+        return False
+    if (
+        source_fingerprint is not None
+        and payload.get("_source_fingerprint") != source_fingerprint
+    ):
+        return False
+    try:
+        as_of = payload.get("as_of_date")
+        if not isinstance(as_of, str):
+            return False
+        coverage = rolling_coverage(as_of, get_settings().history_days)
+        if any(payload.get(key) != value for key, value in coverage.as_metadata().items()):
+            return False
+        if payload.get("history_not_applicable") != ["inventory", "reservations"]:
+            return False
+        if payload.get("model_version") != MODEL_VERSION or payload.get("top_n") != top_n:
+            return False
+        PlanCharts.model_validate(payload)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 def get_source_readiness(as_of: str, *, force: bool = False) -> dict:
     """Return a short-lived snapshot of the factual inputs required by the policy."""
     from app.data import supply_repository as repo
@@ -269,7 +305,28 @@ def cache_canonical_cart_plan(
             cart_limit=cart_limit,
         )
         raise ProcurementBusinessReadinessError("canonical_cart_reconciliation_failed")
-    cache.set(key, payload, ttl=691200)  # 8 days
+    if not cache.set(key, payload, ttl=691200):  # 8 days
+        _mark_canonical_cart_not_ready(
+            as_of,
+            reason="canonical_cart_cache_write_failed",
+            candidate_count=candidate_count,
+            item_count=plan.item_count,
+            cart_limit=cart_limit,
+        )
+        raise ProcurementBusinessReadinessError("canonical_cart_cache_write_failed")
+    stored = cache.get(key)
+    if not canonical_cart_payload_is_ready(
+        stored,
+        source_fingerprint=source_snapshot.get("source_fingerprint"),
+    ):
+        _mark_canonical_cart_not_ready(
+            as_of,
+            reason="canonical_cart_cache_readback_failed",
+            candidate_count=candidate_count,
+            item_count=plan.item_count,
+            cart_limit=cart_limit,
+        )
+        raise ProcurementBusinessReadinessError("canonical_cart_cache_readback_failed")
     cache.clear_cart_not_ready(as_of)
     return candidate_count
 
@@ -280,7 +337,7 @@ def warm_cart(as_of: str | None = None, cart_limit: int | None = CART_LIMIT) -> 
     /plan/cart's canonical request has no truncation and keys as ``cart:all`` for today,
     so the worker writes that same key and the API serves warm (cache hit, <1s).
     """
-    as_of = as_of or datetime.now().strftime("%Y-%m-%d")
+    as_of = as_of or _today()
     started = time.time()
     log.info("procure_cart_warm_start", as_of=as_of, limit=cart_limit)
     source_snapshot = require_source_readiness(as_of, force=True)
@@ -315,7 +372,7 @@ def warm_charts(as_of: str | None = None, top_n: int = CHARTS_TOP_N) -> dict:
     /plan/charts keys on make_key('charts', 'all:{top_n}', as_of) for producer_id=None,
     so the worker writes that same key and the API serves warm instead of rebuilding live.
     """
-    as_of = as_of or datetime.now().strftime("%Y-%m-%d")
+    as_of = as_of or _today()
     started = time.time()
     log.info("procure_charts_warm_start", as_of=as_of, top_n=top_n)
     source_snapshot = require_source_readiness(as_of, force=True)
@@ -340,7 +397,16 @@ def warm_charts(as_of: str | None = None, top_n: int = CHARTS_TOP_N) -> dict:
     key = cache.make_key("charts", f"all:{top_n}", as_of)
     payload = charts.model_dump(mode="json")
     payload["_source_fingerprint"] = source_snapshot.get("source_fingerprint")
-    cache.set(key, payload, ttl=691200)  # 8 days
+    if not cache.set(key, payload, ttl=691200):  # 8 days
+        cache.delete(key)
+        raise ProcurementBusinessReadinessError("canonical_charts_cache_write_failed")
+    if not canonical_charts_payload_is_ready(
+        cache.get(key),
+        source_fingerprint=source_snapshot.get("source_fingerprint"),
+        top_n=top_n,
+    ):
+        cache.delete(key)
+        raise ProcurementBusinessReadinessError("canonical_charts_cache_readback_failed")
     stats = {"key": key, "top_items": len(charts.top_items),
              "duration_s": round(time.time() - started, 1), "as_of": as_of}
     log.info("procure_charts_warm_done", **stats)
@@ -349,7 +415,7 @@ def warm_charts(as_of: str | None = None, top_n: int = CHARTS_TOP_N) -> dict:
 
 def run(as_of: str | None = None, limit: int | None = None, warm_cart_key: bool = True,
         skip_existing: bool = False) -> dict:
-    as_of = as_of or datetime.now().strftime("%Y-%m-%d")
+    as_of = as_of or _today()
     started = time.time()
     source_snapshot = require_source_readiness(as_of, force=True)
     producers = warm_producer_candidates(as_of)
@@ -378,7 +444,8 @@ def run(as_of: str | None = None, limit: int | None = None, warm_cart_key: bool 
             plan = policy.build_plan(pid, as_of, only_needed=True)
             payload = plan.model_dump(mode="json")
             payload["_source_fingerprint"] = source_snapshot.get("source_fingerprint")
-            cache.set(key, payload, ttl=691200)  # 8 days
+            if not cache.set(key, payload, ttl=691200):  # 8 days
+                raise RuntimeError("producer_plan_cache_write_failed")
             ok += 1
             if plan.item_count > 0:
                 nonempty_producers += 1

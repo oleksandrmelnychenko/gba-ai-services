@@ -310,14 +310,21 @@ def test_current_evaluated_zero_cart_is_cached_as_a_valid_plan(monkeypatch):
     )
     monkeypatch.setattr(main, "_today", lambda: "2026-06-15")
     monkeypatch.setattr(worker, "get_source_readiness", lambda *args, **kwargs: _source())
-    monkeypatch.setattr(main.cache, "get", lambda key: None)
     monkeypatch.setattr(main.policy, "build_cart_plan", lambda *args, **kwargs: empty_plan)
     monkeypatch.setattr(main.cache, "clear_cart_not_ready", lambda as_of: True)
     writes = []
+    stored = {}
+
+    def persist(key, value, ttl=None):
+        writes.append((key, value, ttl))
+        stored[key] = value
+        return True
+
+    monkeypatch.setattr(main.cache, "get", stored.get)
     monkeypatch.setattr(
         main.cache,
         "set",
-        lambda key, value, ttl=None: writes.append((key, value, ttl)),
+        persist,
     )
 
     result = main.plan_cart(CartPlanRequest())
