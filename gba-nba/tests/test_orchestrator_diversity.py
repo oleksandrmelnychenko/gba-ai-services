@@ -305,7 +305,8 @@ def test_reserve_never_decrements_an_uncounted_capacity_skip(monkeypatch):
     ))
     monkeypatch.setattr(orchestrator.lifecycle, "active_counts_by_client", lambda manager_id: {})
     monkeypatch.setattr(orchestrator.lifecycle, "active_counts_by_type", lambda manager_id: {})
-    monkeypatch.setattr(orchestrator.lifecycle, "active_count", lambda manager_id: 0)
+    monkeypatch.setattr(orchestrator.lifecycle, "active_count",
+                        lambda manager_id, exclude_manual=False: 0)
     monkeypatch.setattr(orchestrator.lifecycle, "feedback_rejections", lambda manager_id, days: {})
     monkeypatch.setattr(orchestrator.lifecycle, "is_muted", lambda manager_id, client_id, task_type: False)
     monkeypatch.setattr(orchestrator.lifecycle, "upsert_generated", lambda task: task.task_key)

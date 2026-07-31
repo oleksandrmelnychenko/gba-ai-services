@@ -214,6 +214,7 @@ def test_head_tasks_shape_for_head(client):
         "requested_statuses",
         "requested_manager_id",
         "requested_urgency",
+        "requested_task_type",
         "skip",
         "limit",
         "returned_count",

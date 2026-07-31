@@ -149,6 +149,13 @@ def build_product_analytics(
             )
         )
 
+    # The portfolio snapshot aggregates sales over a rolling day window
+    # (settings.dead_window_days), while this response declares a month-aligned window and
+    # builds its series from it. Publishing both as one period made revenue_eur disagree with
+    # annual_units and with the series, so the window-scoped figures are recomputed here from
+    # the very buckets the caller sees.
+    snapshot = _align_snapshot_to_window(snapshot, buckets.values())
+
     return ProductAnalyticsResponse(
         product_id=product_id,
         as_of=as_of,
@@ -178,3 +185,50 @@ def build_product_analytics(
             zero_fill_begins_at=window.effective_start,
         ),
     )
+
+
+def _align_snapshot_to_window(
+    snapshot: dict[str, Any],
+    buckets: Any,
+) -> dict[str, Any]:
+    """Recompute the sales aggregates of a snapshot over this response's own window."""
+    units = Decimal(0)
+    revenue = Decimal(0)
+    for bucket in buckets:
+        units += bucket["units"]
+        revenue += bucket["revenue_eur"]
+
+    aligned = dict(snapshot)
+    aligned["annual_units"] = exact.quantity(units, "annual_units")
+    aligned["revenue_eur"] = exact.money(revenue, "revenue_eur")
+    avg_price = (revenue / units) if units > 0 else None
+    aligned["avg_price_eur"] = (
+        exact.unit_price(avg_price, "avg_price_eur") if avg_price is not None else None
+    )
+
+    unit_cost = snapshot.get("unit_cost_eur")
+    if avg_price is not None and avg_price > 0 and unit_cost is not None:
+        cost = exact.decimal_value(unit_cost, "unit_cost_eur", non_negative=True)
+        aligned["margin_pct"] = exact.ratio(
+            (avg_price - cost) / avg_price,
+            "margin_pct",
+        )
+
+    _assert_window_consistency(aligned)
+    return aligned
+
+
+def _assert_window_consistency(snapshot: dict[str, Any]) -> None:
+    """Guard the contract the payload advertises: avg_price_eur == revenue_eur / units."""
+    units = snapshot.get("annual_units") or 0
+    revenue = snapshot.get("revenue_eur") or 0
+    avg_price = snapshot.get("avg_price_eur")
+    if not units or avg_price is None:
+        return
+
+    derived = Decimal(str(revenue)) / Decimal(str(units))
+    if abs(derived - Decimal(str(avg_price))) > Decimal("0.01"):
+        raise ValueError(
+            "snapshot sales aggregates come from different windows: "
+            f"revenue_eur/annual_units={derived} but avg_price_eur={avg_price}"
+        )

@@ -21,3 +21,6 @@ benchmarks/*.json
 .DS_Store
 .vscode/
 .idea/
+
+# Runtime feedback journal (replayed into Redis on startup)
+data/negatives.jsonl

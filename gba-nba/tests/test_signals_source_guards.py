@@ -73,6 +73,20 @@ def test_overdue_debt_uses_parameterized_filters():
     assert ":maxage" in _OVERDUE_SRC and ":minamt" in _OVERDUE_SRC
 
 
+def test_overdue_debt_uses_effective_history_order_and_ignores_deleted_rates():
+    norm = _norm(sig._EUR_VALUE_CTE)
+    assert norm.count("erh.Created <= d.Created") == 1
+    assert norm.count("crh.Created <= d.Created") == 2
+    assert norm.count("erh.Deleted = 0") == 1
+    assert norm.count("crh.Deleted = 0") == 2
+    assert "ORDER BY erh.Created DESC, erh.ID DESC, er0.ID DESC" in norm
+    assert norm.count(
+        "ORDER BY crh.Created DESC, crh.ID DESC, cr0.ID DESC"
+    ) == 2
+    assert "ORDER BY erh.ID DESC" not in norm
+    assert "ORDER BY crh.ID DESC" not in norm
+
+
 def test_sales_spine_uses_validity_flag_not_deleted():
     """Every Order/OrderItem-spine sales query must gate on oi.IsValidForCurrentSale=1 and must NOT
     use the reverted o.Deleted=0 / oi.Deleted=0 (which kept only ~16% of sales). DB-free guard."""
