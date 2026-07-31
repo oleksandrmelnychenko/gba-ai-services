@@ -237,6 +237,24 @@ def test_risk_90d_high_is_exact_overdue_exposure_rounded_to_cents():
     assert risk.reason_code == Risk90dReason.WILL_CROSS_90_DAYS
 
 
+@pytest.mark.parametrize(
+    ("total_debt_eur", "expected_band", "expected_exposure"),
+    [
+        (0.004, Risk90dBand.LOW, 0.0),
+        (0.005, Risk90dBand.MEDIUM, 0.01),
+    ],
+)
+def test_risk_90d_classifies_after_cent_rounding(
+    total_debt_eur,
+    expected_band,
+    expected_exposure,
+):
+    risk = service._risk_90d({"total_debt_eur": total_debt_eur})
+
+    assert risk.band == expected_band
+    assert risk.exposure_eur == expected_exposure
+
+
 def test_score_client_provider_only_not_applicable_no_compute(monkeypatch):
     monkeypatch.setattr(service.repo, "has_buyer_role", lambda cid: False)
 

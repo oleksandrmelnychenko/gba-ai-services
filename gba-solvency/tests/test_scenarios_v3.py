@@ -38,16 +38,34 @@ LIVE_BASE_URL = os.environ.get("SOLVENCY_BASE_URL", "http://127.0.0.1:8003")
 
 
 def _assert_operational_risk_90d(risk, features: dict) -> None:
+    from app.domain.money import round_cent
+
     payload = risk if isinstance(risk, dict) else risk.model_dump(mode="json")
-    overdue_90_plus = sum(
-        float(features.get(name, 0.0) or 0.0)
-        for name in ("overdue_eur_91_180", "overdue_eur_180plus")
+    overdue_90_plus = float(
+        round_cent(
+            sum(
+                float(features.get(name, 0.0) or 0.0)
+                for name in ("overdue_eur_91_180", "overdue_eur_180plus")
+            )
+        )
     )
-    overdue_1_90 = sum(
-        float(features.get(name, 0.0) or 0.0)
-        for name in ("overdue_eur_1_30", "overdue_eur_31_60", "overdue_eur_61_90")
+    overdue_1_90 = float(
+        round_cent(
+            sum(
+                float(features.get(name, 0.0) or 0.0)
+                for name in (
+                    "overdue_eur_1_30",
+                    "overdue_eur_31_60",
+                    "overdue_eur_61_90",
+                )
+            )
+        )
     )
-    total_debt = float(features.get("total_debt_eur", 0.0) or 0.0)
+    total_debt = float(
+        round_cent(
+            float(features.get("total_debt_eur", 0.0) or 0.0)
+        )
+    )
 
     if overdue_90_plus >= 100.0:
         expected = ("critical", "already_90_plus", overdue_90_plus)

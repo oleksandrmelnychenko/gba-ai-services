@@ -168,15 +168,31 @@ def _risk_90d(features: dict[str, float]) -> Risk90d:
     already 1..90 days overdue will cross the 90-day control threshold within the horizon if
     it remains unpaid. Debt already beyond that threshold is critical now.
     """
-    overdue_90_plus = sum(
-        float(features.get(name, 0.0) or 0.0)
-        for name in ("overdue_eur_91_180", "overdue_eur_180plus")
+    overdue_90_plus = float(
+        round_cent(
+            sum(
+                float(features.get(name, 0.0) or 0.0)
+                for name in ("overdue_eur_91_180", "overdue_eur_180plus")
+            )
+        )
     )
-    overdue_1_90 = sum(
-        float(features.get(name, 0.0) or 0.0)
-        for name in ("overdue_eur_1_30", "overdue_eur_31_60", "overdue_eur_61_90")
+    overdue_1_90 = float(
+        round_cent(
+            sum(
+                float(features.get(name, 0.0) or 0.0)
+                for name in (
+                    "overdue_eur_1_30",
+                    "overdue_eur_31_60",
+                    "overdue_eur_61_90",
+                )
+            )
+        )
     )
-    total_debt = float(features.get("total_debt_eur", 0.0) or 0.0)
+    total_debt = float(
+        round_cent(
+            float(features.get("total_debt_eur", 0.0) or 0.0)
+        )
+    )
 
     if overdue_90_plus >= _OPERATIONAL_RISK_MIN_EUR:
         return Risk90d(
