@@ -74,11 +74,11 @@ def test_competitor_search_route_returns_console_contract(monkeypatch):
             ai_summary="Знайдено один точний збіг.",
             offers=[
                 {
-                    "source": "prom",
-                    "marketplace_name": "Prom.ua",
-                    "seller_name": "Truck Parts UA",
+                    "source": "strans",
+                    "marketplace_name": "STRANS",
+                    "seller_name": "STRANS",
                     "title": "Сайлентблок MAN 81.43220-6057",
-                    "url": "https://prom.ua/ua/p123-exact-part.html",
+                    "url": "https://strans-shop.com.ua/shop/product/887756",
                     "price_uah": 1250,
                     "original_price_uah": None,
                     "availability": "in_stock",
@@ -96,7 +96,7 @@ def test_competitor_search_route_returns_console_contract(monkeypatch):
             "market": "UA",
             "product_net_uid": CA_UID,
             "query": "81.43220-6057 MAN сайлентблок",
-            "sources": ["prom"],
+            "sources": ["strans"],
         },
     )
 

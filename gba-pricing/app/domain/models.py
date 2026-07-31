@@ -25,11 +25,11 @@ class Confidence(StrEnum):
 
 
 class CompetitorSource(StrEnum):
-    AVTOPRO = "avtopro"
-    GOOGLE = "google"
-    HOTLINE = "hotline"
-    PROM = "prom"
-    ROZETKA = "rozetka"
+    STRANS = "strans"
+    CARGO_PARTS = "cargo_parts"
+    INTERCARS = "intercars"
+    OMEGA = "omega"
+    TIR_MARKET = "tir_market"
 
 
 class CompetitorAvailability(StrEnum):

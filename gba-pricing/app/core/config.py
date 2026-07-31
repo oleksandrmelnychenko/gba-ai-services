@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     anthropic_api_key: str = Field(default="", description="Server-only Anthropic API key")
     anthropic_api_key_file: str = "/run/secrets/AnthropicApiKey"
     competitor_search_model: str = "claude-sonnet-5"
-    competitor_search_max_uses: int = Field(default=5, ge=1, le=10)
+    competitor_search_max_uses: int = Field(default=10, ge=1, le=10)
     competitor_search_max_offers: int = Field(default=18, ge=1, le=30)
     competitor_search_timeout_seconds: float = Field(default=90.0, ge=10.0, le=180.0)
     competitor_search_cache_ttl: int = Field(default=900, ge=60, le=3600)

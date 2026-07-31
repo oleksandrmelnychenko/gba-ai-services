@@ -24,12 +24,35 @@ from app.services.competitor_prompt import SYSTEM_PROMPT
 
 log = get_logger("competitor_search")
 
+_SOURCE_PRIORITY: tuple[CompetitorSource, ...] = (
+    CompetitorSource.STRANS,
+    CompetitorSource.CARGO_PARTS,
+    CompetitorSource.INTERCARS,
+    CompetitorSource.OMEGA,
+    CompetitorSource.TIR_MARKET,
+)
 _SOURCE_DOMAINS: dict[CompetitorSource, str] = {
-    CompetitorSource.AVTOPRO: "avto.pro",
-    CompetitorSource.HOTLINE: "hotline.ua",
-    CompetitorSource.PROM: "prom.ua",
-    CompetitorSource.ROZETKA: "rozetka.com.ua",
+    CompetitorSource.STRANS: "strans-shop.com.ua",
+    CompetitorSource.CARGO_PARTS: "cargo-parts.ua",
+    CompetitorSource.INTERCARS: "webshop-ua.intercars.eu",
+    CompetitorSource.OMEGA: "omega.page",
+    CompetitorSource.TIR_MARKET: "tirmarket.com.ua",
 }
+_SOURCE_NAMES: dict[CompetitorSource, str] = {
+    CompetitorSource.STRANS: "STRANS",
+    CompetitorSource.CARGO_PARTS: "Cargo Parts",
+    CompetitorSource.INTERCARS: "Inter Cars Ukraine",
+    CompetitorSource.OMEGA: "Омега",
+    CompetitorSource.TIR_MARKET: "TIR Market",
+}
+_SOURCE_ACCESS: dict[CompetitorSource, str] = {
+    CompetitorSource.STRANS: "public_prices",
+    CompetitorSource.CARGO_PARTS: "b2b_login_required",
+    CompetitorSource.INTERCARS: "bot_protected_webshop",
+    CompetitorSource.OMEGA: "b2b_login_required_for_prices",
+    CompetitorSource.TIR_MARKET: "public_site",
+}
+_SOURCE_RANK = {source: index for index, source in enumerate(_SOURCE_PRIORITY)}
 _RETURN_TOOL_NAME = "return_competitor_prices"
 _RETURN_TOOL: dict[str, Any] = {
     "name": _RETURN_TOOL_NAME,
@@ -46,7 +69,7 @@ _RETURN_TOOL: dict[str, Any] = {
                     "properties": {
                         "source": {
                             "type": "string",
-                            "enum": ["avtopro", "google", "hotline", "prom", "rozetka"],
+                            "enum": [source.value for source in _SOURCE_PRIORITY],
                         },
                         "marketplace_name": {"type": "string"},
                         "seller_name": {"type": ["string", "null"]},
@@ -106,16 +129,28 @@ def _cache_key(request: CompetitorPriceSearchRequest, settings: Settings) -> str
     return f"competitor-search:v1:{digest}"
 
 
+def _ordered_sources(sources: list[CompetitorSource]) -> list[CompetitorSource]:
+    selected = set(sources)
+    return [source for source in _SOURCE_PRIORITY if source in selected]
+
+
 def _build_user_prompt(request: CompetitorPriceSearchRequest, max_offers: int) -> str:
-    source_domains = {
-        source.value: _SOURCE_DOMAINS.get(source, "весь український веб") for source in request.sources
-    }
+    ordered_sources = _ordered_sources(request.sources)
     request_data = {
         "market": request.market,
         "query": request.query,
         "product_net_uid": request.product_net_uid,
-        "selected_sources": [source.value for source in request.sources],
-        "source_domains": source_domains,
+        "selected_sources": [source.value for source in ordered_sources],
+        "source_targets": [
+            {
+                "source": source.value,
+                "priority": _SOURCE_RANK[source] + 1,
+                "name": _SOURCE_NAMES[source],
+                "domain": _SOURCE_DOMAINS[source],
+                "access": _SOURCE_ACCESS[source],
+            }
+            for source in ordered_sources
+        ],
         "max_offers": max_offers,
     }
     return (
@@ -140,10 +175,9 @@ def _build_web_search_tool(
             "timezone": "Europe/Kyiv",
         },
     }
-    if CompetitorSource.GOOGLE not in request.sources:
-        tool["allowed_domains"] = [
-            _SOURCE_DOMAINS[source] for source in request.sources if source in _SOURCE_DOMAINS
-        ]
+    tool["allowed_domains"] = [
+        _SOURCE_DOMAINS[source] for source in _ordered_sources(request.sources)
+    ]
     return tool
 
 
@@ -210,7 +244,7 @@ def _source_for_url(value: str) -> CompetitorSource:
     for source, domain in _SOURCE_DOMAINS.items():
         if host == domain or host.endswith(f".{domain}"):
             return source
-    return CompetitorSource.GOOGLE
+    raise CompetitorSearchUpstreamError("offer URL is outside the configured competitor domains")
 
 
 def _extract_return_tool_input(content: list[Any]) -> dict[str, Any] | None:
@@ -250,8 +284,11 @@ def _normalize_tool_output(
         canonical = _canonical_url(offer.url)
         if not canonical or canonical not in evidence_urls:
             continue
-        source = _source_for_url(offer.url)
-        if source not in requested_sources and CompetitorSource.GOOGLE not in requested_sources:
+        try:
+            source = _source_for_url(offer.url)
+        except CompetitorSearchUpstreamError:
+            continue
+        if source not in requested_sources:
             continue
         offer.source = source
         identity = (canonical, (offer.seller_name or "").casefold(), offer.price_uah)
@@ -260,7 +297,13 @@ def _normalize_tool_output(
         seen.add(identity)
         offers.append(offer)
 
-    offers.sort(key=lambda offer: (-offer.similarity_score, offer.price_uah))
+    offers.sort(
+        key=lambda offer: (
+            _SOURCE_RANK[offer.source],
+            -offer.similarity_score,
+            offer.price_uah,
+        )
+    )
     offers = offers[:max_offers]
 
     raw_summary = tool_input.get("ai_summary")
