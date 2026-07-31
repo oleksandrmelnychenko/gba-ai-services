@@ -158,11 +158,15 @@ def _synthetic_drift_ok_cached() -> bool | None:
 
 def _model_readiness() -> dict:
     from app.risk.score_current import current_model_readiness
-    from app.risk.score_forward import forward_model_readiness
 
     return {
         "current_state": current_model_readiness(),
-        "forward_6m": forward_model_readiness(),
+        "operational_90d": {
+            "ready": True,
+            "kind": "deterministic_open_debt_control",
+            "horizon_days": 90,
+            "threshold_days": 90,
+        },
     }
 
 
@@ -215,7 +219,7 @@ def _health_snapshot() -> dict:
         and synthetic_drift_ok is True
         and models["current_state"]["ready"] is True
     )
-    healthy = serving_ready and models["forward_6m"]["ready"] is True
+    healthy = serving_ready and models["operational_90d"]["ready"] is True
     drift = _drift_summary_cached()
     return {
         "status": "healthy" if healthy else "degraded",
@@ -237,8 +241,6 @@ def _health_snapshot() -> dict:
 @app.get("/ready")
 def ready() -> JSONResponse:
     snapshot = _health_snapshot()
-    # A statistically unsupported forward model degrades /health but must not remove the
-    # independently validated current-state score from service.
     is_ready = snapshot["serving_ready"] is True
     return JSONResponse(
         status_code=200 if is_ready else 503,

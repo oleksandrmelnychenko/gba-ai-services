@@ -16,18 +16,18 @@ from app.domain.models import (
     Contribution,
     CurrencyExposure,
     DataSufficiency,
-    ForwardRisk,
-    ForwardRiskBand,
     ForwardRiskStatus,
     GaugeChart,
     Rating,
+    Risk90d,
+    Risk90dBand,
+    Risk90dReason,
     SolvencyCharts,
     SolvencyScore,
 )
 from app.domain.money import round_cent
 from app.risk import dataset as risk_dataset
 from app.risk.score_current import score_current
-from app.risk.score_forward import ForwardModelUnavailableError, score_forward
 from app.services.solvency import charts as charts_builder
 
 log = get_logger("solvency_service")
@@ -36,6 +36,9 @@ log = get_logger("solvency_service")
 _BAND_TO_RATING = {"A": Rating.A, "B": Rating.B, "C": Rating.C, "D": Rating.D}
 
 _NO_SALES_24MO_DAYS = 730.0
+_OPERATIONAL_RISK_MIN_EUR = 100.0
+
+
 def _data_sufficiency(features: dict[str, float]) -> tuple[DataSufficiency, str | None]:
     """Feature-coverage flag: with no sales in 24mo (never-bought recency sentinel included),
     no live debt lines and no credit-terms signal, every feature sits in the safest WOE bin and
@@ -96,6 +99,7 @@ def _hydrate_score(data: dict, expected_client_id: int) -> SolvencyScore | None:
     """
     required_metadata = {
         "data_sufficiency",
+        "risk_90d",
         "forward_risk_status",
         "current_model_run_id",
         "source_history_start",
@@ -106,6 +110,18 @@ def _hydrate_score(data: dict, expected_client_id: int) -> SolvencyScore | None:
         return None
     result = SolvencyScore.model_validate(data)
     if result.client_id != expected_client_id or result.as_of_date is None:
+        return None
+    if (
+        result.applicable
+        and result.data_sufficiency == DataSufficiency.OK
+        and (
+            result.risk_90d is None
+            or result.forward_risk is not None
+            or result.forward_risk_status != ForwardRiskStatus.NOT_APPLICABLE
+            or result.forward_risk_reason != "replaced_by_operational_90d"
+            or not result.current_model_run_id
+        )
+    ):
         return None
     expected_history = coverage(result.as_of_date, result.window_months)
     if (
@@ -145,42 +161,45 @@ def _hydrate_charts(
     return result
 
 
-def _forward_risk(
-    features: dict[str, float],
-) -> tuple[ForwardRisk | None, ForwardRiskStatus, str | None]:
-    """Map score_forward()'s 6mo early-warning output to the v3 ForwardRisk{band, pd}.
+def _risk_90d(features: dict[str, float]) -> Risk90d:
+    """Classify exact open exposure by what can happen within the next 90 days.
 
-    The forward model's declared population is ``total_debt_eur > 0`` and *not already SEV180*.
-    An already-defaulted buyer is outside that population: returning the behavioral model's
-    usually-low PD would be actively misleading, so the forward signal is absent while the
-    current-state score continues to carry the C/D risk. Buyers with no debt are outside the
-    model's declared population too, so they have no forward signal. At-risk-with-debt buyers
-    carry the behavioral band + PD.
+    This is intentionally deterministic rather than a synthetic probability: debt that is
+    already 1..90 days overdue will cross the 90-day control threshold within the horizon if
+    it remains unpaid. Debt already beyond that threshold is critical now.
     """
+    overdue_90_plus = sum(
+        float(features.get(name, 0.0) or 0.0)
+        for name in ("overdue_eur_91_180", "overdue_eur_180plus")
+    )
+    overdue_1_90 = sum(
+        float(features.get(name, 0.0) or 0.0)
+        for name in ("overdue_eur_1_30", "overdue_eur_31_60", "overdue_eur_61_90")
+    )
     total_debt = float(features.get("total_debt_eur", 0.0) or 0.0)
-    severe_overdue = float(features.get("overdue_eur_180plus", 0.0) or 0.0)
-    if total_debt <= 0.0:
-        return (
-            None,
-            ForwardRiskStatus.NOT_APPLICABLE,
-            "no current debt: outside forward model population",
+
+    if overdue_90_plus >= _OPERATIONAL_RISK_MIN_EUR:
+        return Risk90d(
+            band=Risk90dBand.CRITICAL,
+            exposure_eur=overdue_90_plus,
+            reason_code=Risk90dReason.ALREADY_90_PLUS,
         )
-    if severe_overdue >= risk_dataset.SEV180_MIN_EUR:
-        return (
-            None,
-            ForwardRiskStatus.NOT_APPLICABLE,
-            "already SEV180: outside forward model population",
+    if overdue_1_90 >= _OPERATIONAL_RISK_MIN_EUR:
+        return Risk90d(
+            band=Risk90dBand.HIGH,
+            exposure_eur=overdue_1_90,
+            reason_code=Risk90dReason.WILL_CROSS_90_DAYS,
         )
-    try:
-        fwd = score_forward(features)
-    except ForwardModelUnavailableError as exc:
-        return None, ForwardRiskStatus.MODEL_UNAVAILABLE, str(exc)
-    if fwd["band"] == "none":
-        return None, ForwardRiskStatus.NOT_APPLICABLE, "outside forward model population"
-    return (
-        ForwardRisk(band=ForwardRiskBand(fwd["band"]), pd=float(fwd["pd_behavioral"])),
-        ForwardRiskStatus.AVAILABLE,
-        None,
+    if total_debt > 0.0:
+        return Risk90d(
+            band=Risk90dBand.MEDIUM,
+            exposure_eur=total_debt,
+            reason_code=Risk90dReason.CURRENT_DEBT,
+        )
+    return Risk90d(
+        band=Risk90dBand.LOW,
+        exposure_eur=0.0,
+        reason_code=Risk90dReason.NO_DEBT,
     )
 
 
@@ -217,6 +236,7 @@ def _not_applicable(
         rating=None,
         pd=None,
         contributions=None,
+        risk_90d=None,
         forward_risk=None,
         forward_risk_status=ForwardRiskStatus.NOT_APPLICABLE,
         forward_risk_reason="client has no buyer role",
@@ -276,7 +296,7 @@ def _build_score(
 
     This is the single shared code path for the score math so the per-client (/score) and
     set-based batch (/score/batch) routes are guaranteed bit-identical: same score_current,
-    same forward scorecard, same rounding.
+    same operational 90-day control, same rounding.
     """
     history = coverage(as_of, window_months)
     sufficiency, sufficiency_reason = _data_sufficiency(features)
@@ -289,6 +309,7 @@ def _build_score(
             rating=None,
             pd=None,
             contributions=None,
+            risk_90d=None,
             forward_risk=None,
             forward_risk_status=ForwardRiskStatus.NOT_APPLICABLE,
             forward_risk_reason=sufficiency_reason,
@@ -309,7 +330,6 @@ def _build_score(
         )
 
     current = score_current(features)
-    forward, forward_status, forward_reason = _forward_risk(features)
     return SolvencyScore(
         client_id=cid,
         client_net_uid=client_net_uid,
@@ -321,9 +341,10 @@ def _build_score(
             Contribution(feature=c["feature"], value=c["value"], points=c["points"])
             for c in current["contributions"]
         ],
-        forward_risk=forward,
-        forward_risk_status=forward_status,
-        forward_risk_reason=forward_reason,
+        risk_90d=_risk_90d(features),
+        forward_risk=None,
+        forward_risk_status=ForwardRiskStatus.NOT_APPLICABLE,
+        forward_risk_reason="replaced_by_operational_90d",
         sub_factors=None,
         caps_applied=[
             CapType(value) for value in current.get("policy_overrides", [])
@@ -350,13 +371,13 @@ def score_client(
     window_months: int,
     use_cache: bool,
 ) -> SolvencyScore:
-    """v3 (creditscore-v3): WOE+logistic current-state scorecard + 6mo forward early-warning.
+    """v3 (creditscore-v3): current-state scorecard + operational 90-day debt control.
 
     Keeps the has_buyer_role gate (non-buyer -> applicable=false, everything below null). For an
     applicable buyer: build the single-client features as-of the resolved date, run score_current
-    (-> score/pd/band/contributions) and the forward scorecard (-> forward_risk{band,pd}). The old
-    5-factor sub_factors is DEPRECATED and emitted as null. Result is cached under the bumped
-    creditscore-v3 namespace, so old v1/v2 cache entries never collide.
+    (-> score/pd/band/contributions) and classify exact open debt into a 90-day operational
+    control. The old forward_risk and 5-factor sub_factors fields are DEPRECATED and emitted as
+    unavailable/null for backwards compatibility.
     """
     started = datetime.now()
     as_of = _as_of(as_of_date)

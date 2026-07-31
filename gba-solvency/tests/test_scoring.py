@@ -257,9 +257,15 @@ def test_synthetic_line_excluded_from_turnover_repository():
     assert "**syn" in by_ccy
 
 
-def test_synthetic_not_in_clause_is_parameterized_set():
-    """The synthetic exclusion is a parameterized NOT IN over the full configured set."""
+def test_synthetic_not_in_clause_is_parameterized_effective_set(monkeypatch):
+    """The exclusion covers configured and dynamically resolved synthetic product IDs."""
     from app.data import solvency_repository as repo
+
+    monkeypatch.setattr(
+        repo,
+        "synthetic_product_ids",
+        lambda: {29555414, 30661064},
+    )
     ph, params = repo._synthetic_not_in()
     assert ph.startswith("(:synthetic")
-    assert set(params.values()) == repo.get_settings().synthetic_line_product_ids
+    assert set(params.values()) == {29555414, 30661064}

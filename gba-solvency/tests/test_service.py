@@ -8,6 +8,8 @@ from app.domain.models import (
     ForwardRiskBand,
     ForwardRiskStatus,
     Rating,
+    Risk90dBand,
+    Risk90dReason,
 )
 from app.services.solvency import service
 
@@ -36,14 +38,6 @@ def _stub_current(band: str = "A", score: float = 100.0, pd: float = 0.001) -> d
     }
 
 
-def _stub_forward(band: str = "low", pd_beh: float = 0.05) -> dict:
-    if band == "none":
-        return {"score": 0.0, "pd_behavioral": 0.0, "pd_with_aging": 0.0,
-                "band": "none", "already_rolling": False, "note": "no debt"}
-    return {"score": round(100 * pd_beh, 1), "pd_behavioral": pd_beh,
-            "pd_with_aging": 0.1, "band": band, "already_rolling": False}
-
-
 @pytest.fixture(autouse=True)
 def _no_cache(monkeypatch):
     monkeypatch.setattr(service.cache, "get", lambda *a, **k: None)
@@ -60,7 +54,7 @@ def _has_buyer_role(monkeypatch):
     monkeypatch.setattr(service.repo, "has_buyer_role", lambda cid: True)
 
 
-def _wire_v3(monkeypatch, *, current=None, forward=None, currency=None, features=None):
+def _wire_v3(monkeypatch, *, current=None, currency=None, features=None):
     feature_values = _stub_features() if features is None else features
     monkeypatch.setattr(
         service.risk_dataset,
@@ -68,7 +62,6 @@ def _wire_v3(monkeypatch, *, current=None, forward=None, currency=None, features
         lambda *a, **k: feature_values,
     )
     monkeypatch.setattr(service, "score_current", lambda f: current or _stub_current())
-    monkeypatch.setattr(service, "score_forward", lambda f: forward or _stub_forward())
     monkeypatch.setattr(
         service.repo, "turnover_eur_by_currency", lambda *a, **k: currency or []
     )
@@ -126,11 +119,11 @@ def test_build_charts_nonexistent_client_id_raises_lookup(monkeypatch):
 
 
 def test_score_client_v3_shape_applicable_buyer(monkeypatch):
-    """v3 shape: score/pd/rating/contributions/forward_risk populated; sub_factors null."""
+    """v3 shape includes the operational 90-day control; legacy forward risk is retired."""
     features = _stub_features()
     features["total_debt_eur"] = 100.0
     _wire_v3(monkeypatch, current=_stub_current(band="D", score=46.0, pd=0.65),
-             forward=_stub_forward(band="very_high", pd_beh=0.99), features=features)
+             features=features)
     out = service.score_client(5, None, "2026-06-01", 12, use_cache=False)
     assert out.applicable is True
     assert out.score == 46
@@ -140,48 +133,41 @@ def test_score_client_v3_shape_applicable_buyer(monkeypatch):
     assert out.contributions is not None and len(out.contributions) == 2
     assert out.contributions[0].feature == "n_open_debt_lines"
     assert out.contributions[0].points == -5.62
-    assert out.forward_risk is not None
-    assert out.forward_risk.band == ForwardRiskBand.VERY_HIGH
-    assert out.forward_risk.pd == 0.99
+    assert out.risk_90d is not None
+    assert out.risk_90d.band == Risk90dBand.MEDIUM
+    assert out.risk_90d.exposure_eur == 100.0
+    assert out.risk_90d.reason_code == Risk90dReason.CURRENT_DEBT
+    assert out.forward_risk is None
+    assert out.forward_risk_status == ForwardRiskStatus.NOT_APPLICABLE
+    assert out.forward_risk_reason == "replaced_by_operational_90d"
     assert out.model_version == "creditscore-v3"
 
 
-def test_score_client_no_debt_has_no_out_of_population_forward_risk(monkeypatch):
-    """A buyer with no debt is outside the forward model's declared population."""
+def test_score_client_no_debt_has_low_operational_risk(monkeypatch):
     _wire_v3(monkeypatch, current=_stub_current(band="A", score=100.0))
-    monkeypatch.setattr(
-        service,
-        "score_forward",
-        lambda _features: (_ for _ in ()).throw(
-            AssertionError("zero-debt buyers are outside the forward model population")
-        ),
-    )
     out = service.score_client(5, None, "2026-06-01", 12, use_cache=False)
+    assert out.risk_90d is not None
+    assert out.risk_90d.band == Risk90dBand.LOW
+    assert out.risk_90d.exposure_eur == 0.0
+    assert out.risk_90d.reason_code == Risk90dReason.NO_DEBT
     assert out.forward_risk is None
     assert out.forward_risk_status == ForwardRiskStatus.NOT_APPLICABLE
 
 
-def test_forward_model_unavailable_retains_valid_current_score(monkeypatch):
+def test_operational_90_day_control_replaces_retired_forward_model(monkeypatch):
     features = _stub_features()
     features["total_debt_eur"] = 100.0
     _wire_v3(monkeypatch, current=_stub_current(score=82.0, pd=0.01), features=features)
-    monkeypatch.setattr(
-        service,
-        "score_forward",
-        lambda _features: (_ for _ in ()).throw(
-            service.ForwardModelUnavailableError(
-                "forward model unavailable: insufficient_unique_positive_clients (3 < 30)"
-            )
-        ),
-    )
 
     out = service.score_client(5, None, "2026-06-01", 12, use_cache=False)
 
     assert out.score == 82
     assert out.pd == 0.01
+    assert out.risk_90d is not None
+    assert out.risk_90d.band == Risk90dBand.MEDIUM
     assert out.forward_risk is None
-    assert out.forward_risk_status == ForwardRiskStatus.MODEL_UNAVAILABLE
-    assert "3 < 30" in out.forward_risk_reason
+    assert out.forward_risk_status == ForwardRiskStatus.NOT_APPLICABLE
+    assert out.forward_risk_reason == "replaced_by_operational_90d"
 
 
 def test_score_client_empty_zero_terms_is_insufficient_with_control_flag(monkeypatch):
@@ -192,7 +178,6 @@ def test_score_client_empty_zero_terms_is_insufficient_with_control_flag(monkeyp
     _wire_v3(
         monkeypatch,
         current=_stub_current(band="A", score=100.0),
-        forward=_stub_forward(band="none"),
         features=features,
     )
 
@@ -204,6 +189,7 @@ def test_score_client_empty_zero_terms_is_insufficient_with_control_flag(monkeyp
     assert out.rating is None
     assert out.pd is None
     assert out.contributions is None
+    assert out.risk_90d is None
     assert out.forward_risk is None
 
 
@@ -225,19 +211,30 @@ def test_score_client_already_sev180_has_no_out_of_population_forward_risk(monke
     features["total_debt_eur"] = 100.0
     monkeypatch.setattr(service.risk_dataset, "features_one", lambda *a, **k: features)
     monkeypatch.setattr(service, "score_current", lambda f: _stub_current(band="D", score=55.0))
-    monkeypatch.setattr(
-        service,
-        "score_forward",
-        lambda f: (_ for _ in ()).throw(
-            AssertionError("already-SEV180 clients are outside the forward model population")
-        ),
-    )
     monkeypatch.setattr(service.repo, "turnover_eur_by_currency", lambda *a, **k: [])
 
     out = service.score_client(5, None, "2026-06-01", 12, use_cache=False)
 
     assert out.rating == Rating.D
+    assert out.risk_90d is not None
+    assert out.risk_90d.band == Risk90dBand.CRITICAL
+    assert out.risk_90d.exposure_eur == 100.0
+    assert out.risk_90d.reason_code == Risk90dReason.ALREADY_90_PLUS
     assert out.forward_risk is None
+
+
+def test_risk_90d_high_is_exact_overdue_exposure_rounded_to_cents():
+    risk = service._risk_90d(
+        {
+            "overdue_eur_1_30": 40.004,
+            "overdue_eur_31_60": 60.001,
+            "total_debt_eur": 150.005,
+        }
+    )
+
+    assert risk.band == Risk90dBand.HIGH
+    assert risk.exposure_eur == 100.01
+    assert risk.reason_code == Risk90dReason.WILL_CROSS_90_DAYS
 
 
 def test_score_client_provider_only_not_applicable_no_compute(monkeypatch):
@@ -297,15 +294,21 @@ def test_score_client_no_currency_breakdown_single_currency(monkeypatch):
 
 
 def test_score_client_cache_hit_hydrates(monkeypatch):
-    from app.domain.models import Contribution, ForwardRisk, SolvencyScore
+    from app.domain.models import Contribution, Risk90d, SolvencyScore
 
     cached_obj = SolvencyScore(
         client_id=9, applicable=True, score=46, rating=Rating.D, pd=0.65,
         contributions=[Contribution(feature="n_open_debt_lines", value=2.0, points=3.7)],
-        forward_risk=ForwardRisk(band=ForwardRiskBand.HIGH, pd=0.8),
+        risk_90d=Risk90d(
+            band=Risk90dBand.MEDIUM,
+            exposure_eur=250.25,
+            reason_code=Risk90dReason.CURRENT_DEBT,
+        ),
+        forward_risk_status=ForwardRiskStatus.NOT_APPLICABLE,
+        forward_risk_reason="replaced_by_operational_90d",
         sub_factors=None, as_of_date="2026-06-01", window_months=12,
         source_history_start="2025-01-01", effective_start="2025-06-01",
-        history_complete=True,
+        history_complete=True, current_model_run_id="sev180-current-v1",
     ).model_dump(mode="json")
     monkeypatch.setattr(service.cache, "get", lambda *a, **k: cached_obj)
 
@@ -317,20 +320,68 @@ def test_score_client_cache_hit_hydrates(monkeypatch):
     assert out.score == 46
     assert out.rating == Rating.D
     assert out.pd == 0.65
-    assert out.forward_risk.band == ForwardRiskBand.HIGH
+    assert out.risk_90d.band == Risk90dBand.MEDIUM
+    assert out.forward_risk is None
     assert out.contributions[0].feature == "n_open_debt_lines"
 
 
-def test_score_client_ignores_cache_entry_for_another_client(monkeypatch):
+def test_score_client_rejects_legacy_forward_risk_cache(monkeypatch):
     from app.domain.models import Contribution, ForwardRisk, SolvencyScore
+
+    cached_obj = SolvencyScore(
+        client_id=9,
+        applicable=True,
+        score=46,
+        rating=Rating.D,
+        pd=0.65,
+        contributions=[
+            Contribution(
+                feature="n_open_debt_lines",
+                value=2.0,
+                points=3.7,
+            )
+        ],
+        risk_90d=None,
+        forward_risk=ForwardRisk(
+            band=ForwardRiskBand.HIGH,
+            pd=0.8,
+        ),
+        forward_risk_status=ForwardRiskStatus.AVAILABLE,
+        sub_factors=None,
+        as_of_date="2026-06-01",
+        window_months=12,
+        source_history_start="2025-01-01",
+        effective_start="2025-06-01",
+        history_complete=True,
+        current_model_run_id="sev180-current-v1",
+    ).model_dump(mode="json")
+    monkeypatch.setattr(service.cache, "get", lambda *a, **k: cached_obj)
+    _wire_v3(monkeypatch)
+
+    out = service.score_client(9, None, "2026-06-01", 12, use_cache=True)
+
+    assert out.score == 100
+    assert out.risk_90d is not None
+    assert out.risk_90d.band == Risk90dBand.LOW
+    assert out.forward_risk is None
+
+
+def test_score_client_ignores_cache_entry_for_another_client(monkeypatch):
+    from app.domain.models import Contribution, Risk90d, SolvencyScore
 
     cached_obj = SolvencyScore(
         client_id=99, applicable=True, score=46, rating=Rating.D, pd=0.65,
         contributions=[Contribution(feature="n_open_debt_lines", value=2.0, points=3.7)],
-        forward_risk=ForwardRisk(band=ForwardRiskBand.HIGH, pd=0.8),
+        risk_90d=Risk90d(
+            band=Risk90dBand.MEDIUM,
+            exposure_eur=250.25,
+            reason_code=Risk90dReason.CURRENT_DEBT,
+        ),
+        forward_risk_status=ForwardRiskStatus.NOT_APPLICABLE,
+        forward_risk_reason="replaced_by_operational_90d",
         sub_factors=None, as_of_date="2026-06-01", window_months=12,
         source_history_start="2025-01-01", effective_start="2025-06-01",
-        history_complete=True,
+        history_complete=True, current_model_run_id="sev180-current-v1",
     ).model_dump(mode="json")
     monkeypatch.setattr(service.cache, "get", lambda *a, **k: cached_obj)
     _wire_v3(monkeypatch)

@@ -32,10 +32,11 @@ def _wire_operational_dependencies(monkeypatch, *, business_ready: bool) -> None
         "_model_readiness",
         lambda: {
             "current_state": {"ready": True, "training_run_id": "current-test"},
-            "forward_6m": {
-                "ready": False,
-                "status": "unavailable",
-                "reason": "insufficient_unique_positive_clients",
+            "operational_90d": {
+                "ready": True,
+                "kind": "deterministic_open_debt_control",
+                "horizon_days": 90,
+                "threshold_days": 90,
             },
         },
     )
@@ -62,9 +63,9 @@ def test_health_fails_closed_on_stale_business_source(monkeypatch):
 def test_ready_is_200_only_for_complete_business_readiness(monkeypatch):
     _wire_operational_dependencies(monkeypatch, business_ready=True)
     health = TestClient(main.app).get("/health")
-    assert health.json()["status"] == "degraded"
+    assert health.json()["status"] == "healthy"
     assert health.json()["serving_ready"] is True
-    assert health.json()["model_readiness"]["forward_6m"]["ready"] is False
+    assert health.json()["model_readiness"]["operational_90d"]["ready"] is True
 
     response = TestClient(main.app).get("/ready")
     assert response.status_code == 200

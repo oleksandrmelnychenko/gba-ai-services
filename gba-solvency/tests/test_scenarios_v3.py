@@ -37,6 +37,34 @@ NONEXISTENT_CLIENT_ID = 999999999
 LIVE_BASE_URL = os.environ.get("SOLVENCY_BASE_URL", "http://127.0.0.1:8003")
 
 
+def _assert_operational_risk_90d(risk, features: dict) -> None:
+    payload = risk if isinstance(risk, dict) else risk.model_dump(mode="json")
+    overdue_90_plus = sum(
+        float(features.get(name, 0.0) or 0.0)
+        for name in ("overdue_eur_91_180", "overdue_eur_180plus")
+    )
+    overdue_1_90 = sum(
+        float(features.get(name, 0.0) or 0.0)
+        for name in ("overdue_eur_1_30", "overdue_eur_31_60", "overdue_eur_61_90")
+    )
+    total_debt = float(features.get("total_debt_eur", 0.0) or 0.0)
+
+    if overdue_90_plus >= 100.0:
+        expected = ("critical", "already_90_plus", overdue_90_plus)
+    elif overdue_1_90 >= 100.0:
+        expected = ("high", "will_cross_90_days", overdue_1_90)
+    elif total_debt > 0.0:
+        expected = ("medium", "current_debt", total_debt)
+    else:
+        expected = ("low", "no_debt", 0.0)
+
+    assert payload["horizon_days"] == 90
+    assert payload["threshold_days"] == 90
+    assert payload["band"] == expected[0]
+    assert payload["reason_code"] == expected[1]
+    assert payload["exposure_eur"] == pytest.approx(expected[2], abs=0.005)
+
+
 # --------------------------------------------------------------------------------------------
 # Skip plumbing: gate on the DB actually being reachable (settings come from .env or env vars),
 # not on os.environ alone -- this suite must run wherever the app's own DB config resolves.
@@ -236,11 +264,7 @@ def nonbuyer_ids() -> list[int]:
 
 @pytest.fixture(scope="module")
 def forward_at_risk_cohort() -> list[dict]:
-    """Current material-debt buyers in the forward population.
-
-    The post-floor cohort is intentionally too thin to publish a forward model, so these buyers
-    prove that current-state scoring stays available while forward PD fails closed.
-    """
+    """Current material-debt buyers used to prove exact operational 90-day control."""
     from app.risk import dataset
 
     clients = dataset.buyer_ids()
@@ -308,15 +332,9 @@ def test_cohort_overdue_buyers_all_band_c_or_d(service, overdue_cohort):
 
 
 @skip_no_db
-def test_forward_at_risk_cohort_fails_closed_but_retains_current_score(
+def test_material_debt_cohort_has_exact_operational_90_day_control(
     service, forward_at_risk_cohort
 ):
-    from app.risk.score_forward import forward_model_readiness
-
-    readiness = forward_model_readiness()
-    assert readiness["ready"] is False
-    assert readiness["observed_unique_positive_clients"] == 3
-    assert readiness["minimum_unique_positive_clients"] == 30
     for row in forward_at_risk_cohort:
         assert row["features"]["total_debt_eur"] > 0
         assert row["features"]["overdue_eur_180plus"] < SEV180_MIN_EUR
@@ -324,9 +342,11 @@ def test_forward_at_risk_cohort_fails_closed_but_retains_current_score(
         assert result.score is not None
         assert result.pd is not None
         assert result.current_model_run_id
+        assert result.risk_90d is not None
+        _assert_operational_risk_90d(result.risk_90d, row["features"])
         assert result.forward_risk is None
-        assert result.forward_risk_status == "model_unavailable"
-        assert "3 < 30" in result.forward_risk_reason
+        assert result.forward_risk_status == "not_applicable"
+        assert result.forward_risk_reason == "replaced_by_operational_90d"
 
 
 @skip_no_db
@@ -439,7 +459,8 @@ def test_current_score_is_invariant_to_excluded_sev180_magnitude(overdue_cohort)
 # --------------------------------------------------------------------------------------------
 @skip_no_db
 def test_contract_inprocess_shape_for_applicable_buyer(service, forward_at_risk_cohort):
-    res = _score(service, forward_at_risk_cohort[0]["client_id"])
+    cohort_row = forward_at_risk_cohort[0]
+    res = _score(service, cohort_row["client_id"])
     assert res.applicable is True
     assert isinstance(res.score, int) and 0 <= res.score <= 100
     assert res.rating in {"A", "B", "C", "D"}
@@ -448,9 +469,11 @@ def test_contract_inprocess_shape_for_applicable_buyer(service, forward_at_risk_
     for c in res.contributions:
         assert isinstance(c.feature, str) and c.feature
         assert isinstance(c.points, float)
+    assert res.risk_90d is not None
+    _assert_operational_risk_90d(res.risk_90d, cohort_row["features"])
     assert res.forward_risk is None
-    assert res.forward_risk_status == "model_unavailable"
-    assert "3 < 30" in res.forward_risk_reason
+    assert res.forward_risk_status == "not_applicable"
+    assert res.forward_risk_reason == "replaced_by_operational_90d"
     assert res.current_model_run_id
     assert res.sub_factors is None  # deprecated, always null in v3
     assert res.model_version == "creditscore-v3"
@@ -461,7 +484,8 @@ def test_contract_live_response_shape_applicable(forward_at_risk_cohort):
     _require_live()
     import httpx as requests
 
-    client_id = forward_at_risk_cohort[0]["client_id"]
+    cohort_row = forward_at_risk_cohort[0]
+    client_id = cohort_row["client_id"]
     r = requests.post(
         f"{LIVE_BASE_URL}/score",
         json={"client_id": client_id, "as_of_date": _AS_OF, "use_cache": False},
@@ -472,7 +496,7 @@ def test_contract_live_response_shape_applicable(forward_at_risk_cohort):
     body = r.json()
     required = {
         "client_id", "applicable", "score", "rating", "pd", "contributions",
-        "forward_risk", "forward_risk_status", "forward_risk_reason",
+        "risk_90d", "forward_risk", "forward_risk_status", "forward_risk_reason",
         "current_model_run_id", "sub_factors", "model_version",
     }
     assert required.issubset(body.keys()), f"missing keys: {required - set(body.keys())}"
@@ -484,9 +508,10 @@ def test_contract_live_response_shape_applicable(forward_at_risk_cohort):
     assert body["rating"] in {"A", "B", "C", "D"}
     assert 0.0 <= body["pd"] <= 1.0
     assert isinstance(body["contributions"], list) and len(body["contributions"]) > 0
+    _assert_operational_risk_90d(body["risk_90d"], cohort_row["features"])
     assert body["forward_risk"] is None
-    assert body["forward_risk_status"] == "model_unavailable"
-    assert "3 < 30" in body["forward_risk_reason"]
+    assert body["forward_risk_status"] == "not_applicable"
+    assert body["forward_risk_reason"] == "replaced_by_operational_90d"
     assert body["current_model_run_id"]
 
 

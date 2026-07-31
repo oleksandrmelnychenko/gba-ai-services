@@ -116,6 +116,35 @@ class ForwardRisk(BaseModel):
     pd: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
 
 
+class Risk90dBand(StrEnum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
+class Risk90dReason(StrEnum):
+    NO_DEBT = "no_debt"
+    CURRENT_DEBT = "current_debt"
+    WILL_CROSS_90_DAYS = "will_cross_90_days"
+    ALREADY_90_PLUS = "already_90_plus"
+
+
+class Risk90d(BaseModel):
+    """Operational 90-day control derived from exact open-debt aging buckets."""
+
+    horizon_days: int = Field(default=90, ge=1)
+    threshold_days: int = Field(default=90, ge=1)
+    band: Risk90dBand
+    exposure_eur: float = Field(ge=0.0, allow_inf_nan=False)
+    reason_code: Risk90dReason
+
+    @field_validator("exposure_eur", mode="before")
+    @classmethod
+    def _round_exposure(cls, value):
+        return float(round_cent(value))
+
+
 class SolvencyScore(BaseModel):
     client_id: int
     client_net_uid: str | None = Field(
@@ -133,6 +162,7 @@ class SolvencyScore(BaseModel):
         description="current-state PD (0..1)",
     )
     contributions: list[Contribution] | None = None
+    risk_90d: Risk90d | None = None
     forward_risk: ForwardRisk | None = None
     forward_risk_status: ForwardRiskStatus = ForwardRiskStatus.MODEL_UNAVAILABLE
     forward_risk_reason: str | None = None
