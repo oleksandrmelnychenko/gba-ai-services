@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY pyproject.toml ./
 RUN pip install --upgrade pip && pip install \
+        "anthropic>=0.75,<1" \
         "fastapi>=0.115" "uvicorn[standard]>=0.34" "pydantic>=2.10" \
         "pydantic-settings>=2.7" "sqlalchemy>=2.0.36" "pymssql>=2.3.1" \
         "redis>=5.2" "structlog>=24.4"

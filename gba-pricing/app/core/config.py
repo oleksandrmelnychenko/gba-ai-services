@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import date
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -44,6 +45,25 @@ class Settings(BaseSettings):
             "http://127.0.0.1:8083",
         ]
     )
+
+    # Anthropic-powered public competitor price search. The same server-only key may be shared
+    # with gba-ecommerce image search, but it must never be exposed to either browser bundle.
+    anthropic_api_key: str = Field(default="", description="Server-only Anthropic API key")
+    anthropic_api_key_file: str = "/run/secrets/AnthropicApiKey"
+    competitor_search_model: str = "claude-sonnet-5"
+    competitor_search_max_uses: int = Field(default=5, ge=1, le=10)
+    competitor_search_max_offers: int = Field(default=18, ge=1, le=30)
+    competitor_search_timeout_seconds: float = Field(default=90.0, ge=10.0, le=180.0)
+    competitor_search_cache_ttl: int = Field(default=900, ge=60, le=3600)
+
+    def resolve_anthropic_api_key(self) -> str:
+        if self.anthropic_api_key.strip():
+            return self.anthropic_api_key.strip()
+        secret_path = Path(self.anthropic_api_key_file)
+        try:
+            return secret_path.read_text(encoding="utf-8").strip()
+        except (OSError, ValueError):
+            return ""
 
     # Pricing model (A+B: margin-floor + peer-price-band discount governor)
     model_version: str = "pricing-ab-v2"

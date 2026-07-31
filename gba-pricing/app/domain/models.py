@@ -8,8 +8,10 @@ Contract is aligned with the future gba-server (.NET) DTOs and the console.
 """
 from __future__ import annotations
 
-from datetime import date
+import uuid
+from datetime import UTC, date, datetime
 from enum import StrEnum
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -20,6 +22,118 @@ class Confidence(StrEnum):
     HIGH = "high"
     MEDIUM = "medium"
     LOW = "low"
+
+
+class CompetitorSource(StrEnum):
+    AVTOPRO = "avtopro"
+    GOOGLE = "google"
+    HOTLINE = "hotline"
+    PROM = "prom"
+    ROZETKA = "rozetka"
+
+
+class CompetitorAvailability(StrEnum):
+    IN_STOCK = "in_stock"
+    LIMITED = "limited"
+    OUT_OF_STOCK = "out_of_stock"
+    UNKNOWN = "unknown"
+
+
+class CompetitorPriceSearchRequest(BaseModel):
+    market: str = "UA"
+    product_net_uid: str | None = None
+    query: str = Field(min_length=2, max_length=180)
+    sources: list[CompetitorSource] = Field(min_length=1, max_length=5)
+
+    @field_validator("query", "product_net_uid", mode="before")
+    @classmethod
+    def strip_competitor_search_strings(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("sources")
+    @classmethod
+    def require_unique_competitor_sources(
+        cls, value: list[CompetitorSource]
+    ) -> list[CompetitorSource]:
+        if len(set(value)) != len(value):
+            raise ValueError("sources must be unique")
+        return value
+
+    @model_validator(mode="after")
+    def validate_competitor_market_and_product(self) -> CompetitorPriceSearchRequest:
+        if self.market != "UA":
+            raise ValueError("market must be UA")
+        if self.product_net_uid:
+            try:
+                uuid.UUID(self.product_net_uid)
+            except ValueError as exc:
+                raise ValueError("product_net_uid must be a UUID") from exc
+        return self
+
+
+class CompetitorPriceOffer(BaseModel):
+    source: CompetitorSource
+    marketplace_name: str = Field(min_length=1, max_length=80)
+    seller_name: str | None = Field(default=None, max_length=120)
+    title: str = Field(min_length=1, max_length=300)
+    url: str = Field(min_length=8, max_length=2048)
+    price_uah: float = Field(gt=0, le=100_000_000, allow_inf_nan=False)
+    original_price_uah: float | None = Field(
+        default=None, gt=0, le=100_000_000, allow_inf_nan=False
+    )
+    availability: CompetitorAvailability = CompetitorAvailability.UNKNOWN
+    delivery_text: str | None = Field(default=None, max_length=180)
+    similarity_score: float = Field(ge=0.8, le=1.0, allow_inf_nan=False)
+
+    @field_validator(
+        "marketplace_name",
+        "seller_name",
+        "title",
+        "url",
+        "delivery_text",
+        mode="before",
+    )
+    @classmethod
+    def strip_offer_strings(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("url")
+    @classmethod
+    def require_public_http_url(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("url must be an absolute HTTP(S) URL")
+        host = parsed.hostname.lower()
+        if host in {"localhost", "0.0.0.0", "127.0.0.1", "::1"}:
+            raise ValueError("url must be public")
+        return value
+
+    @field_validator("price_uah", "original_price_uah", mode="after")
+    @classmethod
+    def round_offer_money(cls, value):
+        return None if value is None else round(float(value) + 0.0, 2)
+
+    @model_validator(mode="after")
+    def validate_original_price(self) -> CompetitorPriceOffer:
+        if self.original_price_uah is not None and self.original_price_uah < self.price_uah:
+            raise ValueError("original_price_uah cannot be below price_uah")
+        return self
+
+
+class CompetitorPriceSearchResult(BaseModel):
+    market: str = "UA"
+    currency: str = "UAH"
+    query: str = Field(min_length=2, max_length=180)
+    searched_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    sources_scanned: list[CompetitorSource] = Field(min_length=1, max_length=5)
+    ai_summary: str | None = Field(default=None, max_length=400)
+    offers: list[CompetitorPriceOffer] = Field(max_length=30)
+
+    @model_validator(mode="after")
+    def validate_competitor_result_contract(self) -> CompetitorPriceSearchResult:
+        if self.market != "UA" or self.currency != "UAH":
+            raise ValueError("competitor search supports UA/UAH only")
+        return self
 
 
 class DiscountBand(BaseModel):

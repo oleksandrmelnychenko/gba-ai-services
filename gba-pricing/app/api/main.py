@@ -24,8 +24,14 @@ from app.data import pricing_repository as repo
 from app.data.db import dispose, get_engine
 from app.domain.models import (
     BatchPriceRequest,
+    CompetitorPriceSearchRequest,
+    CompetitorPriceSearchResult,
     PriceRecommendation,
     PriceRequest,
+)
+from app.services.competitor_search import (
+    CompetitorSearchNotConfigured,
+    search_competitor_prices,
 )
 
 settings = get_settings()
@@ -214,6 +220,27 @@ def price(req: PriceRequest) -> PriceRecommendation:
         log.error("price_failed", error_id=eid, product_id=req.product_id,
                   client_agreement_net_uid=req.client_agreement_net_uid, error=str(exc))
         raise HTTPException(status_code=500, detail=f"internal error (ref {eid})") from exc
+
+
+@app.post("/competitors/search", response_model=CompetitorPriceSearchResult)
+async def competitor_search(req: CompetitorPriceSearchRequest) -> CompetitorPriceSearchResult:
+    try:
+        return await search_competitor_prices(req)
+    except CompetitorSearchNotConfigured as exc:
+        raise HTTPException(status_code=503, detail="competitor_search_not_configured") from exc
+    except Exception as exc:  # noqa: BLE001
+        eid = uuid.uuid4().hex
+        log.error(
+            "competitor_search_failed",
+            error_id=eid,
+            product_net_uid=req.product_net_uid,
+            sources=[source.value for source in req.sources],
+            error=str(exc),
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"competitor search upstream failed (ref {eid})",
+        ) from exc
 
 
 @app.post("/price/batch")

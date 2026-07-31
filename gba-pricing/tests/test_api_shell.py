@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from app.api import main
 from app.domain.models import (
+    CompetitorPriceSearchResult,
     Confidence,
     DiscountBand,
     PeerBand,
@@ -63,6 +64,45 @@ def test_metrics_endpoint():
     resp = client.get("/metrics", headers=_headers())
     assert resp.status_code == 200
     assert "uptime_seconds" in resp.json()
+
+
+def test_competitor_search_route_returns_console_contract(monkeypatch):
+    async def fake_search(request):
+        return CompetitorPriceSearchResult(
+            query=request.query,
+            sources_scanned=request.sources,
+            ai_summary="Знайдено один точний збіг.",
+            offers=[
+                {
+                    "source": "prom",
+                    "marketplace_name": "Prom.ua",
+                    "seller_name": "Truck Parts UA",
+                    "title": "Сайлентблок MAN 81.43220-6057",
+                    "url": "https://prom.ua/ua/p123-exact-part.html",
+                    "price_uah": 1250,
+                    "original_price_uah": None,
+                    "availability": "in_stock",
+                    "delivery_text": None,
+                    "similarity_score": 1.0,
+                }
+            ],
+        )
+
+    monkeypatch.setattr(main, "search_competitor_prices", fake_search)
+    response = TestClient(main.app).post(
+        "/competitors/search",
+        headers=_headers(),
+        json={
+            "market": "UA",
+            "product_net_uid": CA_UID,
+            "query": "81.43220-6057 MAN сайлентблок",
+            "sources": ["prom"],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["currency"] == "UAH"
+    assert response.json()["offers"][0]["price_uah"] == 1250
 
 
 def test_health_fails_closed_when_business_source_is_not_ready(monkeypatch):
