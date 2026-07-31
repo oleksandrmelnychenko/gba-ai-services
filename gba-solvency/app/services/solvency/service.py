@@ -4,6 +4,8 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
+from pydantic import ValidationError
+
 from app.core.config import get_settings
 from app.core.history import coverage, require_supported_as_of
 from app.core.logging import get_logger
@@ -108,7 +110,10 @@ def _hydrate_score(data: dict, expected_client_id: int) -> SolvencyScore | None:
     }
     if not required_metadata.issubset(data):
         return None
-    result = SolvencyScore.model_validate(data)
+    try:
+        result = SolvencyScore.model_validate(data)
+    except ValidationError:
+        return None
     if result.client_id != expected_client_id or result.as_of_date is None:
         return None
     if (

@@ -384,6 +384,48 @@ def test_score_client_rejects_legacy_forward_risk_cache(monkeypatch):
     assert out.forward_risk is None
 
 
+def test_score_client_rejects_internally_inconsistent_risk_cache(monkeypatch):
+    from app.domain.models import Contribution, Risk90d, SolvencyScore
+
+    cached_obj = SolvencyScore(
+        client_id=9,
+        applicable=True,
+        score=46,
+        rating=Rating.D,
+        pd=0.65,
+        contributions=[
+            Contribution(
+                feature="n_open_debt_lines",
+                value=2.0,
+                points=3.7,
+            )
+        ],
+        risk_90d=Risk90d(
+            band=Risk90dBand.MEDIUM,
+            exposure_eur=0.01,
+            reason_code=Risk90dReason.CURRENT_DEBT,
+        ),
+        forward_risk_status=ForwardRiskStatus.NOT_APPLICABLE,
+        forward_risk_reason="replaced_by_operational_90d",
+        sub_factors=None,
+        as_of_date="2026-06-01",
+        window_months=12,
+        source_history_start="2025-01-01",
+        effective_start="2025-06-01",
+        history_complete=True,
+        current_model_run_id="sev180-current-v1",
+    ).model_dump(mode="json")
+    cached_obj["risk_90d"]["exposure_eur"] = 0.0
+    monkeypatch.setattr(service.cache, "get", lambda *a, **k: cached_obj)
+    _wire_v3(monkeypatch)
+
+    out = service.score_client(9, None, "2026-06-01", 12, use_cache=True)
+
+    assert out.score == 100
+    assert out.risk_90d is not None
+    assert out.risk_90d.band == Risk90dBand.LOW
+
+
 def test_score_client_ignores_cache_entry_for_another_client(monkeypatch):
     from app.domain.models import Contribution, Risk90d, SolvencyScore
 

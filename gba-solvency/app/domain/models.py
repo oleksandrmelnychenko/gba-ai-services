@@ -144,6 +144,38 @@ class Risk90d(BaseModel):
     def _round_exposure(cls, value):
         return float(round_cent(value))
 
+    @model_validator(mode="after")
+    def _validate_operational_contract(self) -> Self:
+        valid = (
+            self.horizon_days == 90
+            and self.threshold_days == 90
+            and (
+                (
+                    self.band == Risk90dBand.LOW
+                    and self.reason_code == Risk90dReason.NO_DEBT
+                    and self.exposure_eur == 0.0
+                )
+                or (
+                    self.band == Risk90dBand.MEDIUM
+                    and self.reason_code == Risk90dReason.CURRENT_DEBT
+                    and self.exposure_eur > 0.0
+                )
+                or (
+                    self.band == Risk90dBand.HIGH
+                    and self.reason_code == Risk90dReason.WILL_CROSS_90_DAYS
+                    and self.exposure_eur >= 100.0
+                )
+                or (
+                    self.band == Risk90dBand.CRITICAL
+                    and self.reason_code == Risk90dReason.ALREADY_90_PLUS
+                    and self.exposure_eur >= 100.0
+                )
+            )
+        )
+        if not valid:
+            raise ValueError("risk_90d operational fields are inconsistent")
+        return self
+
 
 class SolvencyScore(BaseModel):
     client_id: int
