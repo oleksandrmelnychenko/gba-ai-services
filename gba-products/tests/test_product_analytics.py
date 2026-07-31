@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from datetime import date
 from decimal import Decimal
+
+import pytest
 
 from fastapi.testclient import TestClient
 
@@ -248,3 +251,45 @@ def test_builder_uses_half_up_money_and_explicit_quantity_scale():
     assert point.units == 2.3457
     assert point.revenue_eur == 1.01
     assert point.avg_price_eur == 0.4285
+
+
+def test_snapshot_sales_aggregates_follow_the_response_window():
+    """revenue_eur must come from the same window as the series, not the rolling portfolio one."""
+    monthly = [
+        {"ym": "2026-06", "units": 10, "order_count": 3, "revenue_eur": 200},
+        {"ym": "2026-07", "units": 5, "order_count": 2, "revenue_eur": 120},
+    ]
+    # The portfolio snapshot carries rolling-window figures that must not leak through.
+    snapshot = {
+        "product_id": 1,
+        "found": True,
+        "annual_units": 99.0,
+        "revenue_eur": 9999.0,
+        "avg_price_eur": 101.0,
+        "unit_cost_eur": 16.0,
+    }
+
+    response = product_analytics.build_product_analytics(
+        product_id=1,
+        as_of="2026-07-26",
+        months=2,
+        model_version="test",
+        snapshot=snapshot,
+        monthly_rows=monthly,
+        source_history_start=date(2025, 1, 1),
+    )
+
+    aligned = response.snapshot
+    assert aligned["annual_units"] == 15.0
+    assert aligned["revenue_eur"] == 320.0
+    # unit prices are quantised to 4 decimals by the exact-number contract
+    assert aligned["avg_price_eur"] == pytest.approx(320 / 15, abs=1e-4)
+    # The advertised contract holds: avg_price_eur == revenue_eur / units.
+    assert aligned["revenue_eur"] / aligned["annual_units"] == pytest.approx(
+        aligned["avg_price_eur"], abs=0.01
+    )
+    # Margin follows the corrected average price rather than the stale snapshot one.
+    assert aligned["margin_pct"] == pytest.approx((320 / 15 - 16) / (320 / 15), abs=1e-4)
+    # Series and snapshot agree.
+    assert sum(point.units for point in response.sales_series) == aligned["annual_units"]
+    assert sum(point.revenue_eur for point in response.sales_series) == aligned["revenue_eur"]

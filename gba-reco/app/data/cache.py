@@ -178,10 +178,14 @@ def add_negatives(customer_id: int, product_ids: list[int], ttl: int) -> int:
     try:
         n = client.sadd(key, *codes)
         client.expire(key, ttl)
-        return int(n)
     except Exception as exc:  # noqa: BLE001
         log.warning("neg_add_failed", customer_id=customer_id, error=str(exc))
         return 0
+
+    # journal AFTER the cache write succeeds — the durable copy self-heals Redis on startup
+    from app.data import feedback_store
+    feedback_store.append(net_uid, list(codes))
+    return int(n)
 
 
 def get_negative_vendor_codes(customer_id: int) -> frozenset[str]:

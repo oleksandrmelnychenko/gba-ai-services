@@ -98,6 +98,9 @@ def _ranking_field_updates(doc: dict) -> dict:
 
 def _hydrate_ranking_fields(docs: list[dict], *, persist: bool = False) -> None:
     for doc in docs:
+        if doc.get("task_type") == TaskType.MANUAL.value:
+            # head-assigned tasks carry no EV by design; ranking falls back to priority
+            continue
         updates = _ranking_field_updates(doc)
         if not updates:
             continue
@@ -114,6 +117,7 @@ def backfill_active_ranking_fields(manager_id: int | None = None, limit: int = 1
     """
     query: dict = {
         "status": {"$in": list(s.value for s in ACTIVE)},
+        "task_type": {"$ne": TaskType.MANUAL.value},
         "$or": [
             {"p_outcome": {"$exists": False}},
             {"p_outcome": None},
@@ -150,7 +154,10 @@ def _ranking_score(doc: dict) -> float:
 
 
 def _inbox_sort_key(doc: dict) -> tuple:
-    return (_URGENCY_RANK.get(doc.get("urgency"), 9),
+    # Head-assigned (manual) tasks pin above the AI queue: a direct order from the head is worked
+    # before model-ranked suggestions regardless of EV. Within each tier the usual policy applies.
+    return (0 if doc.get("task_type") == TaskType.MANUAL.value else 1,
+            _URGENCY_RANK.get(doc.get("urgency"), 9),
             -_ranking_score(doc),
             _TYPE_RANK.get(doc.get("task_type"), 9),
             -_float_score(doc.get("priority")))
@@ -265,6 +272,52 @@ def upsert_generated(task: Task) -> str:
     return task.task_key
 
 
+def create_manual(task: Task, created_by: int) -> dict:
+    """Insert a head-assigned task (origin=head). Unlike upsert_generated this is not idempotent
+    regeneration: the task_key is unique per assignment, expires_at stays None so sweep_expired can
+    never silently delete the head's direct order, and no generator ever refreshes or resurrects it.
+    EV fields are persisted as None (not 0.0) so ranking falls back to the urgency-derived priority
+    instead of pinning the task under every EV-scored document."""
+    now = _now()
+    doc = {
+        "task_key": task.task_key,
+        "status": TaskStatus.OPEN.value,
+        "notes": [],
+        "status_history": [{"from": TaskStatus.GENERATED.value, "to": TaskStatus.OPEN.value,
+                            "at": now, "by": created_by}],
+        "snooze_until": None,
+        "sla_breached": False,
+        "escalated_to": None,
+        "outcome": None,
+        "generated_at": now,
+        "manager_id": task.manager_id,
+        "client_id": task.client_id,
+        "client_name": task.client_name,
+        "task_type": task.task_type.value,
+        "title": task.title,
+        "reason": task.reason,
+        "priority": task.priority,
+        "p_outcome": None,
+        "expected_value": None,
+        "ev_score": None,
+        "urgency": task.urgency.value,
+        "payload": task.payload,
+        "signals": task.signals,
+        "explanation": task.explanation.model_dump(),
+        "contact": task.contact.model_dump(),
+        "due_date": task.due_date,
+        "ab_variant": None,
+        "origin": "head",
+        "created_by": created_by,
+        "model_version": get_settings().model_version,
+        "updated_at": now,
+        "expires_at": None,
+    }
+    mongo.tasks().insert_one(doc)
+    _event(task.task_key, "created_manual", by=created_by)
+    return doc
+
+
 def change_status(task_key: str, to: TaskStatus, by: int, reason: str | None = None,
                   outcome: Outcome | None = None, snooze_until: datetime | None = None) -> dict:
     doc = mongo.tasks().find_one({"task_key": task_key})
@@ -312,9 +365,11 @@ def change_status(task_key: str, to: TaskStatus, by: int, reason: str | None = N
     return updated
 
 
-def add_note(task_key: str, author_id: int, text: str) -> dict:
+def add_note(task_key: str, author_id: int, text: str, author_name: str | None = None) -> dict:
     now = _now()
     note = {"author_id": author_id, "text": text, "created_at": now}
+    if author_name:
+        note["author_name"] = author_name
     updated = mongo.tasks().find_one_and_update(
         {"task_key": task_key},
         {"$push": {"notes": note}, "$set": {"updated_at": now}},
@@ -397,7 +452,11 @@ def sweep_orphaned() -> int:
     ALLOWED_TRANSITIONS), applied directly like the other sweeps. Returns the number closed."""
     from app.data import signals_repository
     active_values = list(s.value for s in ACTIVE)
-    cids = [c for c in mongo.tasks().distinct("client_id", {"status": {"$in": active_values}})
+    # Manual (head-assigned) tasks are exempt: they may legitimately carry client_id=0 (no client)
+    # and a head's direct order must not be closed by a data-wipe heuristic.
+    not_manual = {"task_type": {"$ne": TaskType.MANUAL.value}}
+    cids = [c for c in mongo.tasks().distinct(
+                "client_id", {"status": {"$in": active_values}, **not_manual})
             if c is not None]
     if not cids:
         return 0
@@ -408,7 +467,7 @@ def sweep_orphaned() -> int:
     reason = "client_id absent from dbo.Client (orphaned by data wipe/re-mint)"
     orphaned = 0
     cursor = mongo.tasks().find(
-        {"status": {"$in": active_values}, "client_id": {"$in": dead}},
+        {"status": {"$in": active_values}, "client_id": {"$in": dead}, **not_manual},
         {"task_key": 1, "status": 1, "client_id": 1})
     for doc in cursor:
         res = mongo.tasks().update_one(
@@ -481,15 +540,27 @@ def escalated_tasks(limit: int = 100) -> list[dict]:
 _TEAM_BOARD_FIELDS = (
     "task_key", "manager_id", "client_id", "client_name", "task_type", "title", "status",
     "urgency", "priority", "p_outcome", "expected_value", "ev_score", "in_progress_since",
-    "generated_at", "updated_at", "sla_breached",
+    "generated_at", "updated_at", "sla_breached", "origin", "created_by", "due_date", "notes",
+    "reason", "status_history", "outcome",
 )
+
+
+def _resolution_reason(history: list | None) -> str | None:
+    """The reason of the LAST status change that carried one — for a dismissed task this is the
+    manager's «не актуально» explanation the head needs to see on the board."""
+    for change in reversed(history or []):
+        reason = (change or {}).get("reason")
+        if reason:
+            return str(reason)
+    return None
 
 # Status order for the by_status rollup (fixed shape the board renders).
 _TEAM_STATUS_KEYS = ("open", "in_progress", "done", "snoozed", "dismissed")
 
 
 def team_tasks(statuses: list[str], manager_ids: list[int] | None = None, urgency: str | None = None,
-               skip: int = 0, limit: int = 50) -> tuple[list[dict], int, dict]:
+               skip: int = 0, limit: int = 50,
+               task_type: str | None = None) -> tuple[list[dict], int, dict]:
     """Team-wide live board (head-of-sales). ONE Mongo aggregation over `tasks` with NO single-manager
     filter — team = ALL managers (optionally narrowed to manager_ids), status $in statuses, optional
     urgency match. Sorted by urgency band, then actively-worked first (in_progress_since asc, nulls
@@ -504,6 +575,8 @@ def team_tasks(statuses: list[str], manager_ids: list[int] | None = None, urgenc
         match["manager_id"] = {"$in": list(manager_ids)}
     if urgency:
         match["urgency"] = urgency
+    if task_type:
+        match["task_type"] = task_type
 
     # urgency rank + has-in_progress_since rank as ENGINE-side computed fields so the sort works
     # in the aggregation (nulls last: docs with no in_progress_since sort after those that have one).
@@ -543,18 +616,24 @@ def team_tasks(statuses: list[str], manager_ids: list[int] | None = None, urgenc
         if row["_id"] in by_status:
             by_status[row["_id"]] = row["n"]
 
-    # join manager display names once for the page.
+    # join manager display names once for the page; collapse status_history into the single
+    # resolution reason the board renders (the full history stays a cockpit-side concern).
     from app.data import signals_repository
     mgr_ids = sorted({d["manager_id"] for d in page if d.get("manager_id") is not None})
     names = signals_repository.manager_names(mgr_ids) if mgr_ids else {}
     for d in page:
         d["manager_name"] = names.get(d.get("manager_id"))
+        d["resolution_reason"] = _resolution_reason(d.pop("status_history", None))
     return page, total, by_status
 
 
-def active_count(manager_id: int) -> int:
-    return mongo.tasks().count_documents(
-        {"manager_id": manager_id, "status": {"$in": list(s.value for s in ACTIVE)}})
+def active_count(manager_id: int, exclude_manual: bool = False) -> int:
+    query: dict = {"manager_id": manager_id, "status": {"$in": list(s.value for s in ACTIVE)}}
+    if exclude_manual:
+        # generation capacity: head-assigned tasks ride ON TOP of the AI queue and must not
+        # silently shrink the generated plan.
+        query["task_type"] = {"$ne": TaskType.MANUAL.value}
+    return mongo.tasks().count_documents(query)
 
 
 def escalated_count() -> int:
@@ -563,6 +642,65 @@ def escalated_count() -> int:
     return mongo.tasks().count_documents(
         {"status": {"$in": list(s.value for s in ACTIVE)},
          "escalated_to": {"$ne": None, "$exists": True}})
+
+
+def dismissal_stats(window_days: int = 30, manager_ids: list[int] | None = None) -> dict:
+    """Aggregated «не актуально» analytics for the head board: dismissed tasks over the window,
+    grouped per manager and per dismissal reason (the reason of the LAST status change carrying
+    one — the same collapse rule the board rows use). Reasons are grouped after whitespace/case
+    normalisation so quick-chip texts and hand-typed variants of the same wording land in one
+    bucket; the first-seen original spelling is what gets displayed."""
+    since = _now() - timedelta(days=window_days)
+    match: dict = {"status": TaskStatus.DISMISSED.value, "updated_at": {"$gte": since}}
+    if manager_ids:
+        match["manager_id"] = {"$in": list(manager_ids)}
+    docs = list(mongo.tasks().find(
+        match, {"manager_id": 1, "task_type": 1, "status_history": 1}))
+
+    per_mgr: dict[int, dict] = {}
+    reason_totals: dict[str, dict] = {}
+    for doc in docs:
+        mid = doc.get("manager_id")
+        entry = per_mgr.setdefault(
+            mid, {"dismissed": 0, "manual": 0, "no_reason": 0, "reasons": {}})
+        entry["dismissed"] += 1
+        if doc.get("task_type") == TaskType.MANUAL.value:
+            entry["manual"] += 1
+        reason = _resolution_reason(doc.get("status_history"))
+        if not reason:
+            entry["no_reason"] += 1
+            continue
+        key = " ".join(reason.split()).casefold()
+        bucket = entry["reasons"].setdefault(key, {"reason": reason, "count": 0})
+        bucket["count"] += 1
+        total = reason_totals.setdefault(key, {"reason": reason, "count": 0, "managers": set()})
+        total["count"] += 1
+        total["managers"].add(mid)
+
+    from app.data import signals_repository
+    names = signals_repository.manager_names(sorted(per_mgr)) if per_mgr else {}
+    managers = [
+        {
+            "manager_id": mid,
+            "manager_name": names.get(mid),
+            "dismissed": entry["dismissed"],
+            "manual": entry["manual"],
+            "no_reason": entry["no_reason"],
+            "reasons": sorted(entry["reasons"].values(), key=lambda r: -r["count"]),
+        }
+        for mid, entry in per_mgr.items()
+    ]
+    managers.sort(key=lambda m: -m["dismissed"])
+    top_reasons = sorted(
+        ({"reason": v["reason"], "count": v["count"], "managers": len(v["managers"])}
+         for v in reason_totals.values()),
+        key=lambda r: -r["count"])
+    return {
+        "window_days": window_days,
+        "total_dismissed": len(docs),
+        "managers": managers,
+        "top_reasons": top_reasons,
+    }
 
 
 def _active_counts(manager_id: int, field: str) -> dict:

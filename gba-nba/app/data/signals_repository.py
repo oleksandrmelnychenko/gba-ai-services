@@ -300,6 +300,56 @@ def clients_for_manager(manager_id: int) -> list[dict]:
     )
 
 
+def clients_overview_for_manager(manager_id: int, as_of: str, window_days: int = 365) -> list[dict]:
+    """Manager's client book + light commercial stats for the cockpit «Мої клієнти» view: identity,
+    contacts, NetUID (the console recommendation/agreement routes are NetUID-keyed), last order date,
+    distinct orders and EUR turnover over the trailing window. Turnover mirrors client_monetary
+    (IsValidForCurrentSale + synthetic/ubiquity exclusion) so the number matches every other signal."""
+    window = history.rolling_days(as_of, window_days)
+    excl = _excluded(window.as_of.isoformat())
+    not_in = ""
+    params: dict = {
+        "mid": manager_id,
+        "asof": window.as_of.isoformat(),
+        "start": window.effective_start.isoformat(),
+    }
+    if excl:
+        eph, eparams = in_clause("x", sorted(excl))
+        not_in = f" AND oi.ProductID NOT IN {eph}"
+        params.update(eparams)
+    return query(
+        f"""
+        SELECT c.ID AS client_id,
+               LOWER(CONVERT(varchar(36), c.NetUID)) AS client_net_uid,
+               c.Name AS name, c.FullName AS full_name,
+               c.MobileNumber AS phone, c.EmailAddress AS email,
+               ord.last_order AS last_order,
+               ISNULL(ord.orders_cnt, 0) AS orders_cnt,
+               ISNULL(rev.turnover_eur, 0) AS turnover_eur
+        FROM dbo.Client c
+        OUTER APPLY (
+            SELECT MAX(o.Created) AS last_order, COUNT(DISTINCT o.ID) AS orders_cnt
+            FROM dbo.ClientAgreement ca
+            JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
+                 AND o.Created >= :start AND o.Created < :asof
+            WHERE ca.ClientID = c.ID
+        ) ord
+        OUTER APPLY (
+            SELECT SUM(oi.Qty * oi.PricePerItem) AS turnover_eur
+            FROM dbo.ClientAgreement ca
+            JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
+                 AND o.Created >= :start AND o.Created < :asof
+            JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
+                 AND oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL{not_in}
+            WHERE ca.ClientID = c.ID
+        ) rev
+        WHERE c.Deleted = 0 AND c.MainManagerID = :mid
+        ORDER BY ISNULL(rev.turnover_eur, 0) DESC, c.Name
+        """,
+        params,
+    )
+
+
 def active_clients_for_manager(manager_id: int, as_of: str, recent_days: int = 120,
                                min_orders: int = 3) -> list[dict]:
     """Clients with >= min_orders distinct orders in the last recent_days — the only clients worth
@@ -372,27 +422,33 @@ _EUR_VALUE_CTE = """
             SELECT TOP(1) IIF(erh.Amount IS NOT NULL, erh.Amount, er0.Amount) AS rate
             FROM dbo.ExchangeRate er0
             LEFT JOIN dbo.ExchangeRateHistory erh
-                ON erh.ExchangeRateID = er0.ID AND erh.Created <= d.Created
+                ON erh.ExchangeRateID = er0.ID
+               AND erh.Deleted = 0
+               AND erh.Created <= d.Created
             WHERE er0.CurrencyID = ISNULL(a.CurrencyID, 2) AND er0.Code = 'EUR' AND er0.Deleted = 0
-            ORDER BY erh.ID DESC
+            ORDER BY erh.Created DESC, erh.ID DESC, er0.ID DESC
         ) er
         OUTER APPLY (
             SELECT TOP(1) IIF(crh.Amount IS NOT NULL, crh.Amount, cr0.Amount) AS rate
             FROM dbo.CrossExchangeRate cr0
             LEFT JOIN dbo.CrossExchangeRateHistory crh
-                ON crh.CrossExchangeRateID = cr0.ID AND crh.Created <= d.Created
+                ON crh.CrossExchangeRateID = cr0.ID
+               AND crh.Deleted = 0
+               AND crh.Created <= d.Created
             WHERE cr0.CurrencyFromID = ISNULL(a.CurrencyID, 2) AND cr0.CurrencyToID = eur.eur_id
                   AND cr0.Deleted = 0
-            ORDER BY crh.ID DESC
+            ORDER BY crh.Created DESC, crh.ID DESC, cr0.ID DESC
         ) cr
         OUTER APPLY (
             SELECT TOP(1) IIF(crh.Amount IS NOT NULL, crh.Amount, cr0.Amount) AS rate
             FROM dbo.CrossExchangeRate cr0
             LEFT JOIN dbo.CrossExchangeRateHistory crh
-                ON crh.CrossExchangeRateID = cr0.ID AND crh.Created <= d.Created
+                ON crh.CrossExchangeRateID = cr0.ID
+               AND crh.Deleted = 0
+               AND crh.Created <= d.Created
             WHERE cr0.CurrencyFromID = eur.eur_id AND cr0.CurrencyToID = ISNULL(a.CurrencyID, 2)
                   AND cr0.Deleted = 0
-            ORDER BY crh.ID DESC
+            ORDER BY crh.Created DESC, crh.ID DESC, cr0.ID DESC
         ) ir
         WHERE cid.Deleted = 0
               {manager_filter}

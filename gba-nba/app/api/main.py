@@ -23,7 +23,7 @@ from app.core.metrics import METRICS
 from app.core.money import cents, decimal_value
 from app.data import mongo, signals_repository
 from app.data.db import get_engine
-from app.domain.models import Outcome, TaskStatus, Urgency
+from app.domain.models import Contact, Explanation, Outcome, Task, TaskStatus, TaskType, Urgency
 from app.services import lifecycle
 
 log = get_logger("api")
@@ -155,6 +155,25 @@ class CockpitStatusRequest(BaseModel):
 class CockpitNoteRequest(BaseModel):
     task_key: str = Field(min_length=1, max_length=500)
     text: str = Field(min_length=1, max_length=4000)
+
+
+class HeadTaskCreateRequest(BaseModel):
+    manager_id: PositiveId
+    client_id: PositiveId | None = None
+    title: str = Field(min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=2000)
+    urgency: Urgency = Urgency.HIGH
+    due_date: datetime | None = None
+
+
+# Manual tasks carry no model EV; priority derives from the chosen urgency so the legacy
+# priority-based ordering fallbacks position them sensibly.
+_MANUAL_PRIORITY = {
+    Urgency.CRITICAL: 95.0,
+    Urgency.HIGH: 80.0,
+    Urgency.NORMAL: 60.0,
+    Urgency.LOW: 40.0,
+}
 
 
 def _resolve_manager(manager_net_uid: str) -> int:
@@ -383,6 +402,34 @@ def cockpit_count(manager_net_uid: str) -> dict:
             "by_urgency": {k: by_urgency[k] for k in ("critical", "high", "normal", "low")}}
 
 
+@app.get("/cockpit/clients")
+def cockpit_clients(manager_net_uid: str, as_of_date: date | None = None) -> dict:
+    """The manager's client book with light commercial stats + overdue debt — the cockpit
+    «Мої клієнти» view. Recommendations hydrate per client in the console via the existing
+    NetUID-keyed gba-server routes; this endpoint supplies the book and the NetUIDs."""
+    manager_id = _resolve_manager(manager_net_uid)
+    resolved_as_of = _resolved_as_of(as_of_date)
+    started = time.time()
+    try:
+        rows = signals_repository.clients_overview_for_manager(manager_id, resolved_as_of)
+        debts = {
+            int(d["client_id"]): d
+            for d in signals_repository.overdue_debts_for_manager(manager_id, resolved_as_of)
+        }
+        for r in rows:
+            debt = debts.get(int(r["client_id"]))
+            r["overdue_eur"] = cents(debt["overdue_amount"]) if debt else 0.0
+            r["max_days_past_terms"] = int(debt["max_days_past_terms"]) if debt else 0
+            r["turnover_eur"] = cents(r.get("turnover_eur") or 0)
+        METRICS.record_request((time.time() - started) * 1000)
+        return {"manager_id": manager_id, "manager_net_uid": _canonical_net_uid(manager_net_uid),
+                "as_of": resolved_as_of, "count": len(rows), "clients": rows}
+    except Exception as exc:  # noqa: BLE001
+        METRICS.record_request((time.time() - started) * 1000, error=True)
+        log.error("cockpit_clients_failed", manager_id=manager_id, error=str(exc))
+        raise HTTPException(status_code=500, detail="cockpit_clients_failed") from exc
+
+
 @app.post("/cockpit/status")
 def cockpit_status(manager_net_uid: str, req: CockpitStatusRequest) -> dict:
     manager_id = _resolve_manager(manager_net_uid)
@@ -390,7 +437,12 @@ def cockpit_status(manager_net_uid: str, req: CockpitStatusRequest) -> dict:
     task = lifecycle.get_task(req.task_key)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
-    if task["manager_id"] != manager_id:
+    if task["manager_id"] != manager_id and not (
+        task.get("task_type") == TaskType.MANUAL.value
+        and signals_repository.is_head_of_sales(manager_net_uid)
+    ):
+        # a head may act on head-assigned (manual) tasks of any manager (e.g. cancel own order);
+        # AI tasks remain strictly owner-only.
         raise HTTPException(status_code=403, detail="forbidden")
     outcome = None
     if req.to == TaskStatus.DONE and (req.sold is not None or req.amount is not None):
@@ -412,10 +464,12 @@ def cockpit_notes(manager_net_uid: str, req: CockpitNoteRequest) -> dict:
     task = lifecycle.get_task(req.task_key)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
-    if task["manager_id"] != manager_id:
+    if task["manager_id"] != manager_id and not signals_repository.is_head_of_sales(manager_net_uid):
+        # the head can comment on any manager's task (two-way thread on assigned work)
         raise HTTPException(status_code=403, detail="forbidden")
+    author_name = signals_repository.manager_names([manager_id]).get(manager_id)
     try:
-        doc = lifecycle.add_note(req.task_key, manager_id, req.text)
+        doc = lifecycle.add_note(req.task_key, manager_id, req.text, author_name=author_name)
     except lifecycle.TaskNotFoundError as exc:
         # Race with sweep_expired: the task passed the ownership check above but was
         # purged before the note landed — a 404, not a 500.
@@ -801,13 +855,21 @@ class TeamBoardTask(BaseModel):
     status: str
     urgency: str | None = None
     priority: float = 0.0
-    p_outcome: float = 0.0
-    expected_value: float = 0.0
-    ev_score: float = 0.0
+    # manual (head-assigned) tasks persist EV fields as None by design — ranking falls to priority
+    p_outcome: float | None = 0.0
+    expected_value: float | None = 0.0
+    ev_score: float | None = 0.0
     in_progress_since: datetime | None = None
     generated_at: datetime | None = None
     updated_at: datetime | None = None
     sla_breached: bool = False
+    origin: str | None = None
+    created_by: int | None = None
+    due_date: datetime | None = None
+    reason: str | None = None
+    resolution_reason: str | None = None
+    outcome: dict | None = None
+    notes: list[dict] = Field(default_factory=list)
 
 
 class TeamBoardManager(BaseModel):
@@ -821,6 +883,7 @@ class TeamBoardResponse(BaseModel):
     requested_statuses: list[str]
     requested_manager_id: int | None = None
     requested_urgency: str | None = None
+    requested_task_type: str | None = None
     skip: int
     limit: int
     returned_count: int
@@ -846,6 +909,7 @@ def head_tasks(
     statuses: str = "open,in_progress",
     manager_id: Annotated[int | None, Query(gt=0)] = None,
     urgency: str | None = None,
+    task_type: str | None = None,
     skip: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=500)] = 50,
 ) -> TeamBoardResponse:
@@ -866,6 +930,8 @@ def head_tasks(
         raise HTTPException(status_code=422, detail="invalid_task_status_filter")
     if urgency is not None and urgency not in {value.value for value in Urgency}:
         raise HTTPException(status_code=422, detail="invalid_urgency_filter")
+    if task_type is not None and task_type not in {value.value for value in TaskType}:
+        raise HTTPException(status_code=422, detail="invalid_task_type_filter")
     if not signals_repository.is_head_of_sales(manager_net_uid):
         return TeamBoardResponse(
             is_head=False,
@@ -873,6 +939,7 @@ def head_tasks(
             requested_statuses=status_list,
             requested_manager_id=manager_id,
             requested_urgency=urgency,
+            requested_task_type=task_type,
             skip=skip,
             limit=limit,
             returned_count=0,
@@ -892,6 +959,7 @@ def head_tasks(
             urgency=urgency,
             skip=skip,
             limit=limit,
+            task_type=task_type,
         )
     else:
         tasks, total, by_status = [], 0, _empty_team_board_statuses()
@@ -902,6 +970,7 @@ def head_tasks(
         requested_statuses=status_list,
         requested_manager_id=manager_id,
         requested_urgency=urgency,
+        requested_task_type=task_type,
         skip=skip,
         limit=limit,
         returned_count=len(tasks),
@@ -910,6 +979,97 @@ def head_tasks(
         by_status=by_status,
         managers=managers,
     )
+
+
+@app.get("/head/dismissals")
+def head_dismissals(
+    manager_net_uid: str,
+    window_days: Annotated[int, Query(ge=1, le=365)] = 30,
+    manager_id: Annotated[int | None, Query(gt=0)] = None,
+) -> dict:
+    """«Не актуально» analytics for the head board: dismissed tasks over the window grouped per
+    manager and per dismissal reason, plus team-wide top reasons. Non-head caller -> benign
+    {is_head: false} (200, same contract as every other /head GET route)."""
+    _resolve_manager(manager_net_uid)
+    requested_net_uid = _canonical_net_uid(manager_net_uid)
+    if not signals_repository.is_head_of_sales(manager_net_uid):
+        return {"is_head": False, "requested_manager_net_uid": requested_net_uid,
+                "window_days": window_days, "total_dismissed": 0,
+                "managers": [], "top_reasons": []}
+    mids = signals_repository.all_managers()
+    if manager_id is not None and manager_id not in mids:
+        raise HTTPException(status_code=422, detail="manager_not_in_active_team_scope")
+    scope = [manager_id] if manager_id is not None else mids
+    if scope:
+        stats = lifecycle.dismissal_stats(window_days=window_days, manager_ids=scope)
+    else:
+        stats = {"window_days": window_days, "total_dismissed": 0,
+                 "managers": [], "top_reasons": []}
+    return {"is_head": True, "requested_manager_net_uid": requested_net_uid, **stats}
+
+
+@app.post("/head/tasks/new")
+def head_task_create(manager_net_uid: str, req: HeadTaskCreateRequest) -> dict:
+    """Head-of-sales assigns a manual task to a manager (origin=head). Unlike the benign
+    {is_head:false} convention on head GET routes, a non-head caller here gets a hard 403 —
+    this is a mutation no non-head UI ever issues."""
+    head_id = _resolve_manager(manager_net_uid)
+    if not signals_repository.is_head_of_sales(manager_net_uid):
+        raise HTTPException(status_code=403, detail="forbidden")
+    target_names = signals_repository.manager_names([req.manager_id])
+    if req.manager_id not in target_names:
+        raise HTTPException(status_code=404, detail="unknown_target_manager")
+
+    client_id = 0
+    client_name = None
+    contact = Contact()
+    if req.client_id is not None:
+        info = signals_repository.contacts_for_clients([req.client_id]).get(req.client_id)
+        if not info:
+            raise HTTPException(status_code=404, detail="unknown_client")
+        client_id = req.client_id
+        client_name = (info.get("full_name") or info.get("name") or "").strip() or None
+        contact = Contact(phone=info.get("phone"), email=info.get("email"))
+
+    title = req.title.strip()
+    if not title:
+        raise HTTPException(status_code=422, detail="empty_title")
+    description = (req.description or "").strip()
+    task = Task(
+        task_key=f"manual|{req.manager_id}|{uuid.uuid4().hex[:16]}",
+        manager_id=req.manager_id,
+        client_id=client_id,
+        client_name=client_name,
+        task_type=TaskType.MANUAL,
+        title=title,
+        reason=description or "Задача від керівника відділу продажів",
+        priority=_MANUAL_PRIORITY[req.urgency],
+        urgency=req.urgency,
+        payload={"description": description or None},
+        explanation=Explanation(factors=["Призначено керівником відділу продажів"],
+                                source_signal="head_assignment", confidence=1.0),
+        contact=contact,
+        due_date=req.due_date,
+    )
+    doc = lifecycle.create_manual(task, created_by=head_id)
+    doc["_id"] = str(doc["_id"])
+    doc["created_by_name"] = signals_repository.manager_names([head_id]).get(head_id)
+    doc["manager_name"] = target_names.get(req.manager_id)
+    log.info("manual_task_created", task_key=doc["task_key"], head_id=head_id,
+             manager_id=req.manager_id, client_id=client_id)
+    return doc
+
+
+@app.get("/head/clients")
+def head_clients(manager_net_uid: str, manager_id: Annotated[int, Query(gt=0)]) -> dict:
+    """Client picker for the head's create-task dialog: the target manager's client book.
+    Non-head -> benign {is_head:false} (GET convention: 403 would log the console session out)."""
+    _resolve_manager(manager_net_uid)
+    if not signals_repository.is_head_of_sales(manager_net_uid):
+        return {"is_head": False, "manager_id": manager_id, "count": 0, "clients": []}
+    rows = signals_repository.clients_for_manager(manager_id)
+    rows.sort(key=lambda r: (r.get("full_name") or r.get("name") or "").lower())
+    return {"is_head": True, "manager_id": manager_id, "count": len(rows), "clients": rows}
 
 
 @app.get("/head/escalated")

@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     redis_db: int = 0
     cache_ttl: int = 3600
     feedback_ttl: int = 7776000
+    # Durable journal for negative feedback (empty = <repo>/data/negatives.jsonl); replayed
+    # into Redis on startup so «не пропонувати» survives cache flushes and TTL expiry.
+    feedback_store_path: str = ""
 
     # API
     api_host: str = "0.0.0.0"

@@ -15,6 +15,7 @@ class TaskType(StrEnum):
     CROSS_SELL = "cross_sell"
     CHURN_WINBACK = "churn_winback"
     NEW_CLIENT_ACTIVATION = "new_client_activation"
+    MANUAL = "manual"               # head-assigned task; never emitted by generators
 
 
 class TaskStatus(StrEnum):
@@ -51,6 +52,7 @@ ACTIVE = {TaskStatus.GENERATED, TaskStatus.OPEN, TaskStatus.IN_PROGRESS, TaskSta
 
 class Note(BaseModel):
     author_id: int
+    author_name: str | None = None  # display name resolved at write time (head vs manager in the thread)
     text: str
     created_at: datetime
 
@@ -122,6 +124,8 @@ class Task(BaseModel):
     snooze_until: datetime | None = None
     outcome: Outcome | None = None
     ab_variant: str | None = None
+    origin: str = "ai"                 # "ai" (generator) | "head" (manual assignment)
+    created_by: int | None = None      # User.ID of the head for origin="head"
     model_version: str = "nba-v1"
     in_progress_since: datetime | None = None  # UTC stamp set when first moved to IN_PROGRESS (work-started)
     generated_at: datetime | None = None

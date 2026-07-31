@@ -56,3 +56,45 @@ def test_feedback_endpoint_rejects_empty_products():
         headers=_headers(),
     )
     assert resp.status_code == 422        # min_length=1 enforced by the request model
+
+
+def test_feedback_store_roundtrip(monkeypatch, tmp_path):
+    from app.data import feedback_store
+
+    store_file = tmp_path / "negatives.jsonl"
+    monkeypatch.setattr(feedback_store, "_store_path", lambda: store_file)
+
+    feedback_store.append("AAAA-1111", ["VC-1", "VC-2"])
+    feedback_store.append("aaaa-1111", ["VC-2", "VC-3"])
+    feedback_store.append("bbbb-2222", ["VC-9"])
+    store_file.write_text(store_file.read_text(encoding="utf-8") + "{broken json\n",
+                          encoding="utf-8")
+
+    journal = feedback_store.load()
+    assert journal == {"aaaa-1111": {"VC-1", "VC-2", "VC-3"}, "bbbb-2222": {"VC-9"}}
+
+
+def test_feedback_store_replay_rearms_redis(monkeypatch, tmp_path):
+    from app.data import cache, feedback_store
+
+    store_file = tmp_path / "negatives.jsonl"
+    monkeypatch.setattr(feedback_store, "_store_path", lambda: store_file)
+    feedback_store.append("cccc-3333", ["VC-5", "VC-6"])
+
+    calls = []
+
+    class _FakeRedis:
+        def sadd(self, key, *members):
+            calls.append(("sadd", key, set(members)))
+            return len(members)
+
+        def expire(self, key, ttl):
+            calls.append(("expire", key, ttl))
+            return True
+
+    monkeypatch.setattr(cache, "_get_client", lambda: _FakeRedis())
+    replayed = feedback_store.replay_into_redis()
+
+    assert replayed == 1
+    assert ("sadd", "reco:neg:cccc-3333", {"VC-5", "VC-6"}) in calls
+    assert any(op == "expire" and key == "reco:neg:cccc-3333" for op, key, _ in calls)

@@ -206,7 +206,9 @@ def generate_for_manager(manager_id: int, as_of: str | None = None) -> dict:
     for raw_type, n in lifecycle.active_counts_by_type(manager_id).items():
         if raw_type in _valid_types:
             per_type[_valid_types[raw_type]] = n
-    active = lifecycle.active_count(manager_id)
+    # Head-assigned (manual) tasks ride on top of the AI queue: they must not consume the
+    # generated-plan capacity, or a head assigning 10 tasks would silently starve generation.
+    active = lifecycle.active_count(manager_id, exclude_manual=True)
     counters = {"persisted": 0, "skipped_muted": 0, "skipped_capped": 0, "refreshed": 0,
                 "crit_debt_reserved": 0}
     # Track final capacity rejects by identity. A critical task admitted by the reserve must stop
