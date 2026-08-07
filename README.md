@@ -9,15 +9,15 @@ AI/ML microservices for the GBA (Concord) ecosystem. Each is a self-contained Fa
 | --- | ---: | --- |
 | gba-reco | 8000 | `/health`, `/ready` |
 | gba-procure | 8001 | `/health`, `/ready` |
-| gba-nba | 8002 | `/health`, `/ready` |
 | gba-solvency | 8003 | `/health`, `/ready` |
 | gba-pricing | 8004 | `/health`, `/ready` |
 | gba-products | 8005 | `/health`, `/ready` |
 | gba-forecast | 8006 | `/health`, `/ready` |
 
-- **gba-nba** — AI Sales Cockpit / Next-Best-Action engine. A prioritized daily task queue per sales
-  manager (debt follow-up, reorder, churn win-back, cross-sell), stateful in MongoDB, with a run-rate
-  sales-target engine, a daily scheduler (09:00 Europe/Kyiv), and a head-of-sales dashboard.
+> **gba-nba (порт 8002)** живе в окремому репозиторії
+> [oleksandrmelnychenko/gba-nba](https://github.com/oleksandrmelnychenko/gba-nba) — AI Sales Cockpit /
+> Next-Best-Action engine. Тут його більше немає, щоб не тримати два джерела для одного сервісу.
+
 - **gba-reco** — client product recommendations (V3.2 hybrid: repurchase + co-purchase discovery),
   with an offline leave-last-basket eval harness and Redis caching.
 - **gba-procure** — per-producer procurement / reorder-point purchase plans.
