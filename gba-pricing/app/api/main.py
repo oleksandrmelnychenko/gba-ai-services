@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 from datetime import date
 
 from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -24,14 +25,8 @@ from app.data import pricing_repository as repo
 from app.data.db import dispose, get_engine
 from app.domain.models import (
     BatchPriceRequest,
-    CompetitorPriceSearchRequest,
-    CompetitorPriceSearchResult,
     PriceRecommendation,
     PriceRequest,
-)
-from app.services.competitor_search import (
-    CompetitorSearchNotConfigured,
-    search_competitor_prices,
 )
 
 settings = get_settings()
@@ -222,27 +217,6 @@ def price(req: PriceRequest) -> PriceRecommendation:
         raise HTTPException(status_code=500, detail=f"internal error (ref {eid})") from exc
 
 
-@app.post("/competitors/search", response_model=CompetitorPriceSearchResult)
-async def competitor_search(req: CompetitorPriceSearchRequest) -> CompetitorPriceSearchResult:
-    try:
-        return await search_competitor_prices(req)
-    except CompetitorSearchNotConfigured as exc:
-        raise HTTPException(status_code=503, detail="competitor_search_not_configured") from exc
-    except Exception as exc:  # noqa: BLE001
-        eid = uuid.uuid4().hex
-        log.error(
-            "competitor_search_failed",
-            error_id=eid,
-            product_net_uid=req.product_net_uid,
-            sources=[source.value for source in req.sources],
-            error=str(exc),
-        )
-        raise HTTPException(
-            status_code=502,
-            detail=f"competitor search upstream failed (ref {eid})",
-        ) from exc
-
-
 @app.post("/price/batch")
 def price_batch(req: BatchPriceRequest) -> dict:
     """Per-item errors are isolated so one bad pair doesn't fail the batch."""
@@ -297,6 +271,43 @@ def price_batch(req: BatchPriceRequest) -> dict:
                 "error": f"internal error (ref {eid})",
             })
     return {"results": results, "errors": errors, "count": len(results), "failed": len(errors)}
+
+
+class CompetitorSearchRequest(BaseModel):
+    market: str
+    product_net_uid: str | None = None
+    query: str
+    sources: list[str] = Field(default_factory=list)
+
+
+@app.post("/competitors/search")
+def competitors_search(req: CompetitorSearchRequest) -> dict:
+    """AI competitor price scan. Request/response contract mirrors gba-server's
+    CompetitorPriceSearchRequestDto/ResultDto validators exactly."""
+    from app.services import competitor_search as comp
+
+    if req.market != "UA":
+        raise HTTPException(status_code=422, detail="market_must_be_ua")
+    query = (req.query or "").strip()
+    if len(query) < 2 or len(query) > 180:
+        raise HTTPException(status_code=422, detail="query_must_be_2_180_chars")
+    if not _is_valid_uid(req.product_net_uid):
+        raise HTTPException(status_code=422, detail="malformed product_net_uid")
+    if (
+        not req.sources
+        or len(req.sources) != len(set(req.sources))
+        or any(s not in comp.SOURCE_DOMAINS for s in req.sources)
+    ):
+        raise HTTPException(status_code=422, detail="sources_invalid")
+
+    try:
+        return comp.search_competitors(query, list(req.sources), req.product_net_uid)
+    except comp.CompetitorSearchError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except Exception as exc:  # noqa: BLE001
+        eid = uuid.uuid4().hex
+        log.error("competitor_search_failed", error_id=eid, query=query, error=str(exc))
+        raise HTTPException(status_code=500, detail=f"internal error (ref {eid})") from exc
 
 
 @app.delete("/cache/{product}/{client_agreement_net_uid}")
