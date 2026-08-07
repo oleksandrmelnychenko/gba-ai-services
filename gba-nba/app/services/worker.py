@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import argparse
 import time
-from datetime import UTC, datetime
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from app.clients import reco_client
 from app.core.config import get_settings
@@ -36,7 +37,7 @@ def push_reco_feedback(window_days: int | None = None) -> dict:
 
 
 def run(as_of: str | None = None, limit: int | None = None) -> dict:
-    as_of = as_of or datetime.now(UTC).strftime("%Y-%m-%d")
+    as_of = as_of or datetime.now(ZoneInfo("Europe/Kyiv")).strftime("%Y-%m-%d")
     started = time.time()
     managers = sig.all_managers()
     if limit:

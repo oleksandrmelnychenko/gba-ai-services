@@ -9,7 +9,8 @@ Anti-spam rules (from manager_prefs / config):
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import UTC, datetime
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from app.core import history
 from app.core.config import get_settings
@@ -152,7 +153,7 @@ def _window_tag(as_of: str) -> str:
 
 def generate_for_manager(manager_id: int, as_of: str | None = None) -> dict:
     s = get_settings()
-    as_of = as_of or datetime.now(UTC).strftime("%Y-%m-%d")
+    as_of = as_of or datetime.now(ZoneInfo("Europe/Kyiv")).strftime("%Y-%m-%d")
     coverage = history.rolling_days(as_of, 365)
     as_of = coverage.as_of.isoformat()
     window = _window_tag(as_of)

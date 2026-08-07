@@ -49,7 +49,38 @@ FEATURES = SHARED + SIGNALS + ONEHOT
 OOT_TRAIN_MAX = "2026-01-01"   # train vintages <= this
 OOT_TEST_LO = "2026-02-01"
 OOT_TEST_HI = "2026-04-01"
+OOT_TEST_VINTAGES = 2          # rolling fallback: how many newest vintages go to the OOT test fold
 TRAINING_WINDOW_DAYS = 365
+
+
+def resolve_oot_split(vintages: list[pd.Timestamp]) -> tuple[str, str, str]:
+    """Pick the temporal OOT boundary for the vintages actually present in the dataset.
+
+    The frozen constants above describe the original backfill. `scripts/retrain.py` rebuilds a
+    rolling window of the newest fully-labelled vintages, so those constants eventually select an
+    empty train fold and the run dies inside sklearn. Keep them while they still split the data
+    (identical artifacts for the historical dataset) and otherwise fall back to a rolling split:
+    the newest OOT_TEST_VINTAGES vintages are the test fold, everything older trains.
+    """
+    ordered = sorted(set(pd.Timestamp(vintage).normalize() for vintage in vintages))
+    if len(ordered) < 2:
+        raise ValueError(f"temporal OOT split needs at least 2 vintages, got {len(ordered)}")
+
+    frozen_train = [vintage for vintage in ordered if vintage <= pd.Timestamp(OOT_TRAIN_MAX)]
+    frozen_test = [
+        vintage for vintage in ordered
+        if pd.Timestamp(OOT_TEST_LO) <= vintage <= pd.Timestamp(OOT_TEST_HI)
+    ]
+    if frozen_train and frozen_test:
+        return OOT_TRAIN_MAX, OOT_TEST_LO, OOT_TEST_HI
+
+    test = ordered[-min(OOT_TEST_VINTAGES, len(ordered) - 1):]
+    train_max = ordered[ordered.index(test[0]) - 1]
+    return (
+        train_max.date().isoformat(),
+        test[0].date().isoformat(),
+        test[-1].date().isoformat(),
+    )
 
 
 def ks(y_true: np.ndarray, p: np.ndarray) -> float:
@@ -259,7 +290,7 @@ Current artifact metrics:
 - Source history starts at `{report["source_history_start"]}`; every training vintage has a
   complete {int(report["training_window_days"])}-day feature window.
 - Training vintages: `{report["training_vintages"][0]}..{report["training_vintages"][-1]}`.
-- Temporal OOT split: train vintages `<= {OOT_TRAIN_MAX}`, test `{OOT_TEST_LO}..{OOT_TEST_HI}`.
+- Temporal OOT split: train vintages `<= {report["oot_split"]["train_max"]}`, test `{report["oot_split"]["test"][0]}..{report["oot_split"]["test"][1]}`.
 
 ## Model
 
@@ -380,8 +411,10 @@ def main() -> None:
     report["cv_per_type"] = cv_per_type
 
     # ----------------------------------------------------------------- temporal OOT split
-    tr_mask = df["vd"] <= OOT_TRAIN_MAX
-    te_mask = (df["vd"] >= OOT_TEST_LO) & (df["vd"] <= OOT_TEST_HI)
+    oot_train_max, oot_test_lo, oot_test_hi = resolve_oot_split(df["vd"].tolist())
+    report["oot_split"] = {"train_max": oot_train_max, "test": [oot_test_lo, oot_test_hi]}
+    tr_mask = df["vd"] <= oot_train_max
+    te_mask = (df["vd"] >= oot_test_lo) & (df["vd"] <= oot_test_hi)
     Xtr, ytr = X[tr_mask], y[tr_mask]
     Xte, yte = X[te_mask], y[te_mask]
     print(f"\n=== Temporal OOT split: train n={tr_mask.sum()} test n={te_mask.sum()} ===")
@@ -474,7 +507,7 @@ def main() -> None:
         "features": FEATURES,
         "task_types": TASK_TYPES,
         "calibration": "isotonic",
-        "oot_split": {"train_max": OOT_TRAIN_MAX, "test": [OOT_TEST_LO, OOT_TEST_HI]},
+        "oot_split": {"train_max": oot_train_max, "test": [oot_test_lo, oot_test_hi]},
         "value_head": "see expected_value_row in train.py / score_task.py",
         "priority_formula": "priority = 100 * p_outcome_normalized; rank by p_outcome * expected_value",
         "source_history_start": history.source_history_start().isoformat(),

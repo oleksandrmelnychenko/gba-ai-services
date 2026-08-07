@@ -5,8 +5,9 @@ import asyncio
 import hmac
 import time
 from contextlib import asynccontextmanager
-from datetime import UTC, date, datetime
+from datetime import date, datetime
 from typing import Annotated
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Path, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -97,7 +98,7 @@ async def timing(request: Request, call_next):
 
 
 def _today() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%d")
+    return datetime.now(ZoneInfo("Europe/Kyiv")).strftime("%Y-%m-%d")
 
 
 def _resolve_as_of(as_of_date: date | None) -> str:
