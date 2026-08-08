@@ -98,8 +98,8 @@
         0.0
       ],
       "woe": [
-        -3.871145881491572,
-        3.1973509225146195
+        -3.8701613384378284,
+        3.1740398503803444
       ]
     },
     "debt_growth_3mo": {
@@ -139,14 +139,12 @@
     "grace_days": {
       "splits": [
         0.0,
-        7.0,
-        10.0
+        14.0
       ],
       "woe": [
-        -1.6018506226219411,
-        0.234714161563672,
-        1.1598168559859237,
-        1.9699113011548564
+        -0.9066347257849459,
+        0.7014285485025035,
+        2.559000340459117
       ]
     },
     "has_credit_control": {
@@ -159,46 +157,44 @@
     },
     "turnover_eur_12mo": {
       "splits": [
-        641.75511,
-        3064.894385
+        618.729507,
+        2793.074693
       ],
       "woe": [
-        0.06515476015960023,
-        -0.9342877613279961,
-        -0.9342877613279961
+        0.06453107383653517,
+        -0.9261916830147874,
+        -0.9310936536149941
       ]
     },
     "order_count_12mo": {
       "splits": [
         0.0,
-        9.0,
-        33.0
+        9.0
       ],
       "woe": [
-        0.07703030760425886,
-        -0.0622812857427975,
-        -0.88888641322197,
-        -0.9487546625645565
+        0.09552023308482765,
+        -0.013579679998094828,
+        -1.6156465516876053
       ]
     },
     "recency_days": {
       "splits": [
-        381.0,
-        474.0
+        386.0,
+        487.0
       ],
       "woe": [
-        -0.696868896843298,
-        0.11871563300741075
+        -0.7022298951342646,
+        0.12006666304752174
       ]
     },
     "tenure_months": {
       "splits": [
-        14.0,
-        15.0
+        15.0,
+        16.0
       ],
       "woe": [
-        0.07420578627260692,
-        -1.5050658691327827
+        0.075070976802416,
+        -1.5137627025107376
       ]
     },
     "return_rate_12mo": {
@@ -217,25 +213,25 @@
       "current_debt_eur": 0.0,
       "total_debt_eur": 0.0,
       "max_overdue_days": 0.0,
-      "n_open_debt_lines": 1.5665115227398136,
+      "n_open_debt_lines": 1.597993604679325,
       "debt_growth_3mo": 0.0,
       "months_with_debt_last12": 0.0,
       "new_debt_eur_3mo": 0.0,
       "credit_limit_eur": 0.0,
       "limit_utilization": 0.0,
-      "grace_days": 0.532435948822708,
+      "grace_days": 0.34139374413894336,
       "has_credit_control": 0.0,
-      "turnover_eur_12mo": 0.8351538874231125,
-      "order_count_12mo": 0.8809270193284152,
-      "recency_days": 1.7676545972263444,
-      "tenure_months": 1.8693173383362836,
+      "turnover_eur_12mo": 0.9705935670629718,
+      "order_count_12mo": 0.8634562357430184,
+      "recency_days": 1.4734547120663422,
+      "tenure_months": 1.9358878079926098,
       "return_rate_12mo": 0.0
     },
-    "intercept": -2.2732891806441033
+    "intercept": -2.271587806108889
   },
   "calibration": {
-    "a": 0.8164069430009224,
-    "b": -4.48881831673985
+    "a": 0.9110128808175079,
+    "b": -4.787771385770725
   },
   "current_state_policy": {
     "sev180_threshold_eur": 100.0,
@@ -254,21 +250,21 @@
     "B": 0.05,
     "C": 0.15
   },
-  "trained_at": "2026-07-25T13:16:04+00:00",
-  "n_rows": 4180,
+  "trained_at": "2026-08-07T07:15:35+00:00",
+  "n_rows": 4133,
   "n_pos": 24,
   "training_lineage": {
     "lineage_schema_version": 1,
     "artifact_role": "current_state_scorecard",
-    "training_run_id": "current-20260725T131604+0000-bee58752534e",
-    "trained_at": "2026-07-25T13:16:04+00:00",
+    "training_run_id": "current-20260807T071535+0000-ec1f5e28e147",
+    "trained_at": "2026-08-07T07:15:35+00:00",
     "source_history_start": "2025-01-01",
     "training_code": "scripts/train_current_state.py",
     "dataset": {
       "lineage_schema_version": 1,
       "dataset_role": "current_state_training",
       "builder": "scripts/build_risk_dataset.py",
-      "built_at": "2026-07-25T13:05:48+00:00",
+      "built_at": "2026-08-07T07:14:58+00:00",
       "source_history_start": "2025-01-01",
       "transactional_history_policy": "clamped_to_source_history_start",
       "current_state_exceptions": [
@@ -278,33 +274,33 @@
       "window_months": 12,
       "date_coverage": [
         {
-          "feature_date": "2026-04-26",
-          "label_date": "2026-07-25",
-          "requested_start": "2025-04-26",
-          "effective_start": "2025-04-26",
+          "feature_date": "2026-05-09",
+          "label_date": "2026-08-07",
+          "requested_start": "2025-05-09",
+          "effective_start": "2025-05-09",
           "history_complete": true
         }
       ],
-      "rows": 4180,
+      "rows": 4133,
       "positives": 24,
-      "unique_clients": 4180,
+      "unique_clients": 4133,
       "unique_positive_clients": 24,
       "target_column": "label_sev180",
-      "parquet_sha256": "bee58752534eaf4fe227e41f0bf5ad6e6d458e57d63cbb1d8ae05d57f3503f5a"
+      "parquet_sha256": "ec1f5e28e147a20e06c79f217a4a76eac245181dce8c89c2f7e768ba91b798e2"
     },
     "validation": {
       "gate": "current_state_production_v1",
       "passed": true,
       "minimum_rows": 1000,
-      "observed_rows": 4180,
+      "observed_rows": 4133,
       "minimum_positives": 20,
       "observed_positives": 24,
       "minimum_oof_auc": 0.9,
-      "oof_auc": 0.9861495428296438,
+      "oof_auc": 0.9840847327005761,
       "folds": 5,
       "sev180_policy_passed": true,
       "sev180_policy_rows": 24
     },
-    "model_payload_sha256": "1416a10586e3e04efe548a925cbc6a3b168846f84c4547c94e7008ef4551b82e"
+    "model_payload_sha256": "1158f7f5daa65177e19bc8a13b105f60a16c20e330bc9e13bf73d65baddc88f4"
   }
 }

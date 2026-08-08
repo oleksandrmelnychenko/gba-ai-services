@@ -1,15 +1,15 @@
 {
   "source_history_start": "2025-01-01",
   "dataset": {
-    "rows": 4180,
+    "rows": 4133,
     "positives": 24,
-    "prevalence": 0.005741626794258373
+    "prevalence": 0.005806919912896201
   },
   "dataset_lineage": {
     "lineage_schema_version": 1,
     "dataset_role": "current_state_training",
     "builder": "scripts/build_risk_dataset.py",
-    "built_at": "2026-07-25T13:05:48+00:00",
+    "built_at": "2026-08-07T07:14:58+00:00",
     "source_history_start": "2025-01-01",
     "transactional_history_policy": "clamped_to_source_history_start",
     "current_state_exceptions": [
@@ -19,19 +19,19 @@
     "window_months": 12,
     "date_coverage": [
       {
-        "feature_date": "2026-04-26",
-        "label_date": "2026-07-25",
-        "requested_start": "2025-04-26",
-        "effective_start": "2025-04-26",
+        "feature_date": "2026-05-09",
+        "label_date": "2026-08-07",
+        "requested_start": "2025-05-09",
+        "effective_start": "2025-05-09",
         "history_complete": true
       }
     ],
-    "rows": 4180,
+    "rows": 4133,
     "positives": 24,
-    "unique_clients": 4180,
+    "unique_clients": 4133,
     "unique_positive_clients": 24,
     "target_column": "label_sev180",
-    "parquet_sha256": "bee58752534eaf4fe227e41f0bf5ad6e6d458e57d63cbb1d8ae05d57f3503f5a"
+    "parquet_sha256": "ec1f5e28e147a20e06c79f217a4a76eac245181dce8c89c2f7e768ba91b798e2"
   },
   "primary_features": [
     "overdue_eur_91_180",
@@ -64,22 +64,22 @@
     "tiers": {
       "non_debt_table_only": {
         "n_features": 9,
-        "auc_mean": 0.7158,
-        "ks_mean": 0.5469
+        "auc_mean": 0.7175,
+        "ks_mean": 0.4997
       },
       "leading_no_aging_buckets": {
         "n_features": 12,
-        "auc_mean": 0.7224,
-        "ks_mean": 0.5113
+        "auc_mean": 0.7162,
+        "ks_mean": 0.4971
       },
       "primary_full": {
         "n_features": 20,
-        "auc_mean": 0.9998,
-        "ks_mean": 0.9998
+        "auc_mean": 0.9999,
+        "ks_mean": 0.9995
       },
       "with_tautological": {
         "n_features": 22,
-        "auc_mean": 0.9998,
+        "auc_mean": 0.9999,
         "ks_mean": 0.9998
       }
     },
@@ -114,77 +114,77 @@
   },
   "cv": {
     "woe_scorecard_primary": {
-      "auc_mean": 0.9880790202952883,
-      "auc_std": 0.006421450630859002,
+      "auc_mean": 0.9865758184636266,
+      "auc_std": 0.006996785304661259,
       "auc_folds": [
-        0.9817,
-        0.986,
-        0.9961,
-        0.9813,
-        0.9952
+        0.9977,
+        0.9839,
+        0.9847,
+        0.99,
+        0.9766
       ],
-      "ks_mean": 0.9795499514023882,
-      "gini_mean": 0.9761580405905765,
-      "brier_mean": 0.029881939328001022,
-      "oof_auc": 0.9861495428296438
+      "ks_mean": 0.9773607048552148,
+      "gini_mean": 0.9731516369272533,
+      "brier_mean": 0.03280397757766829,
+      "oof_auc": 0.9840847327005761
     },
     "woe_scorecard_with_tautological": {
-      "auc_mean": 0.9880549529066001,
-      "auc_std": 0.0064125759585201975,
+      "auc_mean": 0.9867587743864672,
+      "auc_std": 0.006494948785259517,
       "auc_folds": [
-        0.9817,
-        0.9858,
-        0.9961,
-        0.9815,
-        0.9952
+        0.9977,
+        0.9839,
+        0.9839,
+        0.9897,
+        0.9786
       ],
-      "ks_mean": 0.9795496621308896,
-      "gini_mean": 0.9761099058132001,
-      "brier_mean": 0.028178129238025047,
-      "oof_auc": 0.9863249919794674
+      "ks_mean": 0.9746860839697599,
+      "gini_mean": 0.9735175487729344,
+      "brier_mean": 0.028422076470194395,
+      "oof_auc": 0.9841455747546037
     },
     "gbm_primary": {
-      "auc_mean": 0.9998315282791819,
-      "auc_std": 0.00033694344163657245,
+      "auc_mean": 0.9998783454987834,
+      "auc_std": 0.00024330900243310082,
       "auc_folds": [
         1.0,
-        0.9992,
         1.0,
+        0.9994,
         1.0,
         1.0
       ],
-      "ks_mean": 0.9997593261131168,
-      "gini_mean": 0.9996630565583637,
-      "brier_mean": 0.00023921284277734746,
-      "oof_auc": 0.9998245508501765
+      "ks_mean": 0.9995133819951338,
+      "gini_mean": 0.9997566909975668,
+      "brier_mean": 0.00048336122873097857,
+      "oof_auc": 0.9998732457207756
     },
     "gbm_with_tautological": {
-      "auc_mean": 0.9998315282791816,
-      "auc_std": 0.00033694344163661685,
+      "auc_mean": 0.9998783454987834,
+      "auc_std": 0.0002433090024330897,
       "auc_folds": [
         1.0,
-        0.9992,
         1.0,
+        0.9994,
         1.0,
         1.0
       ],
-      "ks_mean": 0.9997593261131168,
-      "gini_mean": 0.9996630565583633,
-      "brier_mean": 0.0002392124353825849,
-      "oof_auc": 0.9998245508501764
+      "ks_mean": 0.9997566909975669,
+      "gini_mean": 0.9997566909975668,
+      "brier_mean": 0.00048336115107154646,
+      "oof_auc": 0.9998732457207755
     },
-    "ablation_auc_delta_woe": -0.0,
-    "ablation_auc_delta_gbm": -0.0
+    "ablation_auc_delta_woe": 0.0002,
+    "ablation_auc_delta_gbm": 0.0
   },
   "production_gate": {
     "gate": "current_state_production_v1",
     "passed": true,
     "minimum_rows": 1000,
-    "observed_rows": 4180,
+    "observed_rows": 4133,
     "minimum_positives": 20,
     "observed_positives": 24,
     "minimum_oof_auc": 0.9,
-    "oof_auc": 0.9861495428296438,
+    "oof_auc": 0.9840847327005761,
     "folds": 5,
     "sev180_policy_passed": true,
     "sev180_policy_rows": 24
@@ -200,34 +200,34 @@
     "realized": [
       {
         "band": "A",
-        "n": 4010,
+        "n": 3964,
         "realized_pd": 0.0,
-        "mean_score": 99.94294921251546,
-        "min_score": 78.27820790669188,
+        "mean_score": 99.94173727372839,
+        "min_score": 79.99596269273414,
         "max_score": 100.0
       },
       {
         "band": "B",
-        "n": 25,
+        "n": 14,
         "realized_pd": 0.0,
-        "mean_score": 74.95736973875808,
-        "min_score": 71.975016752861,
-        "max_score": 77.73372207143706
+        "mean_score": 73.52859647266048,
+        "min_score": 72.22083646026178,
+        "max_score": 73.67681351207267
       },
       {
         "band": "C",
-        "n": 79,
+        "n": 67,
         "realized_pd": 0.0,
-        "mean_score": 65.81603834387349,
-        "min_score": 62.762088754743104,
-        "max_score": 68.52079407331917
+        "mean_score": 66.13275059316699,
+        "min_score": 65.09552922433164,
+        "max_score": 70.06913563820524
       },
       {
         "band": "D",
-        "n": 66,
-        "realized_pd": 0.36363636363636365,
-        "mean_score": 58.78071825516336,
-        "min_score": 57.321230320243224,
+        "n": 88,
+        "realized_pd": 0.2727272727272727,
+        "mean_score": 60.26303603173654,
+        "min_score": 57.32040299185931,
         "max_score": 61.96158711389381
       }
     ]
@@ -235,15 +235,15 @@
   "training_lineage": {
     "lineage_schema_version": 1,
     "artifact_role": "current_state_scorecard",
-    "training_run_id": "current-20260725T131604+0000-bee58752534e",
-    "trained_at": "2026-07-25T13:16:04+00:00",
+    "training_run_id": "current-20260807T071535+0000-ec1f5e28e147",
+    "trained_at": "2026-08-07T07:15:35+00:00",
     "source_history_start": "2025-01-01",
     "training_code": "scripts/train_current_state.py",
     "dataset": {
       "lineage_schema_version": 1,
       "dataset_role": "current_state_training",
       "builder": "scripts/build_risk_dataset.py",
-      "built_at": "2026-07-25T13:05:48+00:00",
+      "built_at": "2026-08-07T07:14:58+00:00",
       "source_history_start": "2025-01-01",
       "transactional_history_policy": "clamped_to_source_history_start",
       "current_state_exceptions": [
@@ -253,34 +253,34 @@
       "window_months": 12,
       "date_coverage": [
         {
-          "feature_date": "2026-04-26",
-          "label_date": "2026-07-25",
-          "requested_start": "2025-04-26",
-          "effective_start": "2025-04-26",
+          "feature_date": "2026-05-09",
+          "label_date": "2026-08-07",
+          "requested_start": "2025-05-09",
+          "effective_start": "2025-05-09",
           "history_complete": true
         }
       ],
-      "rows": 4180,
+      "rows": 4133,
       "positives": 24,
-      "unique_clients": 4180,
+      "unique_clients": 4133,
       "unique_positive_clients": 24,
       "target_column": "label_sev180",
-      "parquet_sha256": "bee58752534eaf4fe227e41f0bf5ad6e6d458e57d63cbb1d8ae05d57f3503f5a"
+      "parquet_sha256": "ec1f5e28e147a20e06c79f217a4a76eac245181dce8c89c2f7e768ba91b798e2"
     },
     "validation": {
       "gate": "current_state_production_v1",
       "passed": true,
       "minimum_rows": 1000,
-      "observed_rows": 4180,
+      "observed_rows": 4133,
       "minimum_positives": 20,
       "observed_positives": 24,
       "minimum_oof_auc": 0.9,
-      "oof_auc": 0.9861495428296438,
+      "oof_auc": 0.9840847327005761,
       "folds": 5,
       "sev180_policy_passed": true,
       "sev180_policy_rows": 24
     },
-    "model_payload_sha256": "1416a10586e3e04efe548a925cbc6a3b168846f84c4547c94e7008ef4551b82e"
+    "model_payload_sha256": "1158f7f5daa65177e19bc8a13b105f60a16c20e330bc9e13bf73d65baddc88f4"
   },
   "calibration_plot": "/root/projects/gba-solvency/app/risk/artifacts/calibration_current.png"
 }
