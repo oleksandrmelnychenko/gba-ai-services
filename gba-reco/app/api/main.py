@@ -82,6 +82,9 @@ async def timing(request: Request, call_next):
 
 
 class RecommendRequest(BaseModel):
+    client_agreement_net_id: uuid.UUID | None = Field(
+        default=None, description="ClientAgreement.NetUID; scopes target history, stock and cache",
+    )
     customer_id: PositiveId = Field(..., description="dbo.Client.ID")
     top_n: int = Field(default=25, ge=1, le=200)
     as_of_date: date | None = None
@@ -216,8 +219,10 @@ def recommend(req: RecommendRequest) -> RecommendationResult:
             top_n=req.top_n,
             include_discovery=req.include_discovery, use_cache=req.use_cache,
             region_scope=req.region_scope,
+            **({"client_agreement_net_id": str(req.client_agreement_net_id)}
+               if req.client_agreement_net_id else {}),
         )
-    except service.UnknownCustomerError as exc:
+    except (service.UnknownCustomerError, service.UnknownAgreementError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         error_id = uuid.uuid4().hex
@@ -232,6 +237,13 @@ def recommend_copurchase(req: RecommendRequest) -> RecommendationResult:
     as_of = req.as_of_date.isoformat() if req.as_of_date else time.strftime("%Y-%m-%d")
     if not repo.client_exists(req.customer_id):
         raise HTTPException(status_code=404, detail=f"customer {req.customer_id} was not found")
+    try:
+        agreement_uid = service.require_agreement(
+            req.customer_id, str(req.client_agreement_net_id) if req.client_agreement_net_id else None,
+        )
+    except service.UnknownAgreementError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    scope = {"client_agreement_net_id": agreement_uid} if agreement_uid else {}
     seeds = sorted(set(req.product_ids)) if req.product_ids else None
     if seeds:
         missing = sorted(set(seeds) - repo.active_product_ids(seeds))
@@ -240,7 +252,7 @@ def recommend_copurchase(req: RecommendRequest) -> RecommendationResult:
                 status_code=404,
                 detail={"message": "seed products were not found", "product_ids": missing},
             )
-    key = cache.make_copurchase_key(req.customer_id, as_of, req.top_n)
+    key = cache.make_copurchase_key(req.customer_id, as_of, req.top_n, **scope)
     if seeds:
         key = f"{key}:s{','.join(map(str, seeds))}"
     if req.use_cache:
@@ -254,12 +266,13 @@ def recommend_copurchase(req: RecommendRequest) -> RecommendationResult:
                 for r in cached["recommendations"]
             ]
             result = RecommendationResult(**cached)
-            if result.customer_id != req.customer_id or result.as_of_date != as_of:
+            if (result.customer_id != req.customer_id or result.as_of_date != as_of
+                    or result.client_agreement_net_id != agreement_uid):
                 raise HTTPException(status_code=503, detail="cached recommendation identity mismatch")
             return result
     try:
         result = copurchase.recommend(req.customer_id, as_of, top_n=req.top_n, include_owned=False,
-                                      seed_product_ids=seeds)
+                                      seed_product_ids=seeds, **scope)
     except Exception as exc:  # noqa: BLE001
         error_id = uuid.uuid4().hex
         log.error("copurchase_failed", customer_id=req.customer_id, error_id=error_id, error=str(exc))

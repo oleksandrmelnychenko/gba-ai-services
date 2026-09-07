@@ -286,20 +286,25 @@ def product_ids_for_vendor_codes(vendor_codes: list[str]) -> set[int]:
     return {int(r["pid"]) for r in rows}
 
 
-def count_orders_before(customer_id: int, as_of_date: str) -> int:
+def count_orders_before(
+    customer_id: int, as_of_date: str, client_agreement_net_id: str | None = None,
+) -> int:
     rows = query(
         """
         SELECT COUNT(DISTINCT o.ID) AS n
         FROM dbo.ClientAgreement ca
         JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
         JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-        WHERE ca.ClientID = :cid AND o.Created < :asof
+        WHERE ca.ClientID = :cid
+                  AND (:agreement_uid IS NULL OR ca.NetUID = CONVERT(uniqueidentifier, :agreement_uid))
+                  AND o.Created < :asof
               AND o.Created >= :history_start
               AND oi.IsValidForCurrentSale = 1
               AND oi.ProductID IS NOT NULL
         """,
         {
             "cid": customer_id,
+            "agreement_uid": client_agreement_net_id,
             "asof": as_of_date,
             "history_start": source_history_start_iso(),
         },
@@ -307,7 +312,9 @@ def count_orders_before(customer_id: int, as_of_date: str) -> int:
     return int(rows[0]["n"]) if rows else 0
 
 
-def repurchase_rate(customer_id: int, as_of_date: str) -> float:
+def repurchase_rate(
+    customer_id: int, as_of_date: str, client_agreement_net_id: str | None = None,
+) -> float:
     """Share of products bought 2+ times — drives REGULAR sub-segmentation.
 
     Restricted to the valid rec sales spine (oi.IsValidForCurrentSale = 1) with the synthetic
@@ -325,7 +332,9 @@ def repurchase_rate(customer_id: int, as_of_date: str) -> float:
             FROM dbo.ClientAgreement ca
             JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
             JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
-            WHERE ca.ClientID = :cid AND o.Created < :asof
+            WHERE ca.ClientID = :cid
+                  AND (:agreement_uid IS NULL OR ca.NetUID = CONVERT(uniqueidentifier, :agreement_uid))
+                  AND o.Created < :asof
                   AND o.Created >= :history_start
                   AND oi.IsValidForCurrentSale = 1
                   AND oi.ProductID IS NOT NULL
@@ -335,6 +344,7 @@ def repurchase_rate(customer_id: int, as_of_date: str) -> float:
         """,
         {
             "cid": customer_id,
+            "agreement_uid": client_agreement_net_id,
             "asof": as_of_date,
             "history_start": source_history_start_iso(),
             **synth_params,
@@ -345,20 +355,25 @@ def repurchase_rate(customer_id: int, as_of_date: str) -> float:
     return float(rows[0]["repurchased"] or 0) / float(rows[0]["total_products"])
 
 
-def product_frequency(customer_id: int, as_of_date: str) -> dict[int, int]:
+def product_frequency(
+    customer_id: int, as_of_date: str, client_agreement_net_id: str | None = None,
+) -> dict[int, int]:
     rows = query(
         """
         SELECT oi.ProductID AS pid, COUNT(DISTINCT o.ID) AS cnt
         FROM dbo.ClientAgreement ca
         JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
         JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
-        WHERE ca.ClientID = :cid AND o.Created < :asof
+        WHERE ca.ClientID = :cid
+                  AND (:agreement_uid IS NULL OR ca.NetUID = CONVERT(uniqueidentifier, :agreement_uid))
+                  AND o.Created < :asof
               AND o.Created >= :history_start
               AND oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
         GROUP BY oi.ProductID
         """,
         {
             "cid": customer_id,
+            "agreement_uid": client_agreement_net_id,
             "asof": as_of_date,
             "history_start": source_history_start_iso(),
         },
@@ -366,20 +381,25 @@ def product_frequency(customer_id: int, as_of_date: str) -> dict[int, int]:
     return {int(r["pid"]): int(r["cnt"]) for r in rows}
 
 
-def product_last_purchase(customer_id: int, as_of_date: str) -> dict[int, object]:
+def product_last_purchase(
+    customer_id: int, as_of_date: str, client_agreement_net_id: str | None = None,
+) -> dict[int, object]:
     rows = query(
         """
         SELECT oi.ProductID AS pid, MAX(o.Created) AS last_dt
         FROM dbo.ClientAgreement ca
         JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
         JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
-        WHERE ca.ClientID = :cid AND o.Created < :asof
+        WHERE ca.ClientID = :cid
+                  AND (:agreement_uid IS NULL OR ca.NetUID = CONVERT(uniqueidentifier, :agreement_uid))
+                  AND o.Created < :asof
               AND o.Created >= :history_start
               AND oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
         GROUP BY oi.ProductID
         """,
         {
             "cid": customer_id,
+            "agreement_uid": client_agreement_net_id,
             "asof": as_of_date,
             "history_start": source_history_start_iso(),
         },
@@ -387,7 +407,9 @@ def product_last_purchase(customer_id: int, as_of_date: str) -> dict[int, object
     return {int(r["pid"]): r["last_dt"] for r in rows}
 
 
-def owned_live_product_ids(customer_id: int, as_of_date: str) -> set[int]:
+def owned_live_product_ids(
+    customer_id: int, as_of_date: str, client_agreement_net_id: str | None = None,
+) -> set[int]:
     """Live catalog identities of every product previously bought by the client.
 
     Order history frequently points at soft-deleted product generations after a catalog
@@ -403,7 +425,9 @@ def owned_live_product_ids(customer_id: int, as_of_date: str) -> set[int]:
             FROM dbo.ClientAgreement ca
             JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
             JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
-            WHERE ca.ClientID = :cid AND o.Created < :asof
+            WHERE ca.ClientID = :cid
+                  AND (:agreement_uid IS NULL OR ca.NetUID = CONVERT(uniqueidentifier, :agreement_uid))
+                  AND o.Created < :asof
                   AND o.Created >= :history_start
                   AND oi.IsValidForCurrentSale = 1
                   AND oi.ProductID IS NOT NULL
@@ -427,6 +451,7 @@ def owned_live_product_ids(customer_id: int, as_of_date: str) -> set[int]:
         """,
         {
             "cid": customer_id,
+            "agreement_uid": client_agreement_net_id,
             "asof": as_of_date,
             "history_start": source_history_start_iso(),
         },
@@ -434,7 +459,9 @@ def owned_live_product_ids(customer_id: int, as_of_date: str) -> set[int]:
     return {int(row["pid"]) for row in rows}
 
 
-def customer_products(customer_id: int, as_of_date: str, limit: int = 500) -> set[int]:
+def customer_products(
+    customer_id: int, as_of_date: str, limit: int = 500, client_agreement_net_id: str | None = None,
+) -> set[int]:
     """Most-recent N distinct products — for Jaccard similarity (bounded for perf)."""
     rows = query(
         """
@@ -443,7 +470,9 @@ def customer_products(customer_id: int, as_of_date: str, limit: int = 500) -> se
             FROM dbo.ClientAgreement ca
             JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
             JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
-            WHERE ca.ClientID = :cid AND o.Created < :asof
+            WHERE ca.ClientID = :cid
+                  AND (:agreement_uid IS NULL OR ca.NetUID = CONVERT(uniqueidentifier, :agreement_uid))
+                  AND o.Created < :asof
                   AND o.Created >= :history_start
                   AND oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
             ORDER BY o.Created DESC, o.ID DESC, oi.ProductID ASC
@@ -451,6 +480,7 @@ def customer_products(customer_id: int, as_of_date: str, limit: int = 500) -> se
         """,
         {
             "cid": customer_id,
+            "agreement_uid": client_agreement_net_id,
             "asof": as_of_date,
             "lim": limit,
             "history_start": source_history_start_iso(),
@@ -534,7 +564,8 @@ def customer_products_bulk(customer_ids: list[int], as_of_date: str) -> dict[int
 
 
 def collaborative_products(
-    similar: list[tuple[int, float]], as_of_date: str, customer_id: int
+    similar: list[tuple[int, float]], as_of_date: str, customer_id: int,
+    client_agreement_net_id: str | None = None,
 ) -> dict[int, float]:
     """Products bought by similar customers (weighted by similarity), excluding owned.
 
@@ -556,7 +587,9 @@ def collaborative_products(
             FROM dbo.ClientAgreement ca
             JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
             JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
-            WHERE ca.ClientID = :cid AND o.Created < :asof
+            WHERE ca.ClientID = :cid
+                  AND (:agreement_uid IS NULL OR ca.NetUID = CONVERT(uniqueidentifier, :agreement_uid))
+                  AND o.Created < :asof
                   AND o.Created >= :history_start
                   AND oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
         ),
@@ -589,6 +622,7 @@ def collaborative_products(
         {
             "asof": as_of_date,
             "cid": customer_id,
+            "agreement_uid": client_agreement_net_id,
             "history_start": source_history_start_iso(),
             **sim_params,
         },
@@ -596,7 +630,25 @@ def collaborative_products(
     return {int(r["pid"]): float(r["score"]) for r in rows}
 
 
-def in_stock_product_ids(product_ids: list[int]) -> set[int]:
+def active_agreements(customer_id: int) -> list[str]:
+    """Current agreements owned by the client, with a usable organization context."""
+    rows = query(
+        """
+        SELECT ca.NetUID AS uid
+        FROM dbo.ClientAgreement ca
+        JOIN dbo.Client c ON c.ID = ca.ClientID AND c.Deleted = 0
+        JOIN dbo.Agreement a ON a.ID = ca.AgreementID
+        JOIN dbo.Organization org ON org.ID = a.OrganizationID AND org.Deleted = 0
+        WHERE ca.ClientID = :cid AND ca.Deleted = 0 AND ca.NetUID IS NOT NULL
+              AND a.Deleted = 0 AND a.IsActive = 1
+        ORDER BY ca.ID
+        """,
+        {"cid": customer_id},
+    )
+    return [str(row["uid"]).lower() for row in rows]
+
+
+def in_stock_product_ids(product_ids: list[int], client_agreement_net_id: str | None = None) -> set[int]:
     """Subset whose exact live catalog row has stock on an operational resale storage.
 
     Candidate ids come from order history, which can carry soft-deleted catalog generations;
@@ -606,6 +658,8 @@ def in_stock_product_ids(product_ids: list[int]) -> set[int]:
     """
     if not product_ids:
         return set()
+    if client_agreement_net_id is not None:
+        return _agreement_stock_product_ids(product_ids, client_agreement_net_id)
     ph, params = in_clause("p", list(dict.fromkeys(product_ids)))
     rows = query(
         f"""
@@ -628,6 +682,42 @@ def in_stock_product_ids(product_ids: list[int]) -> set[int]:
         params,
     )
     return {int(r["pid"]) for r in rows}
+
+
+def _agreement_stock_product_ids(product_ids: list[int], agreement_uid: str) -> set[int]:
+    """Ukraine sale buckets, matching ProductAvailabilityBucketPolicy and the sale wizard.
+
+    VAT uses only the agreement's own storage; non-VAT also accepts Ukrainian
+    resale storage. Defective/Polish stock cannot make a Ukrainian sale actionable.
+    Final prices are calculated by gba-server's existing agreement pricing path.
+    """
+    ph, params = in_clause("p", list(dict.fromkeys(product_ids)))
+    rows = query(
+        f"""
+        WITH live_map AS (
+            SELECT d.ID AS old_id,
+                   CASE WHEN d.Deleted = 0 THEN d.ID ELSE MAX(l.ID) END AS live_id
+            FROM dbo.Product d
+            JOIN dbo.Product l ON l.VendorCode = d.VendorCode AND l.Deleted = 0
+            WHERE d.ID IN {ph} AND d.VendorCode IS NOT NULL AND d.VendorCode <> ''
+            GROUP BY d.ID, d.Deleted
+        )
+        SELECT m.old_id AS pid
+        FROM live_map m
+        JOIN dbo.ProductAvailability pa ON pa.ProductID = m.live_id AND pa.Deleted = 0
+        JOIN dbo.Storage s ON s.ID = pa.StorageID AND s.Deleted = 0
+        JOIN dbo.ClientAgreement ca ON ca.NetUID = CONVERT(uniqueidentifier, :agreement_uid)
+             AND ca.Deleted = 0
+        JOIN dbo.Agreement a ON a.ID = ca.AgreementID AND a.Deleted = 0 AND a.IsActive = 1
+        JOIN dbo.Organization org ON org.ID = a.OrganizationID AND org.Deleted = 0
+        WHERE s.ForDefective = 0 AND COALESCE(LOWER(s.Locale), '') <> 'pl'
+              AND (s.ID = org.StorageID OR (a.WithVATAccounting = 0 AND s.AvailableForReSale = 1))
+        GROUP BY m.old_id
+        HAVING SUM(pa.Amount) > 0
+        """,
+        {**params, "agreement_uid": agreement_uid},
+    )
+    return {int(row["pid"]) for row in rows}
 
 
 def product_groups(product_ids: list[int]) -> dict[int, int]:

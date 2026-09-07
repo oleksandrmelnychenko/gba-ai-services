@@ -58,6 +58,7 @@ class RecommendationResult(BaseModel):
     model_config = ConfigDict(allow_inf_nan=False)
 
     customer_id: int = Field(gt=0)
+    client_agreement_net_id: str | None = None
     recommendations: list[ProductRec]
     count: int = Field(ge=0)
     discovery_count: int = Field(ge=0)
@@ -80,7 +81,7 @@ class RecommendationResult(BaseModel):
     source_history_start: str
     effective_start: str
     history_complete: bool
-    model_version: str = "v38-history-floor-20250101-source-detail-202607"
+    model_version: str = "v39-agreement-history-floor-20250101"
 
     @model_validator(mode="after")
     def validate_exact_contract(self) -> Self:

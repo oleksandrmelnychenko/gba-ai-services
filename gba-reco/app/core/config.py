@@ -78,10 +78,10 @@ class Settings(BaseSettings):
     # warmed client stays a cache hit until the next refresh (8 days = 7-day window + slack).
     warm_cache_ttl: int = 691200
     # Hour (local tz) the daily warm job fires; mirrors gba-nba's daily-generate cron.
-    daily_warm_hour: int = 3
+    daily_warm_hour: int = 5
     timezone: str = "Europe/Kyiv"
     # One-shot retry backoff after a failed warm run (base doubles per attempt, capped) — a
-    # failed 03:00/catch-up warm must not leave the cache cold until tomorrow's cron.
+    # failed 05:00/catch-up warm must not leave the cache cold until tomorrow's cron.
     warm_retry_base_minutes: int = 10
     warm_retry_max_minutes: int = 60
 

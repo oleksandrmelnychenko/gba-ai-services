@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import time
 from typing import Any
+from uuid import UUID
 
 import redis
 
@@ -22,9 +23,9 @@ from app.core.metrics import METRICS
 
 log = get_logger("cache")
 
-# v38: v37 source truth plus a hard 2025-01-01 transactional-history floor. Embedding the
-# boundary prevents pre-floor cached results from surviving the contract change.
-_MODEL_VERSION = "v38-history-floor-20250101-source-detail-202607"
+# v39: target history and operational stock are scoped to ClientAgreement.NetUID.
+# Separate agreement keys also isolate the legacy client-wide NBA/batch signals.
+_MODEL_VERSION = "v39-agreement-history-floor-20250101"
 _RETRY_COOLDOWN_S = 30.0
 _client: redis.Redis | None = None
 _unavailable_until = 0.0
@@ -54,13 +55,17 @@ def _get_client() -> redis.Redis | None:
 
 
 def make_key(customer_id: int, as_of: str, top_n: int, discovery: bool,
-             region_scope: bool = False) -> str:
+             region_scope: bool = False, client_agreement_net_id: str | None = None) -> str:
     base = f"reco:{_MODEL_VERSION}:{customer_id}:{as_of}:{top_n}:{int(discovery)}"
+    if client_agreement_net_id is not None:
+        base += f":a{UUID(client_agreement_net_id)}"
     return f"{base}:r" if region_scope else base
 
 
-def make_copurchase_key(customer_id: int, as_of: str, top_n: int) -> str:
-    return f"copurchase:{_MODEL_VERSION}:{customer_id}:{as_of}:{top_n}"
+def make_copurchase_key(customer_id: int, as_of: str, top_n: int,
+                        client_agreement_net_id: str | None = None) -> str:
+    base = f"copurchase:{_MODEL_VERSION}:{customer_id}:{as_of}:{top_n}"
+    return f"{base}:a{UUID(client_agreement_net_id)}" if client_agreement_net_id else base
 
 
 def get(key: str) -> dict[str, Any] | None:
@@ -79,15 +84,16 @@ def get(key: str) -> dict[str, Any] | None:
     return json.loads(raw)
 
 
-def set(key: str, value: dict[str, Any], ttl: int | None = None) -> None:
+def set(key: str, value: dict[str, Any], ttl: int | None = None) -> bool:
     client = _get_client()
     if client is None:
-        return
+        return False
     ttl = ttl or get_settings().cache_ttl
     try:
-        client.setex(key, ttl, json.dumps(value, default=str))
+        return bool(client.setex(key, ttl, json.dumps(value, default=str)))
     except Exception as exc:  # noqa: BLE001
         log.warning("cache_set_failed", error=str(exc))
+        return False
 
 
 def invalidate_customer(customer_id: int) -> int:

@@ -5,7 +5,7 @@ default /recommend, so a warmed client is a guaranteed cache hit (no live comput
 path). Warming is idempotent — entries are simply overwritten with the day's fresh as_of, and the
 warmed TTL outlives the interval — so a double-run is harmless.
 
-A failed warm (catch-up or 03:00 cron — e.g. a DB blip) schedules a one-shot retry with
+A failed warm (catch-up or 05:00 cron — e.g. a DB blip) schedules a one-shot retry with
 exponential backoff (warm_retry_base_minutes doubling up to warm_retry_max_minutes) until a run
 succeeds, instead of silently leaving the cache cold until tomorrow's cron.
 
@@ -36,8 +36,9 @@ def _job(scheduler: BaseScheduler, attempt: int = 0) -> None:
     s = get_settings()
     try:
         stats = worker.run()
-        if stats["clients"] and not stats["ok"]:
-            raise RuntimeError(f"warm produced 0 ok of {stats['clients']} clients")
+        if (stats.get("failed", 0) or stats.get("copurchase_failed", 0)
+                or (stats["clients"] and not stats["ok"])):
+            raise RuntimeError(f"incomplete recommendation warm: {stats}")
     except Exception as exc:  # noqa: BLE001
         delay_min = min(s.warm_retry_base_minutes * (2 ** attempt), s.warm_retry_max_minutes)
         log.error("daily_warm_failed", error=str(exc), attempt=attempt + 1,

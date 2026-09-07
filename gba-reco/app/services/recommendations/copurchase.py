@@ -34,20 +34,25 @@ from app.domain.models import (
 _COOC_ROW_CAP = 1500
 
 
-def _client_products_with_freq(customer_id: int, as_of: str) -> dict[int, float]:
+def _client_products_with_freq(
+    customer_id: int, as_of: str, client_agreement_net_id: str | None = None,
+) -> dict[int, float]:
     rows = query(
         """
         SELECT oi.ProductID AS pid, COUNT(DISTINCT o.ID) AS c
         FROM dbo.ClientAgreement ca
         JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
         JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-        WHERE ca.ClientID = :cid AND oi.IsValidForCurrentSale = 1
+        WHERE ca.ClientID = :cid
+              AND (:agreement_uid IS NULL OR ca.NetUID = CONVERT(uniqueidentifier, :agreement_uid))
+              AND oi.IsValidForCurrentSale = 1
               AND o.Created < :asof AND o.Created >= :history_start
               AND oi.ProductID IS NOT NULL
         GROUP BY oi.ProductID
         """,
         {
             "cid": customer_id,
+            "agreement_uid": client_agreement_net_id,
             "asof": as_of,
             "history_start": source_history_start_iso(),
         },
@@ -150,6 +155,7 @@ def recommend(
     top_n: int = 25,
     include_owned: bool = True,
     seed_product_ids: list[int] | None = None,
+    client_agreement_net_id: str | None = None,
 ) -> RecommendationResult:
     """Hybrid: repurchase (client's own freq) blended with co-purchase item-CF for discovery.
 
@@ -157,12 +163,16 @@ def recommend(
     wizard's per-cart-line cross-sell: «з ЦИМ товаром зазвичай беруть ще й це») instead of the
     client's own purchase history — so it works even for clients with no valid sales yet."""
     from datetime import datetime
+    scope = {"client_agreement_net_id": client_agreement_net_id} if client_agreement_net_id else {}
     started = datetime.now()
     history = full_history_coverage(as_of_date)
 
     excl = repo.ubiquitous_product_ids(get_settings().ubiquity_exclude_pct) | cache.get_negatives(customer_id)
-    owned_live = repo.owned_live_product_ids(customer_id, as_of_date)
-    own = {p: f for p, f in _client_products_with_freq(customer_id, as_of_date).items() if p not in excl}
+    owned_live = repo.owned_live_product_ids(customer_id, as_of_date, **scope)
+    own = {
+        p: f for p, f in _client_products_with_freq(customer_id, as_of_date, **scope).items()
+        if p not in excl
+    }
     seeds = [p for p in seed_product_ids if p not in excl] if seed_product_ids else list(own.keys())
     co = {p: s for p, s in _cooccurring_products(seeds, as_of_date).items() if p not in excl}
 
@@ -196,7 +206,7 @@ def recommend(
     # Every result must be actionable, including repurchase. One set-membership query over a
     # bounded top-of-ranking window checks the canonical operational resale stock.
     window = ranked[: max(top_n * 4, 100)]
-    stocked = repo.in_stock_product_ids([pid for pid, _ in window])
+    stocked = repo.in_stock_product_ids([pid for pid, _ in window], **scope)
     ranked = [item for item in window if item[0] in stocked][:top_n]
     recs = [
         ProductRec(product_id=pid, score=round(score, 4), rank=i + 1,
@@ -219,18 +229,19 @@ def recommend(
         # The first filter above compares historical raw ids. Repeat after live remapping so a
         # different catalog generation of an already-bought product cannot pass as discovery.
         recs = [item for item in recs if item.source == RecSource.DISCOVERY]
-    final_stock = repo.in_stock_product_ids([item.product_id for item in recs])
+    final_stock = repo.in_stock_product_ids([item.product_id for item in recs], **scope)
     recs = [item for item in recs if item.product_id in final_stock]
     for index, item in enumerate(recs, start=1):
         item.rank = index
     discovery = sum(1 for r in recs if r.source == RecSource.DISCOVERY)
     latency = (datetime.now() - started).total_seconds() * 1000
     return RecommendationResult(
-        customer_id=customer_id, recommendations=recs, count=len(recs),
+        customer_id=customer_id, client_agreement_net_id=client_agreement_net_id,
+        recommendations=recs, count=len(recs),
         discovery_count=discovery, segment="COPURCHASE",
         latency_ms=round(latency, 2), as_of_date=as_of_date,
         source_history_start=history.source_history_start.isoformat(),
         effective_start=history.effective_start.isoformat(),
         history_complete=history.history_complete,
-        model_version="copurchase-v2-history-floor-20250101",
+        model_version="copurchase-v3-agreement-history-floor-20250101",
     )

@@ -24,6 +24,7 @@ from app.core.config import get_settings
 from app.core.history import require_supported_as_of, source_history_start_iso
 from app.core.logging import get_logger
 from app.data import cache
+from app.data import sales_repository as repo
 from app.data.db import query
 from app.services.recommendations import copurchase, service
 
@@ -38,6 +39,7 @@ def active_clients(as_of: str, active_days: int) -> list[int]:
         """
         SELECT DISTINCT ca.ClientID AS cid
         FROM dbo.ClientAgreement ca
+        JOIN dbo.Client c ON c.ID = ca.ClientID AND c.Deleted = 0 AND c.NetUID IS NOT NULL
         JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
         JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
         WHERE oi.IsValidForCurrentSale = 1
@@ -82,6 +84,8 @@ def run(
     top_n = top_n if top_n is not None else s.default_top_n
     include_discovery = include_discovery if include_discovery is not None else s.discovery_count > 0
     started = time.time()
+    if not cache.health():
+        raise RuntimeError("cache unavailable; cannot persist the daily recommendation refresh")
     clients = active_clients(as_of, s.active_client_days)
     _check_identity_churn(clients)
     if limit:
@@ -89,31 +93,44 @@ def run(
     log.info("worker_start", clients=len(clients), as_of=as_of, top_n=top_n,
              discovery=include_discovery, model_version=cache._MODEL_VERSION)
 
+    # Keep the legacy client scope warm for NBA while sales read a separate key
+    # for each active agreement. Never select one arbitrary agreement for a client.
+    targets = [
+        (cid, agreement_uid)
+        for cid in clients
+        for agreement_uid in [None, *repo.active_agreements(cid)]
+    ]
     ok = failed = cop_ok = cop_failed = 0
-    for i, cid in enumerate(clients, 1):
+    for i, (cid, agreement_uid) in enumerate(targets, 1):
+        scope = {"client_agreement_net_id": agreement_uid} if agreement_uid else {}
         try:
-            key = cache.make_key(cid, as_of, top_n, include_discovery)
+            key = cache.make_key(cid, as_of, top_n, include_discovery, **scope)
             res = service.get_recommendations(cid, as_of_date=as_of, top_n=top_n,
-                                              include_discovery=include_discovery, use_cache=False)
-            cache.set(key, res.model_dump(mode="json"), ttl=s.warm_cache_ttl)
+                                              include_discovery=include_discovery, use_cache=False, **scope)
+            if not cache.set(key, res.model_dump(mode="json"), ttl=s.warm_cache_ttl):
+                raise RuntimeError("recommendation cache write failed")
             ok += 1
         except Exception as exc:  # noqa: BLE001
             failed += 1
-            log.warning("worker_customer_failed", customer_id=cid, error=str(exc))
+            log.warning("worker_customer_failed", customer_id=cid,
+                        client_agreement_net_id=agreement_uid, error=str(exc))
         try:
             # the exact key the unseeded /recommend/copurchase endpoint reads (default top_n)
-            cop_key = cache.make_copurchase_key(cid, as_of, top_n)
-            cop = copurchase.recommend(cid, as_of, top_n=top_n, include_owned=False)
-            cache.set(cop_key, cop.model_dump(mode="json"), ttl=s.warm_cache_ttl)
+            cop_key = cache.make_copurchase_key(cid, as_of, top_n, **scope)
+            cop = copurchase.recommend(cid, as_of, top_n=top_n, include_owned=False, **scope)
+            if not cache.set(cop_key, cop.model_dump(mode="json"), ttl=s.warm_cache_ttl):
+                raise RuntimeError("copurchase cache write failed")
             cop_ok += 1
         except Exception as exc:  # noqa: BLE001
             cop_failed += 1
-            log.warning("worker_copurchase_failed", customer_id=cid, error=str(exc))
+            log.warning("worker_copurchase_failed", customer_id=cid,
+                        client_agreement_net_id=agreement_uid, error=str(exc))
         if i % 25 == 0:
-            log.info("worker_progress", done=i, total=len(clients), ok=ok, failed=failed,
+            log.info("worker_progress", done=i, total=len(targets), ok=ok, failed=failed,
                      copurchase_ok=cop_ok, copurchase_failed=cop_failed)
 
-    stats = {"clients": len(clients), "ok": ok, "failed": failed,
+    stats = {"clients": len(clients), "contexts": len(targets),
+             "agreements": len(targets) - len(clients), "ok": ok, "failed": failed,
              "copurchase_ok": cop_ok, "copurchase_failed": cop_failed,
              "duration_s": round(time.time() - started, 1), "as_of": as_of,
              "top_n": top_n, "discovery": include_discovery}

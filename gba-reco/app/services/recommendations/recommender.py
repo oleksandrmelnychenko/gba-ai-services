@@ -42,12 +42,12 @@ _MAX_SIMILAR = 100
 _STOCK_POOL_CAP = 1000
 
 
-def classify(customer_id: int, as_of_date: str) -> Segment:
-    orders = repo.count_orders_before(customer_id, as_of_date)
+def classify(customer_id: int, as_of_date: str, **scope: str) -> Segment:
+    orders = repo.count_orders_before(customer_id, as_of_date, **scope)
     if orders >= 500:
         return Segment.HEAVY
     if orders >= 100:
-        rate = repo.repurchase_rate(customer_id, as_of_date)
+        rate = repo.repurchase_rate(customer_id, as_of_date, **scope)
         return Segment.REGULAR_CONSISTENT if rate >= 0.40 else Segment.REGULAR_EXPLORATORY
     return Segment.LIGHT
 
@@ -59,8 +59,8 @@ def _normalize(scores: dict[int, float]) -> dict[int, float]:
     return {k: v / top for k, v in scores.items()}
 
 
-def _recency_scores(customer_id: int, as_of_date: str) -> dict[int, float]:
-    last = repo.product_last_purchase(customer_id, as_of_date)
+def _recency_scores(customer_id: int, as_of_date: str, **scope: str) -> dict[int, float]:
+    last = repo.product_last_purchase(customer_id, as_of_date, **scope)
     asof = datetime.fromisoformat(as_of_date)
     out: dict[int, float] = {}
     for pid, dt in last.items():
@@ -72,8 +72,8 @@ def _recency_scores(customer_id: int, as_of_date: str) -> dict[int, float]:
 
 
 def _similar_customers(customer_id: int, as_of_date: str,
-                       region_id: int | None = None) -> list[tuple[int, float]]:
-    target = repo.customer_products(customer_id, as_of_date)
+                       region_id: int | None = None, **scope: str) -> list[tuple[int, float]]:
+    target = repo.customer_products(customer_id, as_of_date, **scope)
     if not target:
         return []
     candidates = repo.candidate_similar_customers(target, customer_id, as_of_date,
@@ -115,6 +115,7 @@ def _backfill(
     segment: Segment,
     excl: frozenset[int],
     owned_live: frozenset[int],
+    **scope: str,
 ) -> list[ProductRec]:
     """Fill the gap to top_n when V3.2 discovery under-delivers (HEAVY/LIGHT clients with weak
     Jaccard neighbourhoods). Source order: co-purchase item-CF discovery, then ubiquity-filtered
@@ -150,7 +151,7 @@ def _backfill(
         return rec
 
     try:
-        cop = copurchase.recommend(customer_id, as_of, top_n=top_n * 2, include_owned=False)
+        cop = copurchase.recommend(customer_id, as_of, top_n=top_n * 2, include_owned=False, **scope)
         for r in cop.recommendations:
             if len(combined) >= top_n:
                 break
@@ -165,7 +166,7 @@ def _backfill(
         pool_size = min(_STOCK_POOL_CAP, max(top_n * 5, top_n + len(blocked)))
         popular = baselines.global_popular(as_of, pool_size, exclude=excl)
         popular_live = live_remap.live_product_map(popular)
-        stocked = repo.in_stock_product_ids(popular)
+        stocked = repo.in_stock_product_ids(popular, **scope)
         for pid in popular:
             if len(combined) >= top_n:
                 break
@@ -189,7 +190,9 @@ def recommend(
     top_n: int | None = None,
     include_discovery: bool = True,
     region_scope: bool = False,
+    client_agreement_net_id: str | None = None,
 ) -> RecommendationResult:
+    scope = {"client_agreement_net_id": client_agreement_net_id} if client_agreement_net_id else {}
     s = get_settings()
     started = datetime.now()
     as_of = as_of_date or datetime.now().strftime("%Y-%m-%d")
@@ -198,7 +201,7 @@ def recommend(
     repurchase_n = min(s.repurchase_count, top_n)
     discovery_n = max(top_n - repurchase_n, 0) if include_discovery else 0
 
-    segment = classify(customer_id, as_of)
+    segment = classify(customer_id, as_of, **scope)
     w_freq, w_rec = _WEIGHTS[segment]
 
     # byRegion scoping (opt-in): restrict the discovery neighbour pool to the client's oblast.
@@ -208,13 +211,13 @@ def recommend(
 
     excl = repo.ubiquitous_product_ids(s.ubiquity_exclude_pct) | cache.get_negatives(customer_id)
     owned_live = (
-        frozenset(repo.owned_live_product_ids(customer_id, as_of))
+        frozenset(repo.owned_live_product_ids(customer_id, as_of, **scope))
         if include_discovery
         else frozenset()
     )
-    freq = _normalize({pid: float(c) for pid, c in repo.product_frequency(customer_id, as_of).items()
+    freq = _normalize({pid: float(c) for pid, c in repo.product_frequency(customer_id, as_of, **scope).items()
                        if pid not in excl})
-    rec = _normalize({pid: v for pid, v in _recency_scores(customer_id, as_of).items()
+    rec = _normalize({pid: v for pid, v in _recency_scores(customer_id, as_of, **scope).items()
                       if pid not in excl})
     owned = set(freq) | set(rec)
 
@@ -224,7 +227,7 @@ def recommend(
     # Repurchase must be actionable too: over-fetch, then require the same operational resale
     # stock used for discovery before diversity filtering.
     repurchase_pool = ranked[:_STOCK_POOL_CAP]
-    stocked_repurchase = repo.in_stock_product_ids([pid for pid, _ in repurchase_pool])
+    stocked_repurchase = repo.in_stock_product_ids([pid for pid, _ in repurchase_pool], **scope)
     repurchase_pool = [
         (pid, score) for pid, score in repurchase_pool if pid in stocked_repurchase
     ]
@@ -239,9 +242,11 @@ def recommend(
     discovery: list[ProductRec] = []
     if discovery_n > 0:
         try:
-            sims = _similar_customers(customer_id, as_of, region_id=region_id)
-            collab = {pid: v for pid, v in repo.collaborative_products(sims, as_of, customer_id).items()
-                      if pid not in excl}
+            sims = _similar_customers(customer_id, as_of, region_id=region_id, **scope)
+            collab = {
+                pid: v for pid, v in repo.collaborative_products(sims, as_of, customer_id, **scope).items()
+                if pid not in excl
+            }
             d_ranked = sorted(
                 collab.items(), key=lambda item: (-item[1], item[0])
             )[:_STOCK_POOL_CAP]
@@ -251,7 +256,7 @@ def recommend(
                 for pid, score in d_ranked
                 if candidate_live.get(pid) not in owned_live
             ]
-            stocked = repo.in_stock_product_ids([pid for pid, _ in d_ranked])
+            stocked = repo.in_stock_product_ids([pid for pid, _ in d_ranked], **scope)
             d_ranked = [(pid, sc) for pid, sc in d_ranked if pid in stocked]
             discovery = [
                 ProductRec(product_id=pid, score=float(sc), rank=i + 1, segment=segment.value,
@@ -274,6 +279,7 @@ def recommend(
             segment,
             excl,
             owned_live,
+            **scope,
         )
     # History carries product ids of soft-deleted catalog generations (re-syncs mint new
     # rows); translate onto live rows so the gba-server hydration doesn't drop the list.
@@ -296,7 +302,7 @@ def recommend(
         ]
     # Defense in depth: the exact live ids returned to the caller must still be in operational
     # resale stock. The repository uses the same remap rule, so this should remove nothing.
-    final_stock = repo.in_stock_product_ids([item.product_id for item in combined])
+    final_stock = repo.in_stock_product_ids([item.product_id for item in combined], **scope)
     combined = [item for item in combined if item.product_id in final_stock]
     for i, r in enumerate(combined):
         r.rank = i + 1
@@ -305,6 +311,7 @@ def recommend(
     latency_ms = (datetime.now() - started).total_seconds() * 1000
     return RecommendationResult(
         customer_id=customer_id,
+        client_agreement_net_id=client_agreement_net_id,
         recommendations=combined,
         count=len(combined),
         discovery_count=discovery_count,

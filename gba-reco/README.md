@@ -1,13 +1,13 @@
 # GBA Client Recommendation Service
 
-B2B product recommendation service — for each client, top-N products to (re)buy.
+B2B product recommendation service — top-N products to (re)buy by client agreement.
 Service 1 of the GBA recommendation/procurement initiative. Consumed by gba-server (.NET).
 
 Ground-up rebuild (June 2026) of the `bi-server-concord` V3.2 prototype: same algorithm,
 hardened — read-only DB login, parameterized SQL, env-only secrets, typed contracts.
 
 ## Algorithm (V3.2 hybrid)
-- **Repurchase**: segment-weighted frequency × recency over the client's own history.
+- **Repurchase**: segment-weighted frequency × recency over the selected agreement's history.
 - **Discovery**: collaborative filtering (Jaccard-similar clients) for new products.
 - **Mix**: 20 repurchase + 5 discovery (configurable), max 3 per product group.
 - **Segments**: HEAVY (≥500 orders) / REGULAR-CONSISTENT / REGULAR-EXPLORATORY (100–500) / LIGHT (<100).
@@ -29,8 +29,10 @@ cp .env.example .env   # fill DB_PASSWORD with the read-only login
 ```
 
 ## API
-- `POST /recommend` — `{customer_id, top_n, as_of_date?, include_discovery}` → recommendations.
+- `POST /recommend` — `{customer_id, client_agreement_net_id, top_n, as_of_date?, include_discovery}` → recommendations.
   Responses expose `source_history_start`, `effective_start`, and `history_complete`.
+- `POST /recommend/copurchase` accepts the same agreement and optional `product_ids` seeds.
+- Agreement identity, history, stock, pricing and daily refresh: [contract](docs/agreements.md).
 - `GET /health`.
 
 ## Security
