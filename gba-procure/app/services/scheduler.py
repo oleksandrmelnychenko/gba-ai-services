@@ -16,6 +16,7 @@ Run as a dedicated process:  python -m app.services.scheduler
 """
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -130,22 +131,23 @@ def main() -> None:
         coalesce=True,
         max_instances=1,
     )
-    scheduler.add_job(
-        _producer_job,
-        CronTrigger(hour=s.producer_warm_hour, minute=0, timezone=tz),
-        id="producer_warm",
-        replace_existing=True,
-        misfire_grace_time=_MISFIRE_GRACE_S,
-        coalesce=True,
-    )
-    scheduler.add_job(
-        _cart_job,
-        CronTrigger(hour=s.cart_warm_hour, minute=0, timezone=tz),
-        id="cart_warm",
-        replace_existing=True,
-        misfire_grace_time=_MISFIRE_GRACE_S,
-        coalesce=True,
-    )
+    if os.environ.get("FLEET_MANAGED_REFRESH", "").lower() != "true":
+        scheduler.add_job(
+            _producer_job,
+            CronTrigger(hour=s.producer_warm_hour, minute=0, timezone=tz),
+            id="producer_warm",
+            replace_existing=True,
+            misfire_grace_time=_MISFIRE_GRACE_S,
+            coalesce=True,
+        )
+        scheduler.add_job(
+            _cart_job,
+            CronTrigger(hour=s.cart_warm_hour, minute=0, timezone=tz),
+            id="cart_warm",
+            replace_existing=True,
+            misfire_grace_time=_MISFIRE_GRACE_S,
+            coalesce=True,
+        )
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):

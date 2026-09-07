@@ -17,6 +17,7 @@ from typing import Any
 import redis
 
 from app.core.config import get_settings
+from app.core.refresh import refresh_generation
 from app.core.logging import get_logger
 from app.core.metrics import METRICS
 
@@ -62,14 +63,14 @@ def _get_client() -> redis.Redis | None:
 def make_key(client_id: int, as_of: str, months: int) -> str:
     return (
         f"solv:{_RESPONSE_CONTRACT}:{_history_version()}:{_model_version()}:"
-        f"{client_id}:{as_of}:{months}"
+        f"{client_id}:{as_of}:{months}:{refresh_generation()}"
     )
 
 
 def make_charts_key(client_id: int, as_of: str, months: int) -> str:
     return (
         f"solvchart:{_RESPONSE_CONTRACT}:{_history_version()}:{_model_version()}:"
-        f"{client_id}:{as_of}:{months}"
+        f"{client_id}:{as_of}:{months}:{refresh_generation()}"
     )
 
 

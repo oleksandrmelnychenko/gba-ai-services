@@ -6,11 +6,13 @@ If Redis is down, every call is a no-op miss — service keeps working.
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import redis
 
 from app.core.config import get_settings
+from app.core.refresh import refresh_generation
 from app.core.history import history_contract_fingerprint
 from app.core.logging import get_logger
 from app.core.metrics import METRICS
@@ -18,12 +20,12 @@ from app.core.metrics import METRICS
 log = get_logger("cache")
 
 _client: redis.Redis | None = None
-_unavailable = False
+_unavailable_until = 0.0
 
 
 def _get_client() -> redis.Redis | None:
-    global _client, _unavailable
-    if _unavailable:
+    global _client, _unavailable_until
+    if time.monotonic() < _unavailable_until:
         return None
     if _client is None:
         s = get_settings()
@@ -37,7 +39,7 @@ def _get_client() -> redis.Redis | None:
         except Exception as exc:  # noqa: BLE001
             log.warning("redis_unavailable", error=str(exc))
             _client = None
-            _unavailable = True
+            _unavailable_until = time.monotonic() + 30.0
     return _client
 
 
@@ -46,7 +48,7 @@ def make_key(kind: str, entity_id: int | str, as_of: str) -> str:
     history_fingerprint = history_contract_fingerprint(settings.source_history_start_date)
     return (
         f"products:{settings.model_version}:{history_fingerprint}:"
-        f"{kind}:{entity_id}:{as_of}"
+        f"{kind}:{entity_id}:{as_of}:{refresh_generation()}"
     )
 
 

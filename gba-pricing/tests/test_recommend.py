@@ -190,9 +190,9 @@ def test_assembler_happy_path_peer_median():
     assert reco.confidence == Confidence.HIGH
     assert reco.rationale == engine.R_PEER_MEDIAN
     assert reco.margin_pct_at_recommended == pytest.approx(45.95, abs=0.01)
-    assert reco.discount_band.min_pct == 18.0
-    assert reco.discount_band.target_pct == 18.0
-    assert reco.discount_band.max_pct == pytest.approx(44.0)
+    assert reco.discount_band.min_pct == 0.0
+    assert reco.discount_band.target_pct == 7.5
+    assert reco.discount_band.max_pct == 12.0
     assert (
         reco.discount_band.min_pct
         <= reco.discount_band.target_pct
@@ -230,7 +230,7 @@ def test_assembler_discount_cap_binds_rationale():
         peer={"p25": 9.0, "p50": 10.0, "p75": 11.0, "n": 12},
         segment={"p75": 8.0, "p90": 12.0, "n": 40},
     )
-    assert reco.recommended_price == 10.0
+    assert reco.recommended_price == 18.4
     assert reco.suggested_discount_pct == 8.0
     assert reco.rationale == engine.R_DISCOUNT_CAP
 
@@ -246,3 +246,41 @@ def test_assembler_no_cost_path_is_peer_only_low_confidence():
     assert reco.margin_pct_at_recommended is None
     assert reco.confidence == Confidence.LOW
     assert reco.discount_band.min_pct == 0.0
+
+def test_agreement_baseline_and_peer_cap_conflict_is_not_an_actionable_discount():
+    reco = _build(
+        baseline=Decimal("3.1616"), marked_up=Decimal("3.952"),
+        cost={"unit_cost_eur": Decimal("2.10"), "lot_count": 4},
+        peer={"p25": 3.0, "p50": 3.5, "p75": 3.8, "n": 12},
+        segment={"p75": 16, "p90": 18},
+    )
+    assert reco.recommended_price is None
+    assert reco.suggested_discount_pct is None
+    assert reco.discount_band is None
+    assert reco.rationale == engine.R_CONSTRAINTS_CONFLICT
+    assert reco.confidence == Confidence.LOW
+
+
+@pytest.mark.parametrize("marked_up", ["3.952", "19.9995", "123456.78901"])
+def test_emitted_discount_reproduces_price_after_rounding(marked_up):
+    base = Decimal(marked_up)
+    reco = _build(
+        baseline=base * Decimal("0.96"), marked_up=base,
+        cost={"unit_cost_eur": base * Decimal(".65"), "lot_count": 4},
+        peer={"p25": base * Decimal(".79"), "p50": base * Decimal(".83123"),
+              "p75": base * Decimal(".89"), "n": 12},
+    )
+    assert reco.suggested_discount_pct is not None
+    actual = base * (1 - Decimal(str(reco.suggested_discount_pct)) / 100)
+    assert Decimal(str(reco.recommended_price)) == actual.quantize(Decimal(".01"), rounding="ROUND_HALF_UP")
+    assert actual >= base * Decimal(".65") * Decimal("1.12")
+    assert actual <= base * Decimal(".96")
+    assert reco.discount_band.min_pct <= reco.suggested_discount_pct <= reco.discount_band.max_pct
+    assert reco.discount_band.target_pct == reco.suggested_discount_pct
+
+
+def test_floor_above_undiscounted_list_never_invents_zero_discount_as_a_solution():
+    reco = _build(cost={"unit_cost_eur": 25, "lot_count": 4})
+    assert reco.recommended_price == 28
+    assert reco.suggested_discount_pct is None
+    assert reco.discount_band is None

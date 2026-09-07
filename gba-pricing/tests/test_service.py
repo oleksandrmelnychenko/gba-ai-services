@@ -56,7 +56,7 @@ def test_recommend_resolves_and_assembles(monkeypatch):
     assert out.price_floor == 11.2
     assert out.confidence == Confidence.HIGH
     assert out.rationale == "peer-median"
-    assert out.model_version == "pricing-ab-v2"
+    assert out.model_version == service.get_settings().model_version
     assert out.source_history_start == "2025-01-01"
     assert out.requested_start == "2025-06-15"
     assert out.effective_start == "2025-06-15"
@@ -234,7 +234,7 @@ def test_recommend_cache_hit_hydrates(monkeypatch):
         product_net_uid="p-uid",
         recommended_price=18.5, price_floor=11.2, unit_cost_eur=10.0,
         suggested_discount_pct=7.5,
-        discount_band=DiscountBand(min_pct=18.0, target_pct=18.0, max_pct=44.0),
+        discount_band=DiscountBand(min_pct=0.0, target_pct=7.5, max_pct=12.0),
         peer_band=PeerBand(p25=17.0, p50=18.5, p75=19.5, n=12),
         confidence=Confidence.HIGH, margin_pct_at_recommended=45.95,
         rationale="peer-median", as_of_date="2026-06-15",
@@ -252,7 +252,7 @@ def test_recommend_cache_hit_hydrates(monkeypatch):
     )
     assert out.recommended_price == 18.5
     assert out.confidence == Confidence.HIGH
-    assert out.discount_band.max_pct == 44.0
+    assert out.discount_band.max_pct == 12.0
 
 
 @pytest.mark.parametrize(

@@ -148,7 +148,7 @@ def test_monthly_rate_reports_new_method_ids():
 
 
 def test_forecast_points_shapes_contract():
-    hist = {"2026-04": 90.0, "2026-05": 120.0, "2026-06": 150.0}
+    hist = {"2026-03": 90.0, "2026-04": 120.0, "2026-05": 150.0, "2026-06": 20.0}
     pts = fc.forecast_points(hist, date(2026, 6, 24), CFG, horizon=3)
     assert len(pts) == 3
     assert pts[0]["MonthNameUK"] == "Лип 2026"
@@ -169,6 +169,26 @@ def test_forecast_points_never_crashes_on_zero_horizon():
     assert fc.forecast_points({"2026-06": 10.0}, date(2026, 6, 24), CFG, horizon=0) == []
 
 
+@pytest.mark.parametrize("day,partial", [(1, 0.0), (7, 60.0), (30, 9000.0)])
+def test_partial_month_does_not_change_forecast_of_stable_closed_months(day, partial):
+    history = {f"2025-{month:02d}": 300.0 for month in range(1, 13)}
+    history.update({f"2026-{month:02d}": 300.0 for month in range(1, 9)})
+    history["2026-09"] = partial
+    config = CFG.model_copy(update={"forecast_method": "auto"})
+    points = fc.forecast_points(history, date(2026, 9, day), config, horizon=3)
+    assert [point["SaleAmount"] for point in points] == [300.0, 300.0, 300.0]
+    assert points[0]["MonthNameUK"] == "Жов 2026"
+
+
+def test_trend_projection_skips_current_month_but_keeps_next_month_labels():
+    history = {"2026-03": 100.0, "2026-04": 200.0, "2026-05": 300.0, "2026-06": 1.0}
+    config = CFG.model_copy(update={"forecast_method": "damped_trend", "history_months": 4})
+    points = fc.forecast_points(history, date(2026, 6, 7), config, horizon=2)
+    expected = demand.damped_trend_path([100.0, 200.0, 300.0], 3)
+    assert [point["SaleAmount"] for point in points] == [fc.eur_cents(x) for x in expected[1:]]
+    assert [point["MonthNameUK"] for point in points] == ["Лип 2026", "Сер 2026"]
+
+
 def test_eur_boundary_uses_decimal_half_up_and_rejects_non_finite():
     assert fc.eur_cents(Decimal("10.004")) == 10.0
     assert fc.eur_cents(Decimal("10.005")) == 10.01
@@ -183,7 +203,7 @@ def test_eur_boundary_uses_decimal_half_up_and_rejects_non_finite():
 def test_forecast_points_auto_picks_sba_for_intermittent_series():
     # An intermittent series under auto mode is forecast with SBA (bias-corrected), which yields
     # a strictly lower flat value than the window-mean (moving_avg) on a sporadic series.
-    hist = {"2026-01": 100.0, "2026-04": 100.0, "2026-06": 100.0}
+    hist = {"2025-12": 100.0, "2026-01": 100.0, "2026-04": 100.0}
     auto_cfg = CFG.model_copy(update={"forecast_method": "auto", "min_history_months": 3})
     fixed_cfg = CFG.model_copy(update={"forecast_method": "moving_avg", "min_history_months": 3})
     auto_pts = fc.forecast_points(hist, date(2026, 6, 24), auto_cfg, horizon=3)
@@ -222,3 +242,16 @@ def test_forecast_points_auto_tracks_uptrend_above_window_mean():
     mavg_pts = fc.forecast_points(hist, date(2026, 6, 24), mavg_cfg, horizon=3)
     assert auto_pts and mavg_pts
     assert auto_pts[0]["SaleAmount"] > mavg_pts[0]["SaleAmount"]  # tracks the trend, not lags it
+
+
+def test_partial_month_cannot_make_history_status_sufficient(monkeypatch):
+    from app.api import main
+    from app.core.config import Settings
+    settings = Settings(min_history_months=3, history_months=12)
+    monkeypatch.setattr(main, "settings", settings)
+    rows = [{"ym": month, "eur": 300.0} for month in ("2026-07", "2026-08", "2026-09")]
+    points, history = main._forecast_with_history(rows, date(2026, 9, 7), 3)
+    assert points == []
+    assert history["sufficient"] is False
+    assert history["status"] == "insufficient_history"
+    assert history["month_count"] == 2

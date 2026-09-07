@@ -7,6 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.api.main import app
+from app.core.config import get_settings
 from app.data import cache
 from app.data import sales_repository as repo
 from app.services import scheduler
@@ -86,7 +87,8 @@ def test_wrong_agreement_cached_under_right_key_is_rejected(scoped_data):
 
 @pytest.mark.parametrize("endpoint", ["/recommend", "/recommend/copurchase"])
 def test_foreign_or_inactive_agreement_fails_even_if_customer_exists(scoped_data, endpoint):
-    response = TestClient(app).post(endpoint, json={"customer_id": 8, "client_agreement_net_id": A})
+    response = TestClient(app).post(endpoint, json={"customer_id": 8, "client_agreement_net_id": A},
+                                    headers={"X-Internal-Api-Key": get_settings().internal_api_key})
     assert response.status_code == 404
 
 
@@ -154,3 +156,22 @@ def test_worker_requires_working_cache_before_computing(monkeypatch):
     monkeypatch.setattr(cache, "health", lambda: False)
     with pytest.raises(RuntimeError, match="cannot persist"):
         worker.run(AS_OF)
+
+
+def test_parallel_worker_resumes_only_unwritten_scope(scoped_data, monkeypatch):
+    entries, _ = scoped_data
+    monkeypatch.setattr(worker, "active_clients", lambda *args: [7])
+    monkeypatch.setattr(worker, "_check_identity_churn", lambda *args: None)
+    monkeypatch.setattr(copurchase, "_cooccurring_products", lambda *args, **kw: {})
+    result = worker.run(AS_OF, top_n=1, include_discovery=False, workers=4, refresh_token="cycle-1")
+    assert result["ok"] == result["copurchase_ok"] == 3
+    missing = cache.make_copurchase_key(7, AS_OF, 1, client_agreement_net_id=B)
+    entries.pop(missing)
+    calls = []
+    original = copurchase.recommend
+    monkeypatch.setattr(copurchase, "recommend", lambda *a, **kw: calls.append(kw.get("client_agreement_net_id")) or original(*a, **kw))
+    monkeypatch.setattr(service, "get_recommendations", lambda *a, **kw: pytest.fail("completed context recalculated"))
+    result = worker.run(AS_OF, top_n=1, include_discovery=False, workers=4, refresh_token="cycle-1")
+    assert result["failed"] == result["copurchase_failed"] == 0
+    assert calls == [B]
+    assert entries[missing]["_fleet_refresh"] == "cycle-1"

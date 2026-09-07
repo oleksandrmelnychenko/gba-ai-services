@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 
 from app.core.config import get_settings
 from app.domain.models import (
@@ -31,6 +31,7 @@ R_AT_BASELINE = "at-baseline"
 R_DISCOUNT_CAP = "discount-cap"
 R_NO_ANCHOR = "no-anchor"
 R_NO_BASELINE = "no-baseline"
+R_CONSTRAINTS_CONFLICT = "constraints-conflict"
 
 
 def _round2(value: MoneyValue) -> float:
@@ -238,29 +239,44 @@ def build_recommendation(
     peer_n = int(peer.get("n") or 0)
     rec = recommended_price(floor, p50, baseline)
 
-    raw_discount = discount_from_price(rec.value, marked_up)
-    seg_p75 = segment.get("p75")
-    seg_p90 = segment.get("p90")
-    suggested_discount, was_capped = cap_discount(raw_discount, seg_p75, seg_p90)
-
-    floor_discount = discount_from_price(floor, marked_up)
-    min_pct = max(ZERO, floor_discount) if floor_discount is not None else ZERO
-    max_pct = (
-        optional_decimal(seg_p90)
-        if seg_p90 is not None
-        else (optional_decimal(seg_p75) if seg_p75 is not None else ZERO)
-    )
-    target_pct = suggested_discount if suggested_discount is not None else ZERO
-    lo, hi = sorted([min_pct, max_pct])
-    target_pct = min(max(target_pct, lo), hi)
-    discount_band = DiscountBand(
-        min_pct=_round2(lo),
-        target_pct=_round2(target_pct),
-        max_pct=_round2(hi),
-    )
-    assert discount_band.min_pct <= discount_band.target_pct <= discount_band.max_pct
+    # A floor-implied discount is an UPPER bound. The agreement's current price
+    # supplies the LOWER bound (except the existing explicit below-margin loss flag).
+    # Round bounds inward at the actual two-decimal DiscountRate precision.
+    marked_up_value = optional_decimal(marked_up)
+    baseline_value = optional_decimal(baseline)
+    suggested_discount = None
+    discount_band = None
+    was_capped = False
+    conflict = False
+    if rec.value is not None and marked_up_value is not None and marked_up_value > ZERO:
+        lo = ZERO
+        if baseline_value is not None and rec.rationale != R_BELOW_MARGIN:
+            lo = max(ZERO, discount_from_price(baseline_value, marked_up_value))
+        hi = HUNDRED
+        for limit in (segment.get("p75"), segment.get("p90"), discount_from_price(floor, marked_up_value)):
+            if limit is not None:
+                hi = min(hi, as_decimal(limit))
+        lo = lo.quantize(CENT, rounding=ROUND_CEILING)
+        hi = hi.quantize(CENT, rounding=ROUND_FLOOR)
+        if lo > hi:
+            conflict = True
+            # Keep the explicit margin-loss target as advisory; it cannot be
+            # applied through DiscountRate when it exceeds the undiscounted list.
+            if rec.rationale != R_BELOW_MARGIN:
+                rec = RecommendedPrice(None, R_CONSTRAINTS_CONFLICT)
+        else:
+            raw_discount = discount_from_price(rec.value, marked_up_value)
+            quantized = raw_discount.quantize(CENT, rounding=ROUND_HALF_UP)
+            suggested_discount = min(max(quantized, lo), hi)
+            was_capped = suggested_discount < quantized
+            rec.value = marked_up_value * (Decimal(1) - suggested_discount / HUNDRED)
+            discount_band = DiscountBand(
+                min_pct=float(lo), target_pct=float(suggested_discount), max_pct=float(hi),
+            )
 
     confidence = confidence_for(lot_count, peer_n, has_cost, baseline)
+    if conflict:
+        confidence = Confidence.LOW
     margin_pct = margin_pct_at(rec.value, unit_cost)
     rationale = rationale_for(rec.rationale, was_capped)
 
@@ -281,6 +297,7 @@ def build_recommendation(
             _round2(suggested_discount) if suggested_discount is not None else None
         ),
         discount_band=discount_band,
+        discount_base_price=float(marked_up_value) if marked_up_value is not None else None,
         peer_band=PeerBand(
             p25=_round2(peer["p25"]) if peer.get("p25") is not None else None,
             p50=_round2(p50) if p50 is not None else None,

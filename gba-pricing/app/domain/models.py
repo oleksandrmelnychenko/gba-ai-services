@@ -139,11 +139,9 @@ class CompetitorPriceSearchResult(BaseModel):
 class DiscountBand(BaseModel):
     """The defensible discount window expressed in the engine's own DiscountRate lever (%).
 
-    Edges = { floor-implied discount (most aggressive discount that still holds the margin floor),
-    peer P90 cap from ProductGroupDiscount.DiscountRate within the segment }, emitted as
-    min_pct <= max_pct (sorted) so the rendered range is always monotone. target_pct = the
-    suggested discount that reproduces recommended_price, clamped into [min_pct, max_pct].
-    DISPLAY-ONLY: this band never feeds recommended_price / suggested_discount_pct / margin.
+    The lower bound protects the agreement baseline; the upper bound is the minimum
+    of the margin-floor-implied discount and peer caps. Bounds are rounded inward
+    to the supported discount precision. target_pct is the actual suggested discount.
     """
     min_pct: float = Field(ge=0.0, le=100.0, allow_inf_nan=False)
     target_pct: float = Field(ge=0.0, le=100.0, allow_inf_nan=False)
@@ -201,7 +199,7 @@ class PriceRecommendation(BaseModel):
         default=None,
         ge=0.0,
         allow_inf_nan=False,
-        description="optimizer target; clamp(max(floor,peer_P50), floor, baseline)",
+        description="price reproduced by the feasible rounded discount; null on conflicting constraints",
     )
     price_floor: float | None = Field(
         default=None,
@@ -221,6 +219,10 @@ class PriceRecommendation(BaseModel):
         le=100.0,
         allow_inf_nan=False,
         description="DiscountRate that reproduces recommended_price via the engine",
+    )
+    discount_base_price: float | None = Field(
+        default=None, gt=0.0, allow_inf_nan=False,
+        description="unrounded EUR amount before DiscountRate; reproduces the recommended price",
     )
     discount_band: DiscountBand | None = None
     peer_band: PeerBand = Field(default_factory=PeerBand)
@@ -268,7 +270,24 @@ class PriceRecommendation(BaseModel):
         description="serving model namespace including version, window and history floor",
     )
     as_of_date: str | None = None
-    model_version: str = "pricing-ab-v2"
+    model_version: str = "pricing-ab-v3-coherent-discount"
+
+    @model_validator(mode="after")
+    def validate_discount_coherence(self) -> PriceRecommendation:
+        if self.suggested_discount_pct is not None:
+            if self.recommended_price is None or self.discount_band is None:
+                raise ValueError("an actionable discount requires a price and feasible band")
+            if self.suggested_discount_pct != self.discount_band.target_pct:
+                raise ValueError("suggested discount must equal the band target")
+            if self.discount_base_price is not None:
+                from decimal import Decimal
+                expected = round_cent(
+                    Decimal(str(self.discount_base_price))
+                    * (Decimal(1) - Decimal(str(self.suggested_discount_pct)) / Decimal(100))
+                )
+                if abs(expected - Decimal(str(self.recommended_price))) > Decimal("0.01"):
+                    raise ValueError("discount does not reproduce recommended price")
+        return self
 
     @field_validator(
         "baseline_price",

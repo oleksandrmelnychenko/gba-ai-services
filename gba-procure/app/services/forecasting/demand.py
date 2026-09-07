@@ -17,7 +17,7 @@ the textbook fix for intermittent series.
 from __future__ import annotations
 
 import math
-from datetime import date
+from datetime import date, timedelta
 
 from app.core.config import get_settings
 from app.core.history import rolling_coverage
@@ -27,7 +27,7 @@ from app.domain.models import DemandForecast
 _METHOD_MOVING_AVG = "moving_average_v0"
 _METHOD_CROSTON = "croston_v1"
 _METHOD_SBA = "sba_v1"
-_METHOD_EWMA = "ewma_v1"
+_METHOD_EWMA = "ewma_v2_calendar_daily"
 
 
 def seasonal_index_for(rows: list[dict], target_month: int, k: float = 4.0,
@@ -87,22 +87,41 @@ def _moving_avg_rate(rows: list[dict], history_days: int) -> float:
     return total_units / history_days if history_days > 0 else 0.0
 
 
-def _ewma_monthly_rate(rows: list[dict], alpha: float) -> float:
-    """Recency-weighted daily rate: EWMA over the monthly demand series / 30."""
-    monthly: dict[str, float] = {}
-    for r in rows:
-        d = r["d"]
-        if isinstance(d, str):
-            d = date.fromisoformat(d[:10])
-        key = f"{d.year:04d}-{d.month:02d}"
-        monthly[key] = monthly.get(key, 0.0) + float(r["units"] or 0)
-    if not monthly:
+def _ewma_monthly_rate(
+    rows: list[dict], alpha: float,
+    window_start: date | None = None, window_end: date | None = None,
+) -> float:
+    """EWMA of daily rates in every calendar bucket, including zero-demand months.
+
+    Boundaries are [start, end). Partial months use their observed day count, so
+    a six-day month-to-date total is not compared with thirty days of demand.
+    Without explicit boundaries, cover the complete observed calendar months.
+    """
+    observations = [
+        (date.fromisoformat(str(r["d"])[:10]), float(r["units"] or 0)) for r in rows
+    ]
+    if not observations:
         return 0.0
-    series = [monthly[k] for k in sorted(monthly)]
-    level = series[0]
-    for m in series[1:]:
-        level = alpha * m + (1.0 - alpha) * level
-    return level / 30.0
+    first = min(day for day, _ in observations)
+    last = max(day for day, _ in observations)
+    start = window_start or first.replace(day=1)
+    end = window_end or ((last.replace(day=28) + timedelta(days=4)).replace(day=1))
+    if end <= start:
+        return 0.0
+    monthly: dict[tuple[int, int], float] = {}
+    for day, units in observations:
+        if start <= day < end:
+            key = (day.year, day.month)
+            monthly[key] = monthly.get(key, 0.0) + units
+    month = start.replace(day=1)
+    level: float | None = None
+    while month < end:
+        following = (month.replace(day=28) + timedelta(days=4)).replace(day=1)
+        observed_days = (min(following, end) - max(month, start)).days
+        rate = monthly.get((month.year, month.month), 0.0) / observed_days
+        level = rate if level is None else alpha * rate + (1.0 - alpha) * level
+        month = following
+    return max(0.0, level or 0.0)
 
 
 def _demand_events(rows: list[dict]) -> list[tuple[date, float]]:
@@ -238,7 +257,14 @@ def forecast_from_rows(
         )
         method_id = _METHOD_SBA
     elif method == "ewma":
-        mean_daily = _ewma_monthly_rate(rows, s.ewma_alpha)
+        start = (
+            date.fromisoformat(str(effective_start)[:10])
+            if effective_start is not None else None
+        )
+        mean_daily = _ewma_monthly_rate(
+            rows, s.ewma_alpha, start,
+            start + timedelta(days=window_days) if start is not None else None,
+        )
         method_id = _METHOD_EWMA
     else:
         mean_daily = _moving_avg_rate(rows, window_days)

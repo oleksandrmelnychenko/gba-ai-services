@@ -98,6 +98,18 @@ def eur_cents(value: object) -> float:
     return result
 
 
+def training_labels(as_of: date, cfg: Settings) -> list[str]:
+    """Calendar months whose complete observations may train a monthly forecast."""
+    labels = history_labels(as_of, cfg.history_months, cfg.source_history_start_date)
+    # Current-month totals are month-to-date, even on the last calendar day
+    # (the source cutoff is exclusive). They cannot be a full monthly observation.
+    return [
+        label for label in labels
+        if label < f"{as_of:%Y-%m}"
+        and date.fromisoformat(f"{label}-01") >= cfg.source_history_start_date
+    ]
+
+
 def forecast_points(
     history: dict[str, float], as_of: date, cfg: Settings, horizon: int | None = None
 ) -> list[dict]:
@@ -111,7 +123,7 @@ def forecast_points(
     if horizon <= 0:
         return []
 
-    labels = history_labels(as_of, cfg.history_months, cfg.source_history_start_date)
+    labels = training_labels(as_of, cfg)
     series = series_from(history, labels)
     if _non_zero_months(series) < cfg.min_history_months:
         return []
@@ -121,7 +133,9 @@ def forecast_points(
     # lumpy -> SBA); a forced FORECAST_METHOD keeps the single-method behaviour. Contract is
     # unchanged — EWMA is a flat level, damped_trend a per-step path; forecast_series handles both.
     method, _segment = selection.select_method(series, cfg.forecast_method)
-    projected = demand.forecast_series(series, horizon, method, cfg.croston_alpha)
+    # The first step from the last closed month is the current month. The API
+    # promises months AFTER as_of's month, so skip that step (essential for trends).
+    projected = demand.forecast_series(series, horizon + 1, method, cfg.croston_alpha)[1:]
     points: list[dict] = []
     for (y, m), amount in zip(future_months(as_of, horizon), projected, strict=True):
         points.append({"SaleAmount": eur_cents(amount), "MonthNameUK": month_name_uk(y, m)})

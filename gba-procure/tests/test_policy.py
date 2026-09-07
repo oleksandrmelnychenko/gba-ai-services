@@ -91,7 +91,7 @@ def test_ewma_forecast_is_positive_and_tagged():
     from app.services.forecasting import demand as d
     rows = [{"d": f"2026-{m:02d}-15", "units": m * 10} for m in range(1, 7)]
     f = d.forecast_from_rows(1, rows, 30, method="ewma")
-    assert f.method == "ewma_v1"
+    assert f.method == "ewma_v2_calendar_daily"
     assert f.mean_daily > 0
 
 
@@ -211,3 +211,31 @@ def test_seasonal_index_shrinks_and_bounds():
     idx_jan = d.seasonal_index_for(rows, 1, k=4, lo=0.6, hi=1.6, min_months=12)
     assert idx_jun > idx_jan
     assert 0.6 <= idx_jan <= idx_jun <= 1.6
+
+
+@pytest.mark.parametrize("reserved,on_order,position,expected_qty", [
+    (0, 0, 20, 0), (15, 0, 5, 35), (15, 8, 13, 0), (25, 0, -5, 45),
+])
+def test_reservations_and_incoming_supply_affect_actual_plan(monkeypatch, reserved, on_order, position, expected_qty):
+    from app.core.config import get_settings
+    settings = get_settings().model_copy(update={
+        "use_masters": False, "use_feedback": False, "seasonality_enabled": False,
+        "economic_service_level": False, "forecast_horizon_days": 30,
+    })
+    monkeypatch.setattr(policy, "get_settings", lambda: settings)
+    monkeypatch.setattr(policy.lead_time_svc, "producer_lead_time", lambda *a: (10.0, 0.0, "test"))
+    monkeypatch.setattr(policy.repo, "products_for_producer", lambda *a: [1])
+    monkeypatch.setattr(policy.repo, "on_hand", lambda *a: {1: 20.0})
+    monkeypatch.setattr(policy.repo, "reserved", lambda *a: {1: float(reserved)})
+    monkeypatch.setattr(policy.repo, "on_order", lambda *a: {1: float(on_order)})
+    monkeypatch.setattr(policy.repo, "product_daily_demand_bulk", lambda *a: {})
+    monkeypatch.setattr(policy.cost_repo, "producer_unit_costs_eur", lambda *a: {})
+    monkeypatch.setattr(policy.cost_repo, "sale_prices_eur", lambda *a: {})
+    monkeypatch.setattr(policy.cost_repo, "cheapest_alt_eur", lambda *a: {})
+    monkeypatch.setattr(policy.demand_svc, "forecast_from_rows", lambda *a, **kw: DemandForecast(
+        product_id=1, mean_daily=1.0, std_daily=0.0, method="test", horizon_days=30, forecast_units=30.0))
+    plan = policy.build_plan(99, "2026-09-07", only_needed=False, abc_map={1: "C"}, producer_name="Test")
+    item = plan.items[0]
+    assert item.inventory.position == position
+    assert item.inventory.available == 20 - reserved
+    assert item.suggested_qty == expected_qty

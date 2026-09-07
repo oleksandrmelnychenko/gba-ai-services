@@ -19,6 +19,7 @@ from typing import Any
 import redis
 
 from app.core.config import get_settings
+from app.core.refresh import refresh_generation
 from app.core.history import model_contract_fingerprint
 from app.core.logging import get_logger
 from app.core.metrics import METRICS
@@ -66,7 +67,7 @@ def make_key(product: int | str, agreement: str, as_of: str,
              target_margin_pct: float, with_vat: bool, culture: str) -> str:
     return (
         f"price:{_model_fingerprint()}:{product}:{agreement.lower()}:{as_of}"
-        f":{target_margin_pct}:{int(with_vat)}:{culture}"
+        f":{target_margin_pct}:{int(with_vat)}:{culture}:{refresh_generation()}"
     )
 
 

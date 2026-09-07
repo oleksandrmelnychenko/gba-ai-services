@@ -212,5 +212,5 @@ def test_canonical_cache_rejects_history_metadata_drift():
 
 
 def test_cache_namespace_and_model_version_identify_the_floor():
-    assert "v8-h20250101" in cache.make_key("cart", "all", "2026-06-15")
+    assert "v9-h20250101" in cache.make_key("cart", "all", "2026-06-15")
     assert "floor20250101" in MODEL_VERSION

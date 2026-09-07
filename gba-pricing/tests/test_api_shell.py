@@ -186,7 +186,7 @@ def test_price_with_fake_service(monkeypatch):
     assert body["product_id"] == 7
     assert body["currency"] == "EUR"
     assert body["confidence"] == "high"
-    assert body["model_version"] == "pricing-ab-v2"
+    assert body["model_version"] == "pricing-ab-v3-coherent-discount"
     assert body["source_history_start"] == "2025-01-01"
     assert body["effective_start"] == "2025-06-15"
     assert body["history_complete"] is True

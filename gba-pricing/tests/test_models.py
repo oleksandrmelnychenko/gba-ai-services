@@ -19,7 +19,7 @@ from app.domain.models import (
 def test_recommendation_defaults_and_roundtrip():
     reco = PriceRecommendation(product_id=42, client_agreement_netuid="ca-uid")
     assert reco.currency == "EUR"
-    assert reco.model_version == "pricing-ab-v2"
+    assert reco.model_version == "pricing-ab-v3-coherent-discount"
     assert reco.confidence == Confidence.LOW
     assert reco.peer_band.n == 0
     assert reco.baseline_price is None

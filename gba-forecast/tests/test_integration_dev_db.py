@@ -258,6 +258,8 @@ def test_live_identity_and_history_money_reconcile_exactly(monkeypatch):
         "history_start": window.effective_start.isoformat(),
         "asof": as_of,
     }
+    # Monthly training and its metadata use only closed calendar months.
+    params["asof"] = as_of[:7] + "-01"
     for key, sql in scope_sql.items():
         rows = query(sql, params)
         values = [Decimal(str(row["eur"] or 0)) for row in rows if row.get("ym")]

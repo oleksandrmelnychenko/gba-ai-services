@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     )
 
     # bump on any forecast-method change so outcomes can be sliced/A-B'd by version
-    model_version: str = "forecast-v1"
+    model_version: str = "forecast-v2-closed-months"
 
     # Optional override for the synthetic «Ввід боргів» debt-entry ProductID. 0 = resolve it
     # dynamically from dbo.Product (the 1С sync re-mints the row, so a pinned ID goes stale).

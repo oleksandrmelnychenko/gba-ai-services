@@ -59,7 +59,7 @@ class Settings(BaseSettings):
     competitor_total_budget_seconds: int = 210
 
     # Pricing model (A+B: margin-floor + peer-price-band discount governor)
-    model_version: str = "pricing-ab-v2"
+    model_version: str = "pricing-ab-v3-coherent-discount"
     # A green health/readiness response means the canonical sales source is present and current,
     # not merely that MSSQL accepts connections. 31 days tolerates quiet holiday periods while
     # still failing closed on a stopped 1C/sales synchronization.

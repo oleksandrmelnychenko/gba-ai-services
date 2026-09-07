@@ -473,7 +473,10 @@ def _forecast_with_history(rows: list[dict], as_of: date, horizon: int) -> tuple
     allowed_months = set(labels)
     if any(row.get("ym") and str(row["ym"]) not in allowed_months for row in rows):
         raise ValueError("sales history contains a month outside the effective source window")
-    summary = sig.history_summary(rows, max_months=len(labels))
+    # Metadata describes the same closed observations the model consumes.
+    training_months = set(fc.training_labels(as_of, settings))
+    training_rows = [row for row in rows if str(row.get("ym")) in training_months]
+    summary = sig.history_summary(training_rows, max_months=len(training_months))
     points = fc.forecast_points(sig.to_series(rows), as_of, settings, horizon)
     sufficient = summary["non_zero_month_count"] >= settings.min_history_months
     status = "sufficient" if sufficient else "insufficient_history"

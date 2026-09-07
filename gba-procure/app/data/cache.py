@@ -17,6 +17,7 @@ from app.core.metrics import METRICS
 
 log = get_logger("cache")
 
+# v9: calendar-complete EWMA invalidates older alternative forecasts.
 # v8-h20250101: source floor, effective window and model metadata are part of every plan;
 # v7: canonical cart is full, product-deduplicated and Decimal-cent reconciled;
 # v6: readiness is input-aware and cached plans carry a source-state fingerprint;
@@ -24,7 +25,7 @@ log = get_logger("cache")
 # v4: ReorderSuggestion gained proof fields (lead_demand/order_up_to/producer_name);
 # v3: /plan/cart keys became only_needed-aware (a shared v2 key could hold either
 # variant's plan for 8 days) — the bump kills all stale entries; scheduler re-warms.
-_VER = f"v8-h{get_settings().source_history_start_date:%Y%m%d}"
+_VER = f"v9-h{get_settings().source_history_start_date:%Y%m%d}"
 _RETRY_COOLDOWN_S = 30.0
 _CART_NOT_READY_TTL_S = 60
 _client: redis.Redis | None = None

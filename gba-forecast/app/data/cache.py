@@ -13,12 +13,13 @@ from typing import Any
 import redis
 
 from app.core.config import get_settings
+from app.core.refresh import refresh_generation
 from app.core.logging import get_logger
 from app.core.metrics import METRICS
 
 log = get_logger("cache")
 
-_VER = "v2"
+_VER = "v3-closed-months"
 _client: redis.Redis | None = None
 _unavailable = False
 _last_failure_at = 0.0
@@ -54,7 +55,7 @@ def _get_client() -> redis.Redis | None:
 
 def make_key(kind: str, entity_id: int | str, months: int, *parts: object) -> str:
     suffix = ":".join(_key_part(part) for part in parts if part is not None)
-    base = f"forecast:{_VER}:{kind}:{_key_part(entity_id)}:{months}"
+    base = f"forecast:{_VER}:{refresh_generation()}:{kind}:{_key_part(entity_id)}:{months}"
     return f"{base}:{suffix}" if suffix else base
 
 
