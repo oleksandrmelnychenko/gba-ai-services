@@ -220,7 +220,7 @@ def assortment_stock(as_of_date: date | None = None, limit: int = 100) -> dict:
             snap = _build_and_cache_stock(as_of)
         METRICS.record_request((time.time() - started) * 1000)
         out = dict(snap)
-        out["rows"] = out.get("rows", [])[:max(0, limit)]
+        out["rows"] = _attach_meta(out.get("rows", [])[:max(0, limit)], as_of)
         return out
     except Exception as exc:  # noqa: BLE001
         METRICS.record_request((time.time() - started) * 1000, error=True)
@@ -323,6 +323,23 @@ def _attach_meta(rows: list[dict], as_of: str) -> list[dict]:
     if len(output) != len(rows):
         raise ValueError("metadata attachment changed row count")
     return output
+
+
+def _attach_ranked_meta(groups: dict[str, list[dict]], as_of: str) -> dict[str, list[dict]]:
+    """Resolve each displayed identity once, preserving ranking and financial fields."""
+    identities = {
+        exact.positive_int(row["product_id"], "ranked product_id")
+        for rows in groups.values()
+        for row in rows
+    }
+    named = {
+        row["product_id"]: row
+        for row in _attach_meta([{"product_id": pid} for pid in sorted(identities)], as_of)
+    }
+    return {
+        group: [{**row, **named[row["product_id"]]} for row in rows]
+        for group, rows in groups.items()
+    }
 
 
 def _region_window(window_days: int | None) -> int:
@@ -770,10 +787,12 @@ async def assortment_margin(as_of_date: date | None = None, limit: int = 20) -> 
         build = await _portfolio(as_of)
         rows = build["rows"]
         METRICS.record_request((time.time() - started) * 1000)
-        return {"as_of": as_of, **_history_response_fields(build),
-                "leaders": margin_returns.margin_leaders(rows, limit),
-                "laggards": margin_returns.margin_laggards(rows, limit),
-                "negative": margin_returns.negative_margin(rows),
+        ranked = await asyncio.to_thread(_attach_ranked_meta, {
+            "leaders": margin_returns.margin_leaders(rows, limit),
+            "laggards": margin_returns.margin_laggards(rows, limit),
+            "negative": margin_returns.negative_margin(rows),
+        }, as_of)
+        return {"as_of": as_of, **_history_response_fields(build), **ranked,
                 "summary": margin_returns.margin_returns_summary(rows)}
     except Exception as exc:  # noqa: BLE001
         METRICS.record_request((time.time() - started) * 1000, error=True)
@@ -792,8 +811,11 @@ async def assortment_returns(as_of_date: date | None = None, min_rate: float | N
         build = await _portfolio(as_of)
         rows = build["rows"]
         METRICS.record_request((time.time() - started) * 1000)
+        ranked = await asyncio.to_thread(
+            _attach_meta, margin_returns.high_returns(rows, rate, limit), as_of,
+        )
         return {"as_of": as_of, **_history_response_fields(build), "min_rate": rate,
-                "high_returns": margin_returns.high_returns(rows, rate, limit),
+                "high_returns": ranked,
                 "summary": margin_returns.margin_returns_summary(rows)}
     except Exception as exc:  # noqa: BLE001
         METRICS.record_request((time.time() - started) * 1000, error=True)
