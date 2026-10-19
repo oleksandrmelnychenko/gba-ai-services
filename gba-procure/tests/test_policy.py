@@ -216,7 +216,9 @@ def test_seasonal_index_shrinks_and_bounds():
 @pytest.mark.parametrize("reserved,on_order,position,expected_qty", [
     (0, 0, 20, 0), (15, 0, 5, 35), (15, 8, 13, 0), (25, 0, -5, 45),
 ])
-def test_reservations_and_incoming_supply_affect_actual_plan(monkeypatch, reserved, on_order, position, expected_qty):
+def test_reservations_and_incoming_supply_affect_actual_plan(
+    monkeypatch, reserved, on_order, position, expected_qty,
+):
     from app.core.config import get_settings
     settings = get_settings().model_copy(update={
         "use_masters": False, "use_feedback": False, "seasonality_enabled": False,
@@ -229,6 +231,7 @@ def test_reservations_and_incoming_supply_affect_actual_plan(monkeypatch, reserv
     monkeypatch.setattr(policy.repo, "reserved", lambda *a: {1: float(reserved)})
     monkeypatch.setattr(policy.repo, "on_order", lambda *a: {1: float(on_order)})
     monkeypatch.setattr(policy.repo, "product_daily_demand_bulk", lambda *a: {})
+    monkeypatch.setattr(policy.repo, "product_meta", lambda *a: {})
     monkeypatch.setattr(policy.cost_repo, "producer_unit_costs_eur", lambda *a: {})
     monkeypatch.setattr(policy.cost_repo, "sale_prices_eur", lambda *a: {})
     monkeypatch.setattr(policy.cost_repo, "cheapest_alt_eur", lambda *a: {})

@@ -33,9 +33,19 @@ def get_engine() -> Engine:
     return _engine
 
 
-def query(sql: str, params: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
-    """Run a parameterized read query. Use :name placeholders, pass params dict."""
+def query(
+    sql: str,
+    params: Mapping[str, Any] | None = None,
+    *,
+    isolation_level: str | None = None,
+) -> list[dict[str, Any]]:
+    """Run a parameterized read; optionally keep a multi-step batch in one snapshot.
+
+    SQLAlchemy restores connection isolation when the connection returns to the pool.
+    """
     with get_engine().connect() as conn:
+        if isolation_level is not None:
+            conn = conn.execution_options(isolation_level=isolation_level)
         result = conn.execute(text(sql), params or {})
         cols = list(result.keys())
         return [dict(zip(cols, row, strict=True)) for row in result.fetchall()]

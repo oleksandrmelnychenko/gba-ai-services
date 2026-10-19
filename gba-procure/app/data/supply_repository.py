@@ -554,9 +554,9 @@ def procurement_source_readiness(as_of: str, history_days: int) -> dict:
     (or lost operational storage flags) before an empty plan can be cached as healthy.
     """
     coverage = rolling_coverage(as_of, history_days)
-    rows = query(
-        f"""
-        WITH FactualSupply AS (
+    statement = f"""
+        SET NOCOUNT ON;
+        SELECT * INTO #FactualSupply FROM (
             SELECT CAST(0 AS tinyint) AS source_kind,
                    sioi.ID AS source_line_id,
                    so.ClientID AS producer_id,
@@ -577,10 +577,10 @@ def procurement_source_readiness(as_of: str, history_days: int) -> dict:
             WHERE si.Deleted = 0
                   AND so.ClientID IS NOT NULL
                   AND sioi.ProductID IS NOT NULL
-                  AND sioi.ProductID <> :syn
-                  AND si.DateFrom >= DATEADD(day, -:days, :asof)
-                  AND si.DateFrom >= :history_start
-                  AND si.DateFrom < :asof
+                  AND sioi.ProductID <> @syn
+                  AND si.DateFrom >= DATEADD(day, -@days, @asof)
+                  AND si.DateFrom >= @history_start
+                  AND si.DateFrom < @asof
 
             UNION ALL
 
@@ -604,20 +604,26 @@ def procurement_source_readiness(as_of: str, history_days: int) -> dict:
                   AND NOT (sou.IsFromCockpit = 1 AND sou.IsPlaced = 0)
                   AND COALESCE(soui.SupplierID, sou.SupplierID) IS NOT NULL
                   AND soui.ProductID IS NOT NULL
-                  AND soui.ProductID <> :syn
-                  AND sou.FromDate >= DATEADD(day, -:days, :asof)
-                  AND sou.FromDate >= :history_start
-                  AND sou.FromDate < :asof
-        ),
-        CandidatePairs AS (
+                  AND soui.ProductID <> @syn
+                  AND sou.FromDate >= DATEADD(day, -@days, @asof)
+                  AND sou.FromDate >= @history_start
+                  AND sou.FromDate < @asof
+
+        ) AS materialized;
+
+        SELECT * INTO #CandidatePairs FROM (
             SELECT DISTINCT producer_id, product_id
-            FROM FactualSupply
-        ),
-        CandidateProducts AS (
+            FROM #FactualSupply
+
+        ) AS materialized;
+
+        SELECT * INTO #CandidateProducts FROM (
             SELECT DISTINCT product_id
-            FROM CandidatePairs
-        ),
-        CandidateDemand AS (
+            FROM #CandidatePairs
+
+        ) AS materialized;
+
+        SELECT * INTO #CandidateDemand FROM (
             SELECT oi.ProductID AS product_id,
                    MAX(o.Created) AS latest_sale_date,
                    MAX(oi.ID) AS max_order_item_id,
@@ -629,19 +635,23 @@ def procurement_source_readiness(as_of: str, history_days: int) -> dict:
                    )) AS demand_checksum
             FROM dbo.[Order] o
             JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-            JOIN CandidateProducts cp ON cp.product_id = oi.ProductID
+            JOIN #CandidateProducts cp ON cp.product_id = oi.ProductID
             WHERE oi.IsValidForCurrentSale = 1
-                  AND o.Created >= DATEADD(day, -:days, :asof)
-                  AND o.Created >= :history_start
-                  AND o.Created < :asof
+                  AND o.Created >= DATEADD(day, -@days, @asof)
+                  AND o.Created >= @history_start
+                  AND o.Created < @asof
             GROUP BY oi.ProductID
-        ),
-        SellableStorage AS (
+
+        ) AS materialized;
+
+        SELECT * INTO #SellableStorage FROM (
             SELECT st.ID
             FROM dbo.Storage st
             WHERE {_SELLABLE_STORAGE}
-        ),
-        GlobalInventory AS (
+
+        ) AS materialized;
+
+        SELECT * INTO #GlobalInventory FROM (
             SELECT COUNT_BIG(*) AS availability_rows,
                    COUNT_BIG(DISTINCT pa.ProductID) AS product_count,
                    SUM(pa.Amount) AS available_qty,
@@ -652,17 +662,21 @@ def procurement_source_readiness(as_of: str, history_days: int) -> dict:
             WHERE pa.Deleted = 0
                   AND st.Deleted = 0
                   AND st.ForDefective = 0
-        ),
-        UnscopedCandidateInventory AS (
+
+        ) AS materialized;
+
+        SELECT * INTO #UnscopedCandidateInventory FROM (
             SELECT COUNT_BIG(DISTINCT pa.ProductID) AS product_count
             FROM dbo.ProductAvailability pa
             JOIN dbo.Storage st ON st.ID = pa.StorageID
-            JOIN CandidateProducts cp ON cp.product_id = pa.ProductID
+            JOIN #CandidateProducts cp ON cp.product_id = pa.ProductID
             WHERE pa.Deleted = 0
                   AND st.Deleted = 0
                   AND st.ForDefective = 0
-        ),
-        CandidateInventory AS (
+
+        ) AS materialized;
+
+        SELECT * INTO #CandidateInventory FROM (
             SELECT pa.ProductID AS product_id,
                    COUNT_BIG(*) AS availability_rows,
                    SUM(pa.Amount) AS available_qty,
@@ -672,12 +686,14 @@ def procurement_source_readiness(as_of: str, history_days: int) -> dict:
                        pa.ID, pa.ProductID, pa.StorageID, pa.Amount, pa.Updated
                    )) AS availability_checksum
             FROM dbo.ProductAvailability pa
-            JOIN SellableStorage ss ON ss.ID = pa.StorageID
-            JOIN CandidateProducts cp ON cp.product_id = pa.ProductID
+            JOIN #SellableStorage ss ON ss.ID = pa.StorageID
+            JOIN #CandidateProducts cp ON cp.product_id = pa.ProductID
             WHERE pa.Deleted = 0
             GROUP BY pa.ProductID
-        ),
-        CandidateReservations AS (
+
+        ) AS materialized;
+
+        SELECT * INTO #CandidateReservations FROM (
             SELECT COUNT_BIG(*) AS reservation_rows,
                    SUM(CAST(pr.Qty AS decimal(38, 6))) AS reserved_qty,
                    MAX(pr.ID) AS max_reservation_id,
@@ -688,11 +704,13 @@ def procurement_source_readiness(as_of: str, history_days: int) -> dict:
             FROM dbo.ProductReservation pr
             JOIN dbo.ProductAvailability pa
               ON pa.ID = pr.ProductAvailabilityID AND pa.Deleted = 0
-            JOIN SellableStorage ss ON ss.ID = pa.StorageID
-            JOIN CandidateProducts cp ON cp.product_id = pa.ProductID
+            JOIN #SellableStorage ss ON ss.ID = pa.StorageID
+            JOIN #CandidateProducts cp ON cp.product_id = pa.ProductID
             WHERE pr.Deleted = 0
-        ),
-        CandidateFlowFacts AS (
+
+        ) AS materialized;
+
+        SELECT * INTO #CandidateFlowFacts FROM (
             SELECT CAST(0 AS tinyint) AS fact_kind,
                    plpoi.ID AS fact_id,
                    sioi.ProductID AS product_id,
@@ -703,10 +721,10 @@ def procurement_source_readiness(as_of: str, history_days: int) -> dict:
               ON sioi.ID = plpoi.SupplyInvoiceOrderItemID AND sioi.Deleted = 0
             JOIN dbo.PackingList pl ON pl.ID = plpoi.PackingListID AND pl.Deleted = 0
             JOIN dbo.SupplyInvoice si ON si.ID = pl.SupplyInvoiceID AND si.Deleted = 0
-            JOIN CandidateProducts cp ON cp.product_id = sioi.ProductID
+            JOIN #CandidateProducts cp ON cp.product_id = sioi.ProductID
             WHERE plpoi.Deleted = 0
-                  AND si.DateFrom >= :history_start
-                  AND si.DateFrom < :asof
+                  AND si.DateFrom >= @history_start
+                  AND si.DateFrom < @asof
 
             UNION ALL
 
@@ -718,10 +736,10 @@ def procurement_source_readiness(as_of: str, history_days: int) -> dict:
               ON plpoi.ID = pii.PackingListPackageOrderItemID AND plpoi.Deleted = 0
             JOIN dbo.SupplyInvoiceOrderItem sioi
               ON sioi.ID = plpoi.SupplyInvoiceOrderItemID AND sioi.Deleted = 0
-            JOIN CandidateProducts cp ON cp.product_id = sioi.ProductID
+            JOIN #CandidateProducts cp ON cp.product_id = sioi.ProductID
             WHERE pii.Deleted = 0
-                  AND pinc.FromDate >= :history_start
-                  AND pinc.FromDate < :asof
+                  AND pinc.FromDate >= @history_start
+                  AND pinc.FromDate < @asof
 
             UNION ALL
 
@@ -729,11 +747,11 @@ def procurement_source_readiness(as_of: str, history_days: int) -> dict:
             FROM dbo.SupplyOrderUkraineItem soui
             JOIN dbo.SupplyOrderUkraine sou
               ON sou.ID = soui.SupplyOrderUkraineID AND sou.Deleted = 0
-            JOIN CandidateProducts cp ON cp.product_id = soui.ProductID
+            JOIN #CandidateProducts cp ON cp.product_id = soui.ProductID
             WHERE soui.Deleted = 0
                   AND NOT (sou.IsFromCockpit = 1 AND sou.IsPlaced = 0)
-                  AND sou.FromDate >= :history_start
-                  AND sou.FromDate < :asof
+                  AND sou.FromDate >= @history_start
+                  AND sou.FromDate < @asof
 
             UNION ALL
 
@@ -745,74 +763,77 @@ def procurement_source_readiness(as_of: str, history_days: int) -> dict:
               ON soui.ID = pii.SupplyOrderUkraineItemID AND soui.Deleted = 0
             JOIN dbo.SupplyOrderUkraine sou
               ON sou.ID = soui.SupplyOrderUkraineID AND sou.Deleted = 0
-            JOIN CandidateProducts cp ON cp.product_id = soui.ProductID
+            JOIN #CandidateProducts cp ON cp.product_id = soui.ProductID
             WHERE pii.Deleted = 0
                   AND NOT (sou.IsFromCockpit = 1 AND sou.IsPlaced = 0)
-                  AND pinc.FromDate >= :history_start
-                  AND pinc.FromDate < :asof
-        ),
-        CandidateCosts AS (
+                  AND pinc.FromDate >= @history_start
+                  AND pinc.FromDate < @asof
+
+        ) AS materialized;
+
+        SELECT * INTO #CandidateCosts FROM (
             SELECT DISTINCT product_id
-            FROM FactualSupply
+            FROM #FactualSupply
             WHERE unit_price > 0
-        )
+
+        ) AS materialized;
         SELECT
-            (SELECT COUNT_BIG(DISTINCT producer_id) FROM CandidatePairs) AS producer_count,
-            (SELECT COUNT_BIG(*) FROM CandidatePairs) AS producer_product_pair_count,
-            (SELECT COUNT_BIG(*) FROM CandidateProducts) AS product_count,
-            (SELECT COUNT_BIG(*) FROM CandidateDemand) AS demand_product_count,
+            (SELECT COUNT_BIG(DISTINCT producer_id) FROM #CandidatePairs) AS producer_count,
+            (SELECT COUNT_BIG(*) FROM #CandidatePairs) AS producer_product_pair_count,
+            (SELECT COUNT_BIG(*) FROM #CandidateProducts) AS product_count,
+            (SELECT COUNT_BIG(*) FROM #CandidateDemand) AS demand_product_count,
             (SELECT COUNT_BIG(*) FROM dbo.Storage st
              WHERE st.Deleted = 0 AND st.ForDefective = 0) AS active_storage_count,
             (SELECT COUNT_BIG(*) FROM dbo.Storage st
              WHERE st.Deleted = 0 AND st.ForDefective = 0
                AND (st.AvailableForReSale = 1 OR st.IsResale = 1))
                 AS role_marked_storage_count,
-            (SELECT COUNT_BIG(*) FROM SellableStorage) AS sellable_storage_count,
-            (SELECT product_count FROM GlobalInventory) AS global_inventory_product_count,
-            ISNULL((SELECT available_qty FROM GlobalInventory), 0) AS global_available_qty,
-            (SELECT product_count FROM UnscopedCandidateInventory)
+            (SELECT COUNT_BIG(*) FROM #SellableStorage) AS sellable_storage_count,
+            (SELECT product_count FROM #GlobalInventory) AS global_inventory_product_count,
+            ISNULL((SELECT available_qty FROM #GlobalInventory), 0) AS global_available_qty,
+            (SELECT product_count FROM #UnscopedCandidateInventory)
                 AS unscoped_inventory_product_count,
-            (SELECT COUNT_BIG(*) FROM CandidateInventory) AS inventory_product_count,
-            ISNULL((SELECT SUM(availability_rows) FROM CandidateInventory), 0)
+            (SELECT COUNT_BIG(*) FROM #CandidateInventory) AS inventory_product_count,
+            ISNULL((SELECT SUM(availability_rows) FROM #CandidateInventory), 0)
                 AS availability_row_count,
-            ISNULL((SELECT SUM(available_qty) FROM CandidateInventory), 0)
+            ISNULL((SELECT SUM(available_qty) FROM #CandidateInventory), 0)
                 AS available_qty,
-            (SELECT COUNT_BIG(*) FROM CandidateCosts) AS cost_product_count,
-            (SELECT COUNT_BIG(*) FROM FactualSupply) AS supply_line_count,
-            ISNULL((SELECT SUM(CAST(source_qty AS decimal(38, 6))) FROM FactualSupply), 0)
+            (SELECT COUNT_BIG(*) FROM #CandidateCosts) AS cost_product_count,
+            (SELECT COUNT_BIG(*) FROM #FactualSupply) AS supply_line_count,
+            ISNULL((SELECT SUM(CAST(source_qty AS decimal(38, 6))) FROM #FactualSupply), 0)
                 AS supply_qty,
             (SELECT CHECKSUM_AGG(BINARY_CHECKSUM(
                 source_kind, source_line_id, producer_id, product_id, source_date,
                 source_qty, unit_price, source_currency_id, source_updated
-             )) FROM FactualSupply) AS supply_checksum,
-            (SELECT MAX(source_updated) FROM FactualSupply) AS latest_supply_line_update,
-            ISNULL((SELECT SUM(demand_qty) FROM CandidateDemand), 0) AS demand_qty,
+             )) FROM #FactualSupply) AS supply_checksum,
+            (SELECT MAX(source_updated) FROM #FactualSupply) AS latest_supply_line_update,
+            ISNULL((SELECT SUM(demand_qty) FROM #CandidateDemand), 0) AS demand_qty,
             (SELECT CHECKSUM_AGG(BINARY_CHECKSUM(
                 product_id, demand_qty, demand_checksum, latest_order_item_update
-             )) FROM CandidateDemand) AS demand_checksum,
-            (SELECT MAX(latest_order_item_update) FROM CandidateDemand)
+             )) FROM #CandidateDemand) AS demand_checksum,
+            (SELECT MAX(latest_order_item_update) FROM #CandidateDemand)
                 AS latest_order_item_update,
             (SELECT CHECKSUM_AGG(BINARY_CHECKSUM(
                 product_id, availability_rows, available_qty,
                 availability_checksum, latest_availability_update
-             )) FROM CandidateInventory) AS availability_checksum,
-            ISNULL((SELECT reservation_rows FROM CandidateReservations), 0)
+             )) FROM #CandidateInventory) AS availability_checksum,
+            ISNULL((SELECT reservation_rows FROM #CandidateReservations), 0)
                 AS reservation_row_count,
-            ISNULL((SELECT reserved_qty FROM CandidateReservations), 0) AS reserved_qty,
-            ISNULL((SELECT max_reservation_id FROM CandidateReservations), 0)
+            ISNULL((SELECT reserved_qty FROM #CandidateReservations), 0) AS reserved_qty,
+            ISNULL((SELECT max_reservation_id FROM #CandidateReservations), 0)
                 AS max_reservation_id,
-            (SELECT latest_reservation_update FROM CandidateReservations)
+            (SELECT latest_reservation_update FROM #CandidateReservations)
                 AS latest_reservation_update,
-            ISNULL((SELECT reservation_checksum FROM CandidateReservations), 0)
+            ISNULL((SELECT reservation_checksum FROM #CandidateReservations), 0)
                 AS reservation_checksum,
-            (SELECT COUNT_BIG(*) FROM CandidateFlowFacts) AS flow_fact_count,
-            ISNULL((SELECT SUM(CAST(qty AS decimal(38, 6))) FROM CandidateFlowFacts), 0)
+            (SELECT COUNT_BIG(*) FROM #CandidateFlowFacts) AS flow_fact_count,
+            ISNULL((SELECT SUM(CAST(qty AS decimal(38, 6))) FROM #CandidateFlowFacts), 0)
                 AS flow_qty,
-            (SELECT MAX(fact_id) FROM CandidateFlowFacts) AS max_flow_fact_id,
-            (SELECT MAX(fact_updated) FROM CandidateFlowFacts) AS latest_flow_update,
+            (SELECT MAX(fact_id) FROM #CandidateFlowFacts) AS max_flow_fact_id,
+            (SELECT MAX(fact_updated) FROM #CandidateFlowFacts) AS latest_flow_update,
             (SELECT CHECKSUM_AGG(BINARY_CHECKSUM(
                 fact_kind, fact_id, product_id, qty, fact_updated
-             )) FROM CandidateFlowFacts) AS flow_checksum,
+             )) FROM #CandidateFlowFacts) AS flow_checksum,
             (SELECT CHECKSUM_AGG(BINARY_CHECKSUM(
                 ID, CurrencyID, Code, Amount, Updated, Deleted
              )) FROM dbo.ExchangeRate) AS exchange_rate_checksum,
@@ -822,27 +843,35 @@ def procurement_source_readiness(as_of: str, history_days: int) -> dict:
             (SELECT CHECKSUM_AGG(BINARY_CHECKSUM(
                 ID, CurrencyFromID, CurrencyToID, Amount, Updated, Deleted
              )) FROM dbo.CrossExchangeRate) AS cross_exchange_rate_checksum,
-            (SELECT MAX(source_date) FROM FactualSupply) AS latest_supply_date,
-            (SELECT MAX(latest_sale_date) FROM CandidateDemand) AS latest_sale_date,
-            (SELECT MAX(international_document_id) FROM FactualSupply)
+            (SELECT MAX(source_date) FROM #FactualSupply) AS latest_supply_date,
+            (SELECT MAX(latest_sale_date) FROM #CandidateDemand) AS latest_sale_date,
+            (SELECT MAX(international_document_id) FROM #FactualSupply)
                 AS max_international_document_id,
-            (SELECT MAX(ukraine_document_id) FROM FactualSupply) AS max_ukraine_document_id,
-            (SELECT MAX(max_order_item_id) FROM CandidateDemand) AS max_order_item_id,
-            (SELECT MAX(ID) FROM SellableStorage) AS max_sellable_storage_id,
-            (SELECT MAX(max_availability_id) FROM CandidateInventory)
+            (SELECT MAX(ukraine_document_id) FROM #FactualSupply) AS max_ukraine_document_id,
+            (SELECT MAX(max_order_item_id) FROM #CandidateDemand) AS max_order_item_id,
+            (SELECT MAX(ID) FROM #SellableStorage) AS max_sellable_storage_id,
+            (SELECT MAX(max_availability_id) FROM #CandidateInventory)
                 AS max_candidate_availability_id,
-            (SELECT MAX(latest_availability_update) FROM CandidateInventory)
+            (SELECT MAX(latest_availability_update) FROM #CandidateInventory)
                 AS latest_candidate_availability_update,
-            (SELECT max_availability_id FROM GlobalInventory) AS max_global_availability_id,
-            (SELECT latest_availability_update FROM GlobalInventory)
-                AS latest_global_availability_update
+            (SELECT max_availability_id FROM #GlobalInventory) AS max_global_availability_id,
+            (SELECT latest_availability_update FROM #GlobalInventory)
+                AS latest_global_availability_update;
+        """
+    rows = query(
+        """
+        EXEC sys.sp_executesql :statement,
+            N'@asof date, @days int, @history_start date, @syn bigint',
+            @asof=:asof, @days=:days, @history_start=:history_start, @syn=:syn
         """,
         {
+            "statement": statement,
             "asof": as_of,
             "days": history_days,
             "history_start": history_start_iso(),
             "syn": synthetic_product_id(),
         },
+        isolation_level="SNAPSHOT",
     )
     row = rows[0] if rows else {}
     integer_fields = (

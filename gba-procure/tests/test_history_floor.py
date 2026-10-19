@@ -169,7 +169,8 @@ def test_current_inventory_and_reservations_are_explicit_history_na():
 def test_readiness_metadata_and_fingerprint_include_effective_window(monkeypatch):
     captured = []
 
-    def fake_query(statement, params):
+    def fake_query(statement, params, *, isolation_level=None):
+        assert isolation_level == "SNAPSHOT"
         captured.append((statement, params))
         return [{}]
 
