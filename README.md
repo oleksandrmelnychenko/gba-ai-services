@@ -42,3 +42,8 @@ repeat the date so the fleet release gate can detect partial or stale deployment
 ## Integration
 Orchestrated by gba-server (.NET), which proxies these services, injects the authenticated user from
 the session, and surfaces them in the GBA Console (React).
+
+The six standalone repositories under `/root/projects` are running deployment snapshots with
+independent Git histories. [The deployment source map](docs/deployment-source-map.json) records
+their source commits, corresponding published subtrees, and verified content differences.
+Keep their working directories intact; publishing here does not restart or update those services.

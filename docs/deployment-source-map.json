@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "review_date": "2026-10-21",
+  "source_repository": "oleksandrmelnychenko/gba-ai-services",
+  "publication_base_commit": "2a373442e94bf14295a3a7cc251292a361efef84",
+  "repository_layout": "ordinary tracked service directories, not submodules",
+  "policy": "Monorepo service subtrees are the publication source. Standalone repositories are live deployment snapshots with independent history; do not point their origin/main at monorepo main or move WorkingDirectory. Deployment updates are separate controlled operations.",
+  "services": [
+    {
+      "service": "gba-forecast",
+      "deployment_working_directory": "/root/projects/gba-forecast",
+      "standalone_source_commit": "914139fe9f0eff1f0fe973e9a9aa151eeeffabe0",
+      "standalone_source_tree": "b180a498f3641481b1066d9f896aea1f1c28664a",
+      "standalone_worktree_clean_at_review": true,
+      "published_subdirectory": "gba-forecast",
+      "integrated_subtree_tree": "b180a498f3641481b1066d9f896aea1f1c28664a",
+      "byte_identical_tracked_files": 34,
+      "standalone_tracked_files": 34,
+      "files_different_from_deployment_snapshot": [],
+      "files_only_in_publication_tree": [],
+      "status": "running-deployment-snapshot; preserve original path and git history"
+    },
+    {
+      "service": "gba-pricing",
+      "deployment_working_directory": "/root/projects/gba-pricing",
+      "standalone_source_commit": "bb62f279e97bcc79e75fac94287a33118421281b",
+      "standalone_source_tree": "079404eec046097ae3f78762b3276be683921e7e",
+      "standalone_worktree_clean_at_review": true,
+      "published_subdirectory": "gba-pricing",
+      "integrated_subtree_tree": "5e135b61836d8de0b3f8f181307fc8d4fe33b173",
+      "byte_identical_tracked_files": 45,
+      "standalone_tracked_files": 45,
+      "files_different_from_deployment_snapshot": [],
+      "files_only_in_publication_tree": [
+        "docs/competitor-price-search.md"
+      ],
+      "status": "running-deployment-snapshot; preserve original path and git history"
+    },
+    {
+      "service": "gba-procure",
+      "deployment_working_directory": "/root/projects/gba-procure",
+      "standalone_source_commit": "3900a7ceb2d0a4ab8195c1940ce09e19a41050a0",
+      "standalone_source_tree": "09737ba3b81f5f56f90b4ff1e46755a792d9aab8",
+      "standalone_worktree_clean_at_review": true,
+      "published_subdirectory": "gba-procure",
+      "integrated_subtree_tree": "09737ba3b81f5f56f90b4ff1e46755a792d9aab8",
+      "byte_identical_tracked_files": 75,
+      "standalone_tracked_files": 75,
+      "files_different_from_deployment_snapshot": [],
+      "files_only_in_publication_tree": [],
+      "status": "running-deployment-snapshot; preserve original path and git history"
+    },
+    {
+      "service": "gba-products",
+      "deployment_working_directory": "/root/projects/gba-products",
+      "standalone_source_commit": "6adc571e7b24ca1edc9d10ccb731adbd9b0d4eb3",
+      "standalone_source_tree": "cc49ee8b83a794370b465c10cc0b04c83f835efa",
+      "standalone_worktree_clean_at_review": true,
+      "published_subdirectory": "gba-products",
+      "integrated_subtree_tree": "95ef7417f7bee22d1608ddfc8bcf7bef1036f05a",
+      "byte_identical_tracked_files": 54,
+      "standalone_tracked_files": 55,
+      "files_different_from_deployment_snapshot": [
+        "app/api/main.py"
+      ],
+      "files_only_in_publication_tree": [
+        "tests/test_dashboard_metadata.py"
+      ],
+      "status": "running-deployment-snapshot; preserve original path and git history"
+    },
+    {
+      "service": "gba-reco",
+      "deployment_working_directory": "/root/projects/gba-reco",
+      "standalone_source_commit": "6395bb8d5706609ba68b6a7bec4c84d94da8fcb8",
+      "standalone_source_tree": "38060d7691019d871e2c876d697b3d572eb0a3b7",
+      "standalone_worktree_clean_at_review": true,
+      "published_subdirectory": "gba-reco",
+      "integrated_subtree_tree": "0be2ef2f745229bfcb024e19a06828daaa324be2",
+      "byte_identical_tracked_files": 52,
+      "standalone_tracked_files": 53,
+      "files_different_from_deployment_snapshot": [
+        "README.md"
+      ],
+      "files_only_in_publication_tree": [
+        "docs/agreements.md"
+      ],
+      "status": "running-deployment-snapshot; preserve original path and git history"
+    },
+    {
+      "service": "gba-solvency",
+      "deployment_working_directory": "/root/projects/gba-solvency",
+      "standalone_source_commit": "e84a24ff932af6f02df734857638dfaf31afb469",
+      "standalone_source_tree": "cc63509b07ce1bb4f8ff24a1199a3be053afbef3",
+      "standalone_worktree_clean_at_review": true,
+      "published_subdirectory": "gba-solvency",
+      "integrated_subtree_tree": "3fe4d698f2026bd0ab7f3f83cc563e8eb3f74d8a",
+      "byte_identical_tracked_files": 69,
+      "standalone_tracked_files": 70,
+      "files_different_from_deployment_snapshot": [
+        "tests/test_artifact_history_contract.py"
+      ],
+      "files_only_in_publication_tree": [],
+      "status": "running-deployment-snapshot; preserve original path and git history"
+    }
+  ]
+}
