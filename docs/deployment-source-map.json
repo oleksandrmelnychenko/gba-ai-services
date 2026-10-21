@@ -18,23 +18,21 @@
       "standalone_tracked_files": 34,
       "files_different_from_deployment_snapshot": [],
       "files_only_in_publication_tree": [],
-      "status": "running-deployment-snapshot; preserve original path and git history"
+      "status": "running deployment snapshot; tracked tree exactly matches published subtree"
     },
     {
       "service": "gba-pricing",
       "deployment_working_directory": "/root/projects/gba-pricing",
-      "standalone_source_commit": "bb62f279e97bcc79e75fac94287a33118421281b",
-      "standalone_source_tree": "079404eec046097ae3f78762b3276be683921e7e",
+      "standalone_source_commit": "78e77f0773a55d2d934a43ba4c3818ca984a01e1",
+      "standalone_source_tree": "5e135b61836d8de0b3f8f181307fc8d4fe33b173",
       "standalone_worktree_clean_at_review": true,
       "published_subdirectory": "gba-pricing",
       "integrated_subtree_tree": "5e135b61836d8de0b3f8f181307fc8d4fe33b173",
-      "byte_identical_tracked_files": 45,
-      "standalone_tracked_files": 45,
+      "byte_identical_tracked_files": 46,
+      "standalone_tracked_files": 46,
       "files_different_from_deployment_snapshot": [],
-      "files_only_in_publication_tree": [
-        "docs/competitor-price-search.md"
-      ],
-      "status": "running-deployment-snapshot; preserve original path and git history"
+      "files_only_in_publication_tree": [],
+      "status": "running deployment snapshot; tracked tree exactly matches published subtree"
     },
     {
       "service": "gba-procure",
@@ -48,59 +46,69 @@
       "standalone_tracked_files": 75,
       "files_different_from_deployment_snapshot": [],
       "files_only_in_publication_tree": [],
-      "status": "running-deployment-snapshot; preserve original path and git history"
+      "status": "running deployment snapshot; tracked tree exactly matches published subtree"
     },
     {
       "service": "gba-products",
       "deployment_working_directory": "/root/projects/gba-products",
-      "standalone_source_commit": "6adc571e7b24ca1edc9d10ccb731adbd9b0d4eb3",
-      "standalone_source_tree": "cc49ee8b83a794370b465c10cc0b04c83f835efa",
+      "standalone_source_commit": "a28a7df7ed2a8c13152341077bc19058b6de512c",
+      "standalone_source_tree": "95ef7417f7bee22d1608ddfc8bcf7bef1036f05a",
       "standalone_worktree_clean_at_review": true,
       "published_subdirectory": "gba-products",
       "integrated_subtree_tree": "95ef7417f7bee22d1608ddfc8bcf7bef1036f05a",
-      "byte_identical_tracked_files": 54,
-      "standalone_tracked_files": 55,
-      "files_different_from_deployment_snapshot": [
-        "app/api/main.py"
-      ],
-      "files_only_in_publication_tree": [
-        "tests/test_dashboard_metadata.py"
-      ],
-      "status": "running-deployment-snapshot; preserve original path and git history"
+      "byte_identical_tracked_files": 56,
+      "standalone_tracked_files": 56,
+      "files_different_from_deployment_snapshot": [],
+      "files_only_in_publication_tree": [],
+      "status": "running deployment snapshot; tracked tree exactly matches published subtree"
     },
     {
       "service": "gba-reco",
       "deployment_working_directory": "/root/projects/gba-reco",
-      "standalone_source_commit": "6395bb8d5706609ba68b6a7bec4c84d94da8fcb8",
-      "standalone_source_tree": "38060d7691019d871e2c876d697b3d572eb0a3b7",
+      "standalone_source_commit": "217838fd3bdf0232f854e6f432f846780f14a1be",
+      "standalone_source_tree": "0be2ef2f745229bfcb024e19a06828daaa324be2",
       "standalone_worktree_clean_at_review": true,
       "published_subdirectory": "gba-reco",
       "integrated_subtree_tree": "0be2ef2f745229bfcb024e19a06828daaa324be2",
-      "byte_identical_tracked_files": 52,
-      "standalone_tracked_files": 53,
-      "files_different_from_deployment_snapshot": [
-        "README.md"
-      ],
-      "files_only_in_publication_tree": [
-        "docs/agreements.md"
-      ],
-      "status": "running-deployment-snapshot; preserve original path and git history"
+      "byte_identical_tracked_files": 54,
+      "standalone_tracked_files": 54,
+      "files_different_from_deployment_snapshot": [],
+      "files_only_in_publication_tree": [],
+      "status": "running deployment snapshot; tracked tree exactly matches published subtree"
     },
     {
       "service": "gba-solvency",
       "deployment_working_directory": "/root/projects/gba-solvency",
-      "standalone_source_commit": "e84a24ff932af6f02df734857638dfaf31afb469",
-      "standalone_source_tree": "cc63509b07ce1bb4f8ff24a1199a3be053afbef3",
+      "standalone_source_commit": "602df6b070997ab742913852efc2fdc9c46df1a9",
+      "standalone_source_tree": "3fe4d698f2026bd0ab7f3f83cc563e8eb3f74d8a",
       "standalone_worktree_clean_at_review": true,
       "published_subdirectory": "gba-solvency",
       "integrated_subtree_tree": "3fe4d698f2026bd0ab7f3f83cc563e8eb3f74d8a",
-      "byte_identical_tracked_files": 69,
+      "byte_identical_tracked_files": 70,
       "standalone_tracked_files": 70,
-      "files_different_from_deployment_snapshot": [
-        "tests/test_artifact_history_contract.py"
-      ],
+      "files_different_from_deployment_snapshot": [],
       "files_only_in_publication_tree": [],
-      "status": "running-deployment-snapshot; preserve original path and git history"
+      "status": "running deployment snapshot; tracked tree exactly matches published subtree"
     }
-  ]
+  ],
+  "content_source_commit": "2d2368e3a648775a3063778630069389af0118a7",
+  "alignment": {
+    "all_six_tracked_trees_match_published_subtrees": true,
+    "all_six_primary_services_active_running": true,
+    "ignored_runtime_configuration_preserved": true,
+    "restarted_services": [
+      "gba-products.service"
+    ],
+    "products_environment": "DEV: runtime DB_HOST=127.0.0.1, DB_PORT=1433, DB_NAME=ConcordDb_V5 matches DEV SQL deployment mapping",
+    "products_targeted_offline_tests_passed": 2,
+    "products_post_restart_health": {
+      "http_status": 200,
+      "status": "healthy",
+      "db_connected": true,
+      "cache_connected": true,
+      "business_ready": true
+    },
+    "other_service_processes_restarted": false,
+    "standalone_git_mapping": "gba.sourceRepository + gba.sourceSubdirectory + gba.sourceCommit, not origin/main tracking"
+  }
 }
