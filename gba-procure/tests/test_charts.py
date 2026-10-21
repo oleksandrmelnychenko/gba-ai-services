@@ -60,7 +60,7 @@ def test_build_charts_producer_uses_full_distribution(monkeypatch):
     items[0].image_url = "https://cdn.example.test/sem18487.jpg"
     items[0].producer_name = "SEM"
     monkeypatch.setattr(policy, "build_plan",
-                        lambda pid, as_of, only_needed=True: _plan(items))
+                        lambda pid, as_of, only_needed=True, **kwargs: _plan(items))
     # demand_series bulk fetch mocked: product 1 has 2 months of history
     monkeypatch.setattr(policy.repo, "product_daily_demand_bulk",
                         lambda ids, as_of, days: {
@@ -128,7 +128,7 @@ def test_build_charts_cart_wide_dedups_top_items(monkeypatch):
 def test_build_charts_demand_series_capped_to_few(monkeypatch):
     items = [_sug(i, float(20 - i), Urgency.HIGH, 1.0) for i in range(1, 11)]
     monkeypatch.setattr(policy, "build_plan",
-                        lambda pid, as_of, only_needed=True: _plan(items))
+                        lambda pid, as_of, only_needed=True, **kwargs: _plan(items))
     captured = {}
 
     def _bulk(ids, as_of, days):

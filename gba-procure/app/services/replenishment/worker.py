@@ -4,26 +4,96 @@ Single worker, single key scheme (procure:v1:producer:{id}:{as_of}). Idempotent/
 Warm candidates = supply-active producers ∪ active Manufacturer-role clients (the console's
 /plan/producer picker list), so every openable producer plan is pre-warmed.
 """
+
 from __future__ import annotations
 
 import argparse
 import time
 from datetime import datetime
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 from zoneinfo import ZoneInfo
 
 from app.core.config import get_settings
 from app.core.history import rolling_coverage
 from app.core.logging import get_logger
+from app.core.readiness import ProcurementBusinessReadinessError
 from app.data import cache, masters
+from app.data.native_purchase_costs import NativePurchaseCostError
+from app.data.purchase_cost_cohort import PurchaseCostCohort, read_purchase_cost_cohort
+from app.data.purchase_cost_metadata import stable_manifest, validate_item_metadata, validated_manifest
 from app.domain.models import MODEL_VERSION, CartReplenishmentPlan, PlanCharts
 from app.services.replenishment import policy
 
 log = get_logger("procure_worker")
 
 
-class ProcurementBusinessReadinessError(RuntimeError):
-    """Canonical procurement data cannot currently produce a usable plan."""
+def plan_cost_metadata_is_ready(payload: dict | None) -> bool:
+    """Validate captured metadata and scalar eligibility; this is not a fresh proof read."""
+    if not isinstance(payload, dict) or payload.get("history_scope") != "demand":
+        return False
+    if payload.get("history_not_applicable") != ["inventory", "reservations", "purchase_costs"]:
+        return False
+    if not all(
+        key in payload for key in ("cost_observation_manifest", "cost_total_basis", "cost_totals_certified")
+    ):
+        return False
+    try:
+        if (
+            type(payload["cost_totals_certified"]) is not bool
+            or payload.get("model_version") != MODEL_VERSION
+            or payload["cost_total_basis"]
+            not in (
+                "net_goods_excluding_vat_delivery_customs",
+                "includes_buyer_values_with_unverified_tax_basis",
+            )
+        ):
+            return False
+        coverage = rolling_coverage(payload["as_of_date"], get_settings().history_days)
+        if any(payload.get(key) != value for key, value in coverage.as_metadata().items()):
+            return False
+        manifest = validated_manifest(payload["cost_observation_manifest"], payload["as_of_date"])
+        if payload.get("value_captured_eur") is not None:
+            return False
+        items = payload.get("items")
+        if items is None:  # Charts describe their underlying input, not their topN slice.
+            return type(payload["cost_totals_certified"]) is bool
+        for item in items:
+            validate_item_metadata(item, manifest)
+        certified = all(item["cost_provenance"]["budget_eligible"] for item in items)
+        if payload["cost_totals_certified"] and not certified:
+            return False
+        if payload.get("is_truncated") is not True and payload["cost_totals_certified"] != certified:
+            return False
+        has_buyer = any(item["cost_provenance"]["source"] == "buyer_supplied" for item in items)
+        expected_basis = (
+            "includes_buyer_values_with_unverified_tax_basis"
+            if has_buyer
+            else "net_goods_excluding_vat_delivery_customs"
+        )
+        if has_buyer and payload["cost_total_basis"] != expected_basis:
+            return False
+        if payload.get("is_truncated") is not True and payload["cost_total_basis"] != expected_basis:
+            return False
+        if payload.get("budget_eur") is not None:
+            if payload.get("budget_objective") != "urgency_weighted_lines":
+                return False
+            selected = [item for item in items if item.get("within_budget") is True]
+            used = sum((Fraction(Decimal(str(item["line_cost_eur"]))) for item in selected), Fraction())
+            score = sum(
+                (Fraction(Decimal(str(item["budget_priority_weight"]))) for item in selected), Fraction()
+            )
+            if (
+                used > Fraction(Decimal(str(payload["budget_eur"])))
+                or used != Fraction(Decimal(str(payload["budget_used_eur"])))
+                or score != Fraction(Decimal(str(payload["budget_score"])))
+                or payload.get("selected_count") != len(selected)
+                or payload.get("deferred_count") != len(items) - len(selected)
+            ):
+                return False
+        return True
+    except (KeyError, TypeError, ValueError, InvalidOperation, NativePurchaseCostError):
+        return False
 
 
 def active_producers(as_of: str, active_days: int = 365) -> list[int]:
@@ -74,7 +144,7 @@ def canonical_cart_payload_is_ready(
     product, preserves nested IDs and reconciles quantity/cost aggregates to the cent.
     An evaluated zero-item plan remains a valid business result.
     """
-    if not isinstance(payload, dict):
+    if not isinstance(payload, dict) or not plan_cost_metadata_is_ready(payload):
         return False
     item_count = payload.get("item_count")
     items = payload.get("items")
@@ -97,7 +167,7 @@ def canonical_cart_payload_is_ready(
     expected_history = coverage.as_metadata()
     if any(payload.get(key) != value for key, value in expected_history.items()):
         return False
-    if payload.get("history_not_applicable") != ["inventory", "reservations"]:
+    if payload.get("history_not_applicable") != ["inventory", "reservations", "purchase_costs"]:
         return False
     if payload.get("model_version") != MODEL_VERSION:
         return False
@@ -111,8 +181,8 @@ def canonical_cart_payload_is_ready(
         return False
 
     seen_products: set[int] = set()
-    total_qty = Decimal()
-    priced_cost = Decimal()
+    total_qty = Fraction()
+    priced_cost = Fraction()
     unpriced = 0
     try:
         for item in items:
@@ -144,7 +214,7 @@ def canonical_cart_payload_is_ready(
             qty = Decimal(str(item.get("suggested_qty")))
             if not qty.is_finite() or qty <= 0:
                 return False
-            total_qty += qty
+            total_qty += Fraction(qty)
 
             unit_cost = item.get("unit_cost_eur")
             line_cost = item.get("line_cost_eur")
@@ -153,22 +223,27 @@ def canonical_cart_payload_is_ready(
                 continue
             unit = Decimal(str(unit_cost))
             line = Decimal(str(line_cost))
-            if not unit.is_finite() or unit <= 0 or not line.is_finite() or line < 0:
+            if not unit.is_finite() or unit < 0 or not line.is_finite() or line < 0:
                 return False
-            expected_line = (unit * qty).quantize(_CENT, rounding=ROUND_HALF_UP)
-            if line != expected_line:
+            scaled = Fraction(unit) * Fraction(qty) * 100
+            whole, remainder = divmod(scaled.numerator, scaled.denominator)
+            expected_line = Fraction(whole + (2 * remainder >= scaled.denominator), 100)
+            if Fraction(line) != expected_line:
                 return False
-            priced_cost += line
+            priced_cost += Fraction(line)
 
         expected_qty = total_qty
         expected_priced = priced_cost
-        if Decimal(str(payload.get("total_suggested_qty"))) != expected_qty:
+        if Fraction(Decimal(str(payload.get("total_suggested_qty")))) != expected_qty:
             return False
-        if Decimal(str(payload.get("priced_cost_eur"))) != expected_priced:
+        if Fraction(Decimal(str(payload.get("priced_cost_eur")))) != expected_priced:
             return False
-        if payload.get("unpriced_item_count") != unpriced or unpriced:
+        if payload.get("unpriced_item_count") != unpriced:
             return False
-        if Decimal(str(payload.get("total_cost_eur"))) != expected_priced:
+        if unpriced:
+            if payload.get("total_cost_eur") is not None:
+                return False
+        elif Fraction(Decimal(str(payload.get("total_cost_eur")))) != expected_priced:
             return False
     except (InvalidOperation, TypeError, ValueError):
         return False
@@ -183,12 +258,9 @@ def canonical_charts_payload_is_ready(
     top_n: int = CHARTS_TOP_N,
 ) -> bool:
     """Validate canonical charts, their history contract and source epoch."""
-    if not isinstance(payload, dict):
+    if not isinstance(payload, dict) or not plan_cost_metadata_is_ready(payload):
         return False
-    if (
-        source_fingerprint is not None
-        and payload.get("_source_fingerprint") != source_fingerprint
-    ):
+    if source_fingerprint is not None and payload.get("_source_fingerprint") != source_fingerprint:
         return False
     try:
         as_of = payload.get("as_of_date")
@@ -197,7 +269,7 @@ def canonical_charts_payload_is_ready(
         coverage = rolling_coverage(as_of, get_settings().history_days)
         if any(payload.get(key) != value for key, value in coverage.as_metadata().items()):
             return False
-        if payload.get("history_not_applicable") != ["inventory", "reservations"]:
+        if payload.get("history_not_applicable") != ["inventory", "reservations", "purchase_costs"]:
             return False
         if payload.get("model_version") != MODEL_VERSION or payload.get("top_n") != top_n:
             return False
@@ -225,9 +297,17 @@ def get_source_readiness(as_of: str, *, force: bool = False) -> dict:
     mongo_required = settings.use_masters or settings.use_feedback
     masters_connected = not mongo_required or masters.ping()
     snapshot["masters_connected"] = masters_connected
+    snapshot["masters_readable"] = not settings.use_masters
     if snapshot.get("ready") is True and not masters_connected:
         snapshot["ready"] = False
         snapshot["reason"] = "masters_store_unavailable"
+    if settings.use_masters and masters_connected:
+        try:
+            masters.require_read_access()
+            snapshot["masters_readable"] = True
+        except masters.MastersReadError as exc:
+            snapshot["ready"] = False
+            snapshot["reason"] = str(exc)
     cache.set(key, snapshot, ttl=SOURCE_READINESS_TTL_S)
     return snapshot
 
@@ -245,8 +325,7 @@ def require_source_readiness(as_of: str, *, force: bool = False) -> dict:
         item_count=0,
     )
     raise ProcurementBusinessReadinessError(
-        f"{reason}:producers={snapshot.get('producer_count', 0)}:"
-        f"products={snapshot.get('product_count', 0)}"
+        f"{reason}:producers={snapshot.get('producer_count', 0)}:products={snapshot.get('product_count', 0)}"
     )
 
 
@@ -331,7 +410,13 @@ def cache_canonical_cart_plan(
     return candidate_count
 
 
-def warm_cart(as_of: str | None = None, cart_limit: int | None = CART_LIMIT) -> dict:
+def warm_cart(
+    as_of: str | None = None,
+    cart_limit: int | None = CART_LIMIT,
+    *,
+    cost_cohort: PurchaseCostCohort | None = None,
+    products_by_producer: dict[int, list[int]] | None = None,
+) -> dict:
     """Pre-compute the cart plan into the EXACT key /plan/cart reads on a cache miss.
 
     /plan/cart's canonical request has no truncation and keys as ``cart:all`` for today,
@@ -341,12 +426,24 @@ def warm_cart(as_of: str | None = None, cart_limit: int | None = CART_LIMIT) -> 
     started = time.time()
     log.info("procure_cart_warm_start", as_of=as_of, limit=cart_limit)
     source_snapshot = require_source_readiness(as_of, force=True)
-    plan = policy.build_cart_plan(
-        as_of,
-        only_needed=True,
-        limit=cart_limit,
-        source_fingerprint=source_snapshot.get("source_fingerprint"),
-    )
+    try:
+        plan = policy.build_cart_plan(
+            as_of,
+            only_needed=True,
+            limit=cart_limit,
+            source_fingerprint=source_snapshot.get("source_fingerprint"),
+            cost_cohort=cost_cohort,
+            products_by_producer=products_by_producer,
+        )
+    except masters.MastersReadError as exc:
+        _mark_canonical_cart_not_ready(
+            as_of,
+            reason=str(exc),
+            candidate_count=int(source_snapshot.get("producer_count") or 0),
+            item_count=0,
+            cart_limit=cart_limit,
+        )
+        raise
     key = cart_cache_key(as_of, cart_limit)
     candidate_count = cache_canonical_cart_plan(
         plan,
@@ -377,22 +474,19 @@ def warm_charts(as_of: str | None = None, top_n: int = CHARTS_TOP_N) -> dict:
     log.info("procure_charts_warm_start", as_of=as_of, top_n=top_n)
     source_snapshot = require_source_readiness(as_of, force=True)
     cart_key = cart_cache_key(as_of)
-    if (
-        cache.get_cart_not_ready(as_of) is not None
-        or not canonical_cart_payload_is_ready(
-            cache.get(cart_key),
-            source_fingerprint=source_snapshot.get("source_fingerprint"),
-        )
+    cart_payload = cache.get(cart_key)
+    if cache.get_cart_not_ready(as_of) is not None or not canonical_cart_payload_is_ready(
+        cart_payload,
+        source_fingerprint=source_snapshot.get("source_fingerprint"),
     ):
         cache.delete(cache.make_key("charts", f"all:{top_n}", as_of))
-        raise ProcurementBusinessReadinessError(
-            f"canonical_cart_not_ready:as_of={as_of}"
-        )
+        raise ProcurementBusinessReadinessError(f"canonical_cart_not_ready:as_of={as_of}")
     charts = policy.build_charts(
         None,
         as_of,
         top_n=top_n,
         source_fingerprint=source_snapshot.get("source_fingerprint"),
+        plan_input=policy.CartReplenishmentPlan.model_validate(cart_payload),
     )
     key = cache.make_key("charts", f"all:{top_n}", as_of)
     payload = charts.model_dump(mode="json")
@@ -407,22 +501,40 @@ def warm_charts(as_of: str | None = None, top_n: int = CHARTS_TOP_N) -> dict:
     ):
         cache.delete(key)
         raise ProcurementBusinessReadinessError("canonical_charts_cache_readback_failed")
-    stats = {"key": key, "top_items": len(charts.top_items),
-             "duration_s": round(time.time() - started, 1), "as_of": as_of}
+    stats = {
+        "key": key,
+        "top_items": len(charts.top_items),
+        "duration_s": round(time.time() - started, 1),
+        "as_of": as_of,
+    }
     log.info("procure_charts_warm_done", **stats)
     return stats
 
 
-def run(as_of: str | None = None, limit: int | None = None, warm_cart_key: bool = True,
-        skip_existing: bool = False) -> dict:
+def run(
+    as_of: str | None = None,
+    limit: int | None = None,
+    warm_cart_key: bool = True,
+    skip_existing: bool = False,
+) -> dict:
     as_of = as_of or _today()
     started = time.time()
     source_snapshot = require_source_readiness(as_of, force=True)
     producers = warm_producer_candidates(as_of)
     if limit:
         producers = producers[:limit]
-    log.info("procure_worker_start", producers=len(producers), as_of=as_of,
-             skip_existing=skip_existing)
+    log.info("procure_worker_start", producers=len(producers), as_of=as_of, skip_existing=skip_existing)
+
+    cohort_producers = set(producers)
+    if warm_cart_key:
+        cohort_producers.update(policy.repo.all_producers(as_of, get_settings().history_days))
+    products_by_producer = {
+        pid: policy.repo.products_for_producer(pid, as_of, get_settings().history_days)
+        for pid in sorted(cohort_producers)
+    }
+    products = sorted({product for ids in products_by_producer.values() for product in ids})
+    # A worker rebuild always revalidates exact receipt payloads. Existing plan caches are not proof.
+    cost_cohort = read_purchase_cost_cohort(products, as_of)
 
     ok = failed = skipped = nonempty_producers = total_items = 0
     for i, pid in enumerate(producers, 1):
@@ -431,8 +543,10 @@ def run(as_of: str | None = None, limit: int | None = None, warm_cart_key: bool 
             cached = cache.get(key)
             if (
                 cached is not None
-                and cached.get("_source_fingerprint")
-                == source_snapshot.get("source_fingerprint")
+                and cached.get("_source_fingerprint") == source_snapshot.get("source_fingerprint")
+                and plan_cost_metadata_is_ready(cached)
+                and stable_manifest(cached["cost_observation_manifest"])
+                == stable_manifest(cost_cohort.manifest(products_by_producer[pid]).model_dump(mode="json"))
             ):
                 skipped += 1
                 cached_item_count = cached.get("item_count")
@@ -441,7 +555,9 @@ def run(as_of: str | None = None, limit: int | None = None, warm_cart_key: bool 
                     total_items += cached_item_count
                 continue
         try:
-            plan = policy.build_plan(pid, as_of, only_needed=True)
+            plan = policy.build_plan(
+                pid, as_of, only_needed=True, cost_cohort=cost_cohort, product_ids=products_by_producer[pid]
+            )
             payload = plan.model_dump(mode="json")
             payload["_source_fingerprint"] = source_snapshot.get("source_fingerprint")
             if not cache.set(key, payload, ttl=691200):  # 8 days
@@ -451,17 +567,26 @@ def run(as_of: str | None = None, limit: int | None = None, warm_cart_key: bool 
                 nonempty_producers += 1
                 total_items += plan.item_count
             log.info("producer_planned", producer_id=pid, items=plan.item_count)
+        except masters.MastersReadError as exc:
+            _mark_canonical_cart_not_ready(
+                as_of,
+                reason=str(exc),
+                candidate_count=len(producers),
+                item_count=0,
+            )
+            raise
         except Exception as exc:  # noqa: BLE001
             failed += 1
             log.warning("producer_failed", producer_id=pid, error=str(exc))
         if i % 10 == 0:
-            log.info("procure_worker_progress", done=i, total=len(producers),
-                     ok=ok, failed=failed, skipped=skipped)
+            log.info(
+                "procure_worker_progress", done=i, total=len(producers), ok=ok, failed=failed, skipped=skipped
+            )
 
     cart = charts = None
     if warm_cart_key:
         try:
-            cart = warm_cart(as_of)
+            cart = warm_cart(as_of, cost_cohort=cost_cohort, products_by_producer=products_by_producer)
         except ProcurementBusinessReadinessError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -484,6 +609,8 @@ def run(as_of: str | None = None, limit: int | None = None, warm_cart_key: bool 
         "source_reason": source_snapshot.get("reason"),
         "duration_s": round(time.time() - started, 1),
         "as_of": as_of,
+        "cart": cart,
+        "charts": charts,
         "cart_items": cart.get("items") if cart else None,
         "charts_top_items": charts.get("top_items") if charts else None,
     }
@@ -497,15 +624,20 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--cart-only", action="store_true", help="only warm the cart key")
     ap.add_argument("--no-cart", action="store_true", help="skip cart warming")
-    ap.add_argument("--skip-existing", action="store_true",
-                    help="resume: skip producers whose key is already warm")
+    ap.add_argument(
+        "--skip-existing", action="store_true", help="resume: skip producers whose key is already warm"
+    )
     args = ap.parse_args()
     if args.cart_only:
         warm_cart(as_of=args.as_of)
         warm_charts(as_of=args.as_of)
     else:
-        run(as_of=args.as_of, limit=args.limit, warm_cart_key=not args.no_cart,
-            skip_existing=args.skip_existing)
+        run(
+            as_of=args.as_of,
+            limit=args.limit,
+            warm_cart_key=not args.no_cart,
+            skip_existing=args.skip_existing,
+        )
 
 
 if __name__ == "__main__":

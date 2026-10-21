@@ -1,5 +1,8 @@
 """Self-healing cache watchdog tests."""
+
 from __future__ import annotations
+
+from native_cost_fixture import attach_cost_metadata
 
 from app.domain.models import MODEL_VERSION
 from app.services import scheduler
@@ -80,8 +83,7 @@ def test_watchdog_repairs_missing_daily_generation(monkeypatch):
     monkeypatch.setattr(
         worker,
         "run",
-        lambda **kwargs: calls.append(("producers", kwargs))
-        or {"ok": 769, "failed": 0, "skipped": 0},
+        lambda **kwargs: calls.append(("producers", kwargs)) or {"ok": 769, "failed": 0, "skipped": 0},
     )
 
     result = scheduler._cache_watchdog_job(as_of="2026-06-15")
@@ -99,8 +101,8 @@ def test_watchdog_keeps_valid_generation_and_only_resumes_producers(monkeypatch)
         "2026-06-15",
     )
     payloads = {
-        cart_key: _canonical_zero_payload(),
-        charts_key: _charts_payload(),
+        cart_key: attach_cost_metadata(_canonical_zero_payload()),
+        charts_key: attach_cost_metadata(_charts_payload()),
     }
     monkeypatch.setattr(scheduler.cache, "health", lambda: True)
     monkeypatch.setattr(
@@ -112,16 +114,12 @@ def test_watchdog_keeps_valid_generation_and_only_resumes_producers(monkeypatch)
     monkeypatch.setattr(
         worker,
         "warm_cart",
-        lambda **kwargs: (_ for _ in ()).throw(
-            AssertionError("valid cart must not be rebuilt")
-        ),
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("valid cart must not be rebuilt")),
     )
     monkeypatch.setattr(
         worker,
         "warm_charts",
-        lambda **kwargs: (_ for _ in ()).throw(
-            AssertionError("valid charts must not be rebuilt")
-        ),
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("valid charts must not be rebuilt")),
     )
     monkeypatch.setattr(
         worker,

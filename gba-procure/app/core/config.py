@@ -4,12 +4,14 @@ from __future__ import annotations
 from datetime import date
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", extra="ignore", hide_input_in_errors=True
+    )
 
     db_host: str = "127.0.0.1"
     db_port: int = 1433
@@ -39,6 +41,20 @@ class Settings(BaseSettings):
     # Shared secret the trusted gba-server proxy must present (X-Internal-Api-Key).
     # Empty = open (dev only); set in every non-local deployment.
     internal_api_key: str = ""
+    # Separate outbound, read-only Analytics credential; never reuse internal_api_key.
+    # Empty means unavailable: the verified-cost client has no SQL/UDF fallback.
+    native_purchase_cost_base_url: str = ""
+    native_purchase_cost_api_key: SecretStr = Field(default=SecretStr(""), repr=False)
+    native_purchase_cost_timeout_seconds: float = Field(default=150.0, gt=120.0, le=600.0)
+
+    @field_validator("native_purchase_cost_api_key")
+    @classmethod
+    def validate_native_purchase_cost_key(cls, value: SecretStr) -> SecretStr:
+        secret = value.get_secret_value()
+        if secret and (not 32 <= len(secret) <= 128 or not all(33 <= ord(char) <= 126 for char in secret)):
+            raise ValueError("native purchase cost key requires 32..128 printable non-space ASCII characters")
+        return value
+
     # Browser origins allowed by CORS (defense-in-depth; server-to-server calls have no Origin).
     cors_allow_origins: list[str] = Field(
         default_factory=lambda: [

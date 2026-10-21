@@ -1,11 +1,14 @@
 """API validation, source-readiness and cache-epoch tests without live services."""
+
 from __future__ import annotations
 
 from datetime import date
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from native_cost_fixture import attach_cost_metadata
 from pydantic import ValidationError
 
 from app.api.main import CartPlanRequest, ProducerProfileUpdate, app
@@ -28,25 +31,27 @@ def _source(*, ready: bool = True, reason: str | None = None) -> dict:
 
 
 def _canonical_zero_payload(source_fingerprint: str = "source-fp") -> dict:
-    return {
-        "as_of_date": "2026-06-15",
-        "source_history_start": "2025-01-01",
-        "effective_start": "2026-02-15",
-        "effective_history_days": 120,
-        "history_complete": True,
-        "history_not_applicable": ["inventory", "reservations"],
-        "model_version": MODEL_VERSION,
-        "item_count": 0,
-        "total_item_count": 0,
-        "is_truncated": False,
-        "duplicate_supplier_options_removed": 0,
-        "total_suggested_qty": 0.0,
-        "total_cost_eur": 0.0,
-        "priced_cost_eur": 0.0,
-        "unpriced_item_count": 0,
-        "items": [],
-        "_source_fingerprint": source_fingerprint,
-    }
+    return attach_cost_metadata(
+        {
+            "as_of_date": "2026-06-15",
+            "source_history_start": "2025-01-01",
+            "effective_start": "2026-02-15",
+            "effective_history_days": 120,
+            "history_complete": True,
+            "history_not_applicable": ["inventory", "reservations", "purchase_costs"],
+            "model_version": MODEL_VERSION,
+            "item_count": 0,
+            "total_item_count": 0,
+            "is_truncated": False,
+            "duplicate_supplier_options_removed": 0,
+            "total_suggested_qty": 0.0,
+            "total_cost_eur": 0.0,
+            "priced_cost_eur": 0.0,
+            "unpriced_item_count": 0,
+            "items": [],
+            "_source_fingerprint": source_fingerprint,
+        }
+    )
 
 
 def test_plan_producer_malformed_date_422():
@@ -59,19 +64,25 @@ def test_plan_producer_malformed_date_422():
 
 
 def test_plan_producer_nonpositive_id_422():
-    assert client.post(
-        "/plan/producer",
-        headers=_HEADERS,
-        json={"producer_id": 0},
-    ).status_code == 422
+    assert (
+        client.post(
+            "/plan/producer",
+            headers=_HEADERS,
+            json={"producer_id": 0},
+        ).status_code
+        == 422
+    )
 
 
 def test_plan_producer_fractional_id_422():
-    assert client.post(
-        "/plan/producer",
-        headers=_HEADERS,
-        json={"producer_id": 1.5},
-    ).status_code == 422
+    assert (
+        client.post(
+            "/plan/producer",
+            headers=_HEADERS,
+            json={"producer_id": 1.5},
+        ).status_code
+        == 422
+    )
 
 
 def test_cart_plan_unknown_method_422():
@@ -80,11 +91,14 @@ def test_cart_plan_unknown_method_422():
 
 
 def test_cart_plan_negative_budget_422():
-    assert client.post(
-        "/plan/cart",
-        headers=_HEADERS,
-        json={"budget_eur": -5},
-    ).status_code == 422
+    assert (
+        client.post(
+            "/plan/cart",
+            headers=_HEADERS,
+            json={"budget_eur": -5},
+        ).status_code
+        == 422
+    )
 
 
 def test_cart_plan_bounds():
@@ -128,13 +142,16 @@ def test_master_and_feedback_queries_require_positive_ids(path):
 
 
 def test_seed_terms_rejects_unbounded_sample_count():
-    assert client.post(
-        "/masters/seed-terms?min_orders=0",
-        headers=_HEADERS,
-    ).status_code == 422
+    assert (
+        client.post(
+            "/masters/seed-terms?min_orders=0",
+            headers=_HEADERS,
+        ).status_code
+        == 422
+    )
 
 
-def test_startup_cart_warmer_skips_matching_canonical_and_charts(monkeypatch):
+def test_startup_cart_warmer_skips_matching_canonical_and_charts(monkeypatch, queued_warms):
     from app.api import main
     from app.services.replenishment import worker
 
@@ -144,7 +161,19 @@ def test_startup_cart_warmer_skips_matching_canonical_and_charts(monkeypatch):
     def cached(key):
         if ":cart:" in key:
             return _canonical_zero_payload()
-        return {"top_items": [], "_source_fingerprint": "source-fp"}
+        from app.domain.models import PlanCharts
+
+        return {
+            **PlanCharts(
+                as_of_date="2026-06-15",
+                cost_totals_certified=True,
+                urgency_mix=[],
+                days_of_cover_hist=[],
+                top_items=[],
+                demand_series=[],
+            ).model_dump(mode="json"),
+            "_source_fingerprint": "source-fp",
+        }
 
     monkeypatch.setattr(main.cache, "get", cached)
     calls = []
@@ -152,11 +181,13 @@ def test_startup_cart_warmer_skips_matching_canonical_and_charts(monkeypatch):
     monkeypatch.setattr(worker, "warm_charts", lambda **kwargs: calls.append(("charts", kwargs)))
 
     main._warm_cart_on_startup()
+    assert len(queued_warms) == 1
+    next(iter(queued_warms.values()))()
 
     assert calls == []
 
 
-def test_startup_cart_warmer_rebuilds_stale_source_epoch(monkeypatch):
+def test_startup_cart_warmer_rebuilds_stale_source_epoch(monkeypatch, queued_warms):
     from app.api import main
     from app.services.replenishment import worker
 
@@ -177,20 +208,20 @@ def test_startup_cart_warmer_rebuilds_stale_source_epoch(monkeypatch):
     monkeypatch.setattr(
         worker,
         "warm_cart",
-        lambda **kwargs: calls.append(("cart", kwargs))
-        or {"items": 0, "business_ready": True},
+        lambda **kwargs: calls.append(("cart", kwargs)) or {"items": 0, "business_ready": True},
     )
     monkeypatch.setattr(
         worker,
         "warm_charts",
-        lambda **kwargs: calls.append(("charts", kwargs))
-        or {"top_items": 0},
+        lambda **kwargs: calls.append(("charts", kwargs)) or {"top_items": 0},
     )
 
     main._warm_cart_on_startup()
+    assert len(queued_warms) == 1
+    next(iter(queued_warms.values()))()
 
     assert [name for name, _ in calls] == ["cart", "charts"]
-    assert worker.cart_cache_key("2026-06-15") in deleted
+    assert deleted == []  # Invalid input is never served; replacement is owned by the completed warm.
 
 
 class _HealthyConnection:
@@ -261,10 +292,7 @@ def test_health_is_healthy_with_matching_evaluated_zero_cart(monkeypatch):
     assert result["effective_history_days"] == 120
     assert result["history_complete"] is True
     assert result["source_history_contract_ready"] is True
-    assert (
-        result["source_readiness"]["source_history_start"]
-        == result["source_history_start"]
-    )
+    assert result["source_readiness"]["source_history_start"] == result["source_history_start"]
 
     response = client.get("/ready", headers=_HEADERS)
     assert response.status_code == 200
@@ -299,7 +327,7 @@ def test_current_cart_returns_503_before_build_when_source_is_not_ready(monkeypa
     assert exc.value.detail == "cart_business_data_not_ready"
 
 
-def test_current_evaluated_zero_cart_is_cached_as_a_valid_plan(monkeypatch):
+def test_current_evaluated_zero_cart_is_cached_as_a_valid_plan(monkeypatch, queued_warms):
     from app.api import main
     from app.services.replenishment import worker
 
@@ -307,6 +335,7 @@ def test_current_evaluated_zero_cart_is_cached_as_a_valid_plan(monkeypatch):
         items=[],
         item_count=0,
         as_of_date="2026-06-15",
+        cost_totals_certified=True,
     )
     monkeypatch.setattr(main, "_today", lambda: "2026-06-15")
     monkeypatch.setattr(worker, "get_source_readiness", lambda *args, **kwargs: _source())
@@ -327,6 +356,11 @@ def test_current_evaluated_zero_cart_is_cached_as_a_valid_plan(monkeypatch):
         persist,
     )
 
+    monkeypatch.setattr(worker, "warm_charts", lambda **kwargs: None)
+    with pytest.raises(HTTPException) as error:
+        main.plan_cart(CartPlanRequest())
+    assert error.value.status_code == 503
+    next(iter(queued_warms.values()))()
     result = main.plan_cart(CartPlanRequest())
 
     assert result.item_count == 0
@@ -335,7 +369,7 @@ def test_current_evaluated_zero_cart_is_cached_as_a_valid_plan(monkeypatch):
     assert writes[0][2] == 691200
 
 
-def test_user_filtered_historical_empty_cart_remains_valid(monkeypatch):
+def test_user_filtered_historical_empty_cart_remains_valid(monkeypatch, queued_warms):
     from app.api import main
     from app.services.replenishment import worker
 
@@ -343,8 +377,10 @@ def test_user_filtered_historical_empty_cart_remains_valid(monkeypatch):
         items=[],
         item_count=0,
         as_of_date="2026-05-01",
+        cost_totals_certified=True,
     )
-    monkeypatch.setattr(main.cache, "get", lambda key: None)
+    stored = {}
+    monkeypatch.setattr(main.cache, "get", stored.get)
     monkeypatch.setattr(main.policy, "build_cart_plan", lambda *args, **kwargs: empty_plan)
     monkeypatch.setattr(
         worker,
@@ -355,17 +391,28 @@ def test_user_filtered_historical_empty_cart_remains_valid(monkeypatch):
     monkeypatch.setattr(
         main.cache,
         "set",
-        lambda key, value, ttl=None: writes.append((key, value, ttl)),
+        lambda key, value, ttl=None: writes.append((key, value, ttl)) or stored.setdefault(key, value),
     )
 
-    result = main.plan_cart(
-        CartPlanRequest(
-            as_of_date=date(2026, 5, 1),
-            limit=0,
-        )
-    )
+    request = CartPlanRequest(as_of_date=date(2026, 5, 1), limit=0)
+    with pytest.raises(HTTPException) as error:
+        main.plan_cart(request)
+    assert error.value.status_code == 503
+    next(iter(queued_warms.values()))()
+    result = main.plan_cart(request)
 
     assert result.item_count == 0
     assert len(writes) == 1
     assert writes[0][2] == 3600
     assert ":cartbudget:" in writes[0][0]
+
+
+@pytest.fixture
+def queued_warms(monkeypatch):
+    from app.api import main
+
+    jobs = {}
+    monkeypatch.setattr(
+        main, "REQUEST_WARMS", SimpleNamespace(submit=lambda key, work: jobs.setdefault(key, work))
+    )
+    return jobs

@@ -1,10 +1,12 @@
 """Source-history floor, effective denominator and API contract tests."""
+
 from __future__ import annotations
 
 import inspect
 
 import pytest
 from fastapi.testclient import TestClient
+from native_cost_fixture import attach_cost_metadata
 
 from app.api.main import app
 from app.core.config import get_settings
@@ -97,8 +99,9 @@ def test_croston_first_interval_starts_at_the_effective_floor():
         effective_start="2025-01-01",
     )
 
-    # First interval is one real day (Jan 1 -> Jan 2), then four days.
-    assert result.mean_daily == pytest.approx(1 / 1.3)
+    # Jan 1 is observed period one: Jan 2 is period two, then a four-day gap.
+    # Smoothed interval = 2 + 0.1 * (4 - 2); no pre-source days are added.
+    assert result.mean_daily == pytest.approx(1 / 2.2)
 
 
 def test_xyz_dense_window_and_adi_use_only_effective_days():
@@ -137,7 +140,6 @@ def test_rolling_and_full_history_sql_are_floor_bounded():
         supply_repo.all_producers,
         supply_repo.procurement_source_readiness,
         supply_repo.all_products_revenue_eur,
-        cost_repo._fetch_cost_rows,
         cost_repo.sale_prices_eur,
     )
     for fn in rolling_sources:
@@ -184,7 +186,7 @@ def test_readiness_metadata_and_fingerprint_include_effective_window(monkeypatch
     assert first["effective_start"] == "2025-01-01"
     assert first["effective_history_days"] == 10
     assert first["history_complete"] is False
-    assert first["history_not_applicable"] == ["inventory", "reservations"]
+    assert first["history_not_applicable"] == ["inventory", "reservations", "purchase_costs"]
     assert first["source_fingerprint"] != second["source_fingerprint"]
     assert all(params["history_start"] == "2025-01-01" for _, params in captured)
 
@@ -194,7 +196,7 @@ def test_canonical_cache_rejects_history_metadata_drift():
     payload = {
         "as_of_date": "2026-06-15",
         **coverage.as_metadata(),
-        "history_not_applicable": ["inventory", "reservations"],
+        "history_not_applicable": ["inventory", "reservations", "purchase_costs"],
         "model_version": MODEL_VERSION,
         "item_count": 0,
         "total_item_count": 0,
@@ -206,12 +208,11 @@ def test_canonical_cache_rejects_history_metadata_drift():
         "unpriced_item_count": 0,
         "items": [],
     }
+    attach_cost_metadata(payload)
     assert worker.canonical_cart_payload_is_ready(payload)
-    assert not worker.canonical_cart_payload_is_ready(
-        {**payload, "effective_history_days": 119}
-    )
+    assert not worker.canonical_cart_payload_is_ready({**payload, "effective_history_days": 119})
 
 
 def test_cache_namespace_and_model_version_identify_the_floor():
-    assert "v9-h20250101" in cache.make_key("cart", "all", "2026-06-15")
+    assert "v11-verified-net-cost-h20250101" in cache.make_key("cart", "all", "2026-06-15")
     assert "floor20250101" in MODEL_VERSION

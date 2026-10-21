@@ -1,0 +1,11 @@
+# Procurement arithmetic boundaries — 2026-09-08
+
+The cart now uses exact rational sums of decimal input expenditure in both greedy paths. The MILP constraint uses integer units at the finest decimal precision of the supplied line costs; its budget is floored to those units, so a €0.2999 budget cannot buy €0.30. Higher-precision costs retain their input precision. Coefficients outside the exact-double integer range fall back to greedy. Every solver result is rechecked against the exact budget. Line totals keep their existing half-up cent convention. Budget and cart-quantity sums do not use the default Decimal precision: a tiny positive term cannot disappear after a large term. An aggregate quantity that cannot be represented exactly in the response raises an error.
+
+Every positive supplier order multiple is applied, including 1 and fractional multiples. Rational integer ceiling avoids a decimal division rounding down across a pack boundary. The subsequent plan no longer rounds a valid fractional multiple back to two decimals: raw0.02 with pack0.003 yields0.021 and a €100 unit cost yields€2.10. JSON retains0.021. Unsupported float output precision raises an error instead of emitting a non-multiple.
+
+Croston/SBA with an explicit [start,end) observation window now counts start as period1. Demand on days3 and5 initializes the first interval to3. The legacy inferred-window fallback is unchanged. Moving-average and calendar EWMA paths are unchanged. Method IDs, the plan model version, and the cache namespace change, invalidating old source fingerprints and all cached plans on rollout, including explicit-date requests that bypass the current-source fingerprint.
+
+Regression coverage: exact/just-insufficient budget, higher-precision cost, integer/fractional/minimum packs, full build_plan+JSON+money, first-day/third-day Croston and SBA. All test execution is isolated and network/SQL-driver denied.
+
+The existing console BudgetCartTable independently rounds suggested quantities up before display; the constructor also has whole-number quantity formatting. That display gap is reviewed separately by the parent task. This Python change does not establish a unit across products, make mixed-unit cart totals dimensionally valid, or turn historical supplier medians into an exact client-agreement quotation.

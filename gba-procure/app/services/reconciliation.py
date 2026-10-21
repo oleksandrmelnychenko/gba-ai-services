@@ -1,7 +1,8 @@
 """Read-only, executable reconciliation for the canonical procurement cart.
 
-The expected side is intentionally calculated from independent SQL instead of calling
-the procurement repositories whose output is being checked. Buyer-approved unit-cost
+Inventory expectations use independent SQL. Purchase costs are independently counted
+and calculated from raw verified observations, never from the production cohort median.
+Buyer-approved unit-cost
 overrides are read independently from Mongo and overlaid with the same precedence as
 the policy. The module never writes to SQL Server, Mongo or Redis; callers supply a
 plan factory (or an already loaded JSON plan).
@@ -11,12 +12,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from decimal import ROUND_HALF_UP, Decimal
+from datetime import date
+from decimal import Decimal, localcontext
 from enum import IntEnum
-from statistics import median
+from fractions import Fraction
 from typing import Any
 
 from app.core.config import get_settings
@@ -24,6 +26,13 @@ from app.core.history import history_start_iso, rolling_coverage
 from app.data import masters
 from app.data import supply_repository as repo
 from app.data.db import in_clause, query
+from app.data.native_purchase_costs import (
+    NativePurchaseCostClient,
+    NativePurchaseCostError,
+    PurchaseCostObservation,
+    PurchaseCostRequest,
+)
+from app.data.purchase_cost_metadata import stable_manifest, validated_manifest
 from app.data.synthetic import synthetic_product_id
 from app.domain.models import MODEL_VERSION
 
@@ -93,6 +102,8 @@ class SourceFacts:
     consignment_by_key: dict[tuple[int, int], Decimal]
     metrics: dict[str, Any]
     unit_cost_overrides_by_pair: dict[tuple[int, int], Any] = field(default_factory=dict)
+    cost_observations: tuple[PurchaseCostObservation, ...] | None = None
+    cost_manifest_matches: bool = True
 
 
 @dataclass
@@ -112,7 +123,7 @@ class ReconciliationReport:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "as_of": self.as_of,
             "ok": self.ok,
             "exit_code": int(self.exit_code),
@@ -540,74 +551,58 @@ def _collect_on_order(product_ids: list[int], as_of: str) -> dict[int, Decimal]:
     return on_order
 
 
-def _collect_cost_rows(
-    product_ids: list[int],
-    as_of: str,
-) -> dict[tuple[int, int], list[Decimal]]:
-    costs: dict[tuple[int, int], list[Decimal]] = defaultdict(list)
-    syn = synthetic_product_id()
-    for start in range(0, len(product_ids), _INVENTORY_CHUNK):
-        chunk = product_ids[start : start + _INVENTORY_CHUNK]
-        placeholders, params = in_clause("p", chunk)
-        rows = query(
-            f"""
-            SELECT sioi.ProductID AS product_id,
-                   so.ClientID AS producer_id,
-                   dbo.GetExchangedToEuroValue(
-                       sioi.UnitPrice, ISNULL(a.CurrencyID, 2), si.DateFrom
-                   ) AS cost_eur
-            FROM dbo.SupplyOrder so
-            JOIN dbo.SupplyInvoice si
-              ON si.SupplyOrderID = so.ID AND si.Deleted = 0
-            JOIN dbo.SupplyInvoiceOrderItem sioi
-              ON sioi.SupplyInvoiceID = si.ID AND sioi.Deleted = 0
-            LEFT JOIN dbo.ClientAgreement ca ON ca.ID = so.ClientAgreementID
-            LEFT JOIN dbo.Agreement a ON a.ID = ca.AgreementID
-            WHERE so.ClientID IS NOT NULL
-                  AND sioi.UnitPrice > 0
-                  AND sioi.ProductID <> :syn
-                  AND sioi.ProductID IN {placeholders}
-                  AND si.DateFrom >= DATEADD(day, -:days, :asof)
-                  AND si.DateFrom >= :history_start
-                  AND si.DateFrom < :asof
+def _collect_cost_evidence(payload: Mapping[str, Any], as_of: str):
+    """Re-read exact published scopes, then independently retain raw known observations.
 
-            UNION ALL
-
-            SELECT soui.ProductID AS product_id,
-                   COALESCE(soui.SupplierID, sou.SupplierID) AS producer_id,
-                   dbo.GetExchangedToEuroValue(
-                       soui.UnitPrice, ISNULL(a.CurrencyID, 2), sou.FromDate
-                   ) AS cost_eur
-            FROM dbo.SupplyOrderUkraine sou
-            JOIN dbo.SupplyOrderUkraineItem soui
-              ON soui.SupplyOrderUkraineID = sou.ID AND soui.Deleted = 0
-            LEFT JOIN dbo.ClientAgreement ca ON ca.ID = sou.ClientAgreementID
-            LEFT JOIN dbo.Agreement a ON a.ID = ca.AgreementID
-            WHERE sou.Deleted = 0
-                  AND NOT (sou.IsFromCockpit = 1 AND sou.IsPlaced = 0)
-                  AND COALESCE(soui.SupplierID, sou.SupplierID) IS NOT NULL
-                  AND soui.UnitPrice > 0
-                  AND soui.ProductID <> :syn
-                  AND soui.ProductID IN {placeholders}
-                  AND sou.FromDate >= DATEADD(day, -:days, :asof)
-                  AND sou.FromDate >= :history_start
-                  AND sou.FromDate < :asof
-            """,
-            {
-                "asof": as_of,
-                "days": _COST_HISTORY_DAYS,
-                "history_start": history_start_iso(),
-                "syn": syn,
-                **params,
-            },
+    This does not invoke the production cohort aggregate or the old currency UDF.
+    A changed whole-document fingerprint is source_changed, not an arithmetic defect.
+    """
+    if "cost_observation_manifest" not in payload:
+        raise NativePurchaseCostError("missing_purchase_cost_manifest")
+    try:
+        manifest = validated_manifest(payload["cost_observation_manifest"], as_of)
+    except (TypeError, ValueError, KeyError):
+        raise NativePurchaseCostError("invalid_purchase_cost_manifest") from None
+    client = NativePurchaseCostClient.from_settings(get_settings()) if manifest.components else None
+    observations = []
+    scopes = set()
+    identities = set()
+    unchanged = True
+    for component in manifest.components:
+        if component.as_of_exclusive != as_of or scopes.intersection(component.product_ids):
+            raise NativePurchaseCostError("purchase_cost_manifest_scope_mismatch")
+        scopes.update(component.product_ids)
+        response = client.read(
+            PurchaseCostRequest(
+                tuple(component.product_ids),
+                component.supplier_id,
+                date.fromisoformat(as_of),
+                component.history_days,
+            )
         )
-        for row in rows:
-            cost = row["cost_eur"]
-            if cost is None or _decimal(cost) <= 0:
-                continue
-            key = (int(row["producer_id"]), int(row["product_id"]))
-            costs[key].append(_decimal(cost))
-    return dict(costs)
+        unchanged = unchanged and response.fingerprint == component.fingerprint
+        for row in response.observations:
+            if row.observation_id in identities:
+                raise NativePurchaseCostError("duplicate_purchase_cost_observation")
+            identities.add(row.observation_id)
+            observations.append(row)
+        if len(observations) > 50_000:
+            raise NativePurchaseCostError("purchase_cost_aggregation_too_large")
+    products, _ = _item_ids(payload)
+    if not set(products).issubset(scopes):
+        raise NativePurchaseCostError("purchase_cost_manifest_scope_mismatch")
+    costs = defaultdict(list)
+    known_units = defaultdict(set)
+    for row in observations:
+        if row.status == "known":
+            costs[row.supplier_id, row.product_id].append(row.unit_net_cost_eur)
+            known_units[row.supplier_id, row.product_id].add(row.unit_id)
+    # A native unit change cannot be hidden by combining unit prices into one scalar.
+    return (
+        {pair: values for pair, values in costs.items() if len(known_units[pair]) == 1},
+        tuple(observations),
+        unchanged,
+    )
 
 
 def _collect_unit_cost_overrides(
@@ -623,7 +618,7 @@ def _collect_unit_cost_overrides(
 
     overrides: dict[tuple[int, int], Any] = {}
     for producer_id, product_ids in product_ids_by_producer.items():
-        terms_by_product = masters.product_terms_for(producer_id, product_ids)
+        terms_by_product = masters.product_terms_for(producer_id, product_ids, required=True)
         for product_id in product_ids:
             terms = terms_by_product.get(product_id)
             if isinstance(terms, Mapping) and "unit_cost_override" in terms:
@@ -637,7 +632,7 @@ def collect_source_facts(payload: Mapping[str, Any], as_of: str) -> SourceFacts:
     availability, reservations = _collect_availability(product_ids)
     consignments = _collect_consignments(product_ids)
     on_order = _collect_on_order(product_ids, as_of)
-    cost_rows = _collect_cost_rows(product_ids, as_of)
+    cost_rows, cost_observations, cost_manifest_matches = _collect_cost_evidence(payload, as_of)
     unit_cost_overrides = _collect_unit_cost_overrides(selected_pairs)
 
     inventory: dict[int, InventoryFact] = {}
@@ -671,6 +666,8 @@ def collect_source_facts(payload: Mapping[str, Any], as_of: str) -> SourceFacts:
         consignment_by_key=consignments,
         metrics=metrics,
         unit_cost_overrides_by_pair=unit_cost_overrides,
+        cost_observations=cost_observations,
+        cost_manifest_matches=cost_manifest_matches,
     )
 
 
@@ -712,7 +709,11 @@ def _compare_decimal(
     tolerance: Decimal = Decimal(),
 ) -> None:
     try:
+        if actual is None or isinstance(actual, bool):
+            raise ValueError("missing numeric value")
         actual_decimal = _decimal(actual)
+        if not actual_decimal.is_finite():
+            raise ValueError("nonfinite numeric value")
     except Exception:  # noqa: BLE001
         _issue(
             issues,
@@ -738,11 +739,27 @@ def _compare_decimal(
         )
 
 
+def _round_exact(value: Fraction, scale: int) -> Decimal:
+    scaled = value * 10**scale
+    whole, remainder = divmod(scaled.numerator, scaled.denominator)
+    units = whole + (2 * remainder >= scaled.denominator)
+    return Decimal(f"{units // 10**scale}.{units % 10**scale:0{scale}d}")
+
+
+def _fraction_decimal(value: Fraction) -> Decimal:
+    with localcontext() as context:
+        context.prec = max(28, len(str(abs(value.numerator))) + value.denominator.bit_length())
+        result = Decimal(value.numerator) / Decimal(value.denominator)
+    if Fraction(result) != value:
+        raise ValueError("unsupported exact decimal quantity")
+    return result
+
+
 def _exact_median(values: list[Decimal]) -> Decimal:
-    return _decimal(median(sorted(values))).quantize(
-        _FOUR_DECIMALS,
-        rounding=ROUND_HALF_UP,
-    )
+    ordered = sorted(Fraction(value) for value in values)
+    middle = len(ordered) // 2
+    value = ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2
+    return _round_exact(value, 4)
 
 
 def _valid_unit_cost_override(value: Any) -> Decimal | None:
@@ -758,6 +775,235 @@ def _valid_unit_cost_override(value: Any) -> Decimal | None:
     if not override.is_finite() or override <= 0:
         return None
     return override
+
+
+def _independent_provenance(
+    rows: list[PurchaseCostObservation], override: Decimal | None, quantity: Decimal, refs: list[str]
+) -> dict:
+    """Independent raw-observation statistic; never calls the production cohort aggregate."""
+    known = [row for row in rows if row.status == "known"]
+    units = sorted({row.unit_id for row in known})
+    agreements = sorted({row.supplier_client_agreement_id for row in known})
+    counts = Counter(reason for row in rows for reason in row.reason_codes)
+    coverage = (
+        "no_observations"
+        if not rows
+        else ("complete" if len(known) == len(rows) else "partial" if known else "unknown")
+    )
+    median = _exact_median([row.unit_net_cost_eur for row in known]) if known and len(units) == 1 else None
+    aggregation = "mixed_current_units" if len(units) > 1 else None
+    usable = median is not None and Decimal(str(float(median))) == median
+    if median is not None and not usable:
+        aggregation = "cost_float_precision_unsupported"
+    exclusions = []
+    if quantity <= 0:
+        exclusions.append("no_positive_suggested_quantity")
+    if coverage != "complete":
+        exclusions.append("no_observations" if not rows else "incomplete_observation_coverage")
+    if aggregation:
+        exclusions.append(aggregation)
+    if not usable:
+        exclusions.append("verified_cost_unavailable")
+    else:
+        line = _round_exact(Fraction(median) * Fraction(quantity), 2)
+        if Decimal(str(float(line))) != line:
+            exclusions.append("line_amount_precision_unsupported")
+    expected = {
+        "version": 1,
+        "source": "receipt_history",
+        "scope": "CurrentPostedReceipts",
+        "resolver_version": "current-posted-receipt-cost-v1",
+        "basis": "net_goods_excluding_vat_delivery_customs",
+        "statistic": "observation_median_half_up_4",
+        "canonical_unit_cost_eur": format(median, ".4f") if median is not None else None,
+        "current_unit_ids": units,
+        "supplier_client_agreement_ids": agreements,
+        "observation_count": len(rows),
+        "known_count": len(known),
+        "unknown_count": len(rows) - len(known),
+        "coverage": coverage,
+        "reason_counts": [{"reason": key, "count": counts[key]} for key in sorted(counts)],
+        "aggregation_reason": aggregation,
+        "component_refs": refs,
+        "budget_eligible": not exclusions,
+        "budget_exclusion_reasons": exclusions,
+    }
+    if override is not None:
+        expected.update(
+            source="buyer_supplied",
+            scope="BuyerSupplied",
+            resolver_version=None,
+            basis="buyer_tax_basis_unverified",
+            statistic="buyer_override",
+            canonical_unit_cost_eur=format(override, "f"),
+            current_unit_ids=[],
+            supplier_client_agreement_ids=[],
+            observation_count=0,
+            known_count=0,
+            unknown_count=0,
+            coverage="buyer_supplied",
+            reason_counts=[],
+            aggregation_reason=None,
+            component_refs=[],
+            budget_eligible=False,
+            budget_exclusion_reasons=["buyer_tax_basis_unverified"]
+            + (["no_positive_suggested_quantity"] if quantity <= 0 else []),
+        )
+    return expected
+
+
+def _validate_purchase_contract(
+    payload: Mapping[str, Any], facts: SourceFacts, issues: list[ReconciliationIssue]
+) -> dict:
+    if (
+        facts.cost_observations is None
+    ):  # Explicit synthetic legacy arithmetic fixture, never production loader.
+        return {}
+    by_pair = defaultdict(list)
+    for row in facts.cost_observations:
+        by_pair[row.supplier_id, row.product_id].append(row)
+    components = payload["cost_observation_manifest"]["components"]
+    refs = {pid: [component["component_id"]] for component in components for pid in component["product_ids"]}
+    coverages = Counter()
+    eligible_count = 0
+    selected_score = Fraction()
+    selected_cost = Fraction()
+    selected_count = 0
+    for item in payload["items"]:
+        product, supplier = item["product_id"], item["producer_id"]
+        quantity = _decimal(item["suggested_qty"])
+        raw_override = facts.unit_cost_overrides_by_pair.get((supplier, product))
+        override = _valid_unit_cost_override(raw_override) if raw_override is not None else None
+        expected = _independent_provenance(
+            by_pair[supplier, product], override, quantity, refs.get(product, [])
+        )
+        coverages[expected["coverage"]] += 1
+        eligible_count += expected["budget_eligible"]
+        if item.get("cost_provenance") != expected:
+            _issue(
+                issues,
+                "C020",
+                "contract",
+                "cost provenance differs from independently counted observations",
+                key={"product_id": product, "producer_id": supplier},
+                expected=expected,
+                actual=item.get("cost_provenance"),
+            )
+        weight = (
+            {
+                "critical": Decimal("1"),
+                "high": Decimal("0.7"),
+                "normal": Decimal("0.4"),
+                "none": Decimal("0.1"),
+            }[item["urgency"]]
+            if quantity > 0
+            else Decimal()
+        )
+        if (
+            item.get("unit_margin_eur") is not None
+            or item.get("value_density") is not None
+            or item.get("margin_unavailable_reason") != "sale_tax_basis_unverified"
+            or item.get("service_level_basis") != "abc_fallback_with_optional_producer_floor"
+            or item.get("sale_price_basis")
+            != (
+                "unavailable"
+                if item.get("unit_sale_eur") is None
+                else "historical_recorded_tax_basis_unverified"
+            )
+            or _decimal(item.get("budget_priority_weight")) != weight
+        ):
+            _issue(
+                issues, "C021", "contract", "sale tax basis or dimensionless priority metadata inconsistent"
+            )
+        if item.get("within_budget") is True:
+            selected_count += 1
+            if not expected["budget_eligible"]:
+                _issue(
+                    issues, "C022", "contract", "unverified or nonpositive-demand line selected for budget"
+                )
+            selected_score += Fraction(weight)
+            if item.get("line_cost_eur") is not None:
+                selected_cost += Fraction(_decimal(item["line_cost_eur"]))
+        alt = item.get("cheaper_alt")
+        if alt is not None:
+            alt_expected = _independent_provenance(
+                by_pair[alt["producer_id"], product], None, quantity, refs.get(product, [])
+            )
+            alt_cost = alt_expected["canonical_unit_cost_eur"]
+            base_cost = expected["canonical_unit_cost_eur"]
+            comparable = (
+                expected["source"] == "receipt_history"
+                and base_cost is not None
+                and alt_cost is not None
+                and item.get("unit_cost_eur") is not None
+                and Fraction(Decimal(alt_cost)) < Fraction(Decimal(base_cost))
+                and Fraction(Decimal(alt_cost)) * 50 <= Fraction(Decimal(base_cost)) * 49
+            )
+            if (
+                not comparable
+                or alt.get("cost_provenance") != alt_expected
+                or alt.get("comparison_basis") != "historical_net_goods"
+                or alt_cost is None
+                or _decimal(alt.get("cost_eur")) != Decimal(alt_cost)
+            ):
+                _issue(
+                    issues, "C025", "contract", "alternative historical cost differs from raw observations"
+                )
+    total_certified = eligible_count == len(payload["items"])
+    basis = (
+        "includes_buyer_values_with_unverified_tax_basis"
+        if coverages["buyer_supplied"]
+        else "net_goods_excluding_vat_delivery_customs"
+    )
+    if (
+        payload.get("cost_totals_certified") != total_certified
+        or payload.get("cost_total_basis") != basis
+        or payload.get("history_scope") != "demand"
+        or payload.get("value_captured_eur") is not None
+    ):
+        _issue(issues, "C023", "contract", "underlying plan cost scope or certification is inconsistent")
+    if payload.get("budget_eur") is not None and (
+        payload.get("budget_objective") != "urgency_weighted_lines"
+        or payload.get("budget_score") is None
+        or payload.get("budget_used_eur") is None
+        or _decimal(payload.get("budget_score")) != _fraction_decimal(selected_score)
+        or _decimal(payload.get("budget_used_eur")) != _fraction_decimal(selected_cost)
+        or selected_cost > Fraction(_decimal(payload["budget_eur"]))
+        or payload.get("selected_count") != selected_count
+        or payload.get("deferred_count") != len(payload["items"]) - selected_count
+    ):
+        _issue(issues, "C024", "contract", "budget score or verified selected cost is inconsistent")
+    known_count = sum(row.status == "known" for row in facts.cost_observations)
+    return {
+        "scope": "CurrentPostedReceipts",
+        "resolver_version": "current-posted-receipt-cost-v1",
+        "basis": "net_goods_excluding_vat_delivery_customs",
+        "components": [
+            {
+                key: component[key]
+                for key in (
+                    "component_id",
+                    "product_ids",
+                    "supplier_id",
+                    "as_of_exclusive",
+                    "history_days",
+                    "fingerprint",
+                )
+            }
+            for component in components
+        ],
+        "observation_count": len(facts.cost_observations),
+        "known_count": known_count,
+        "unknown_count": len(facts.cost_observations) - known_count,
+        "selected_pair_count": len(payload["items"]),
+        "complete_pair_count": coverages["complete"],
+        "partial_pair_count": coverages["partial"],
+        "unknown_pair_count": coverages["unknown"],
+        "no_observations_pair_count": coverages["no_observations"],
+        "buyer_supplied_pair_count": coverages["buyer_supplied"],
+        "budget_eligible_pair_count": eligible_count,
+        "cost_totals_certified": total_certified,
+    }
 
 
 def validate_canonical_plan(
@@ -813,10 +1059,7 @@ def validate_canonical_plan(
             actual=payload.get("as_of_date"),
         )
     expected_history = rolling_coverage(as_of, get_settings().history_days).as_metadata()
-    actual_history = {
-        key: payload.get(key)
-        for key in expected_history
-    }
+    actual_history = {key: payload.get(key) for key in expected_history}
     if actual_history != expected_history:
         _issue(
             issues,
@@ -826,13 +1069,13 @@ def validate_canonical_plan(
             expected=expected_history,
             actual=actual_history,
         )
-    if payload.get("history_not_applicable") != ["inventory", "reservations"]:
+    if payload.get("history_not_applicable") != ["inventory", "reservations", "purchase_costs"]:
         _issue(
             issues,
             "C012",
             "contract",
             "current inventory and reservations must be explicit history N/A inputs",
-            expected=["inventory", "reservations"],
+            expected=["inventory", "reservations", "purchase_costs"],
             actual=payload.get("history_not_applicable"),
         )
     if payload.get("model_version") != MODEL_VERSION:
@@ -846,8 +1089,8 @@ def validate_canonical_plan(
         )
 
     product_occurrences: defaultdict[int, int] = defaultdict(int)
-    total_qty = Decimal()
-    priced_total = Decimal()
+    total_qty = Fraction()
+    priced_total = Fraction()
     computed_unpriced = 0
     applied_unit_cost_overrides = 0
     invalid_unit_cost_overrides = 0
@@ -939,7 +1182,7 @@ def validate_canonical_plan(
                 key=key,
                 actual=suggested_qty,
             )
-        total_qty += suggested_qty
+        total_qty += Fraction(suggested_qty)
 
         fact = facts.inventory_by_product.get(product_id)
         if fact is None:
@@ -978,7 +1221,12 @@ def validate_canonical_plan(
         expected_cost_source = "exact Decimal median"
         if raw_override is not _NO_OVERRIDE:
             expected_unit_cost = _valid_unit_cost_override(raw_override)
-            if expected_unit_cost is None:
+            zero_override = (
+                type(raw_override) in (int, float, Decimal)
+                and _decimal(raw_override).is_finite()
+                and _decimal(raw_override) == 0
+            )
+            if expected_unit_cost is None and not zero_override:
                 invalid_unit_cost_overrides += 1
                 _issue(
                     issues,
@@ -989,22 +1237,34 @@ def validate_canonical_plan(
                     expected="finite value > 0",
                     actual=raw_override,
                 )
-            else:
+            elif expected_unit_cost is not None:
                 applied_unit_cost_overrides += 1
                 expected_cost_source = "buyer unit_cost_override"
 
         if expected_unit_cost is None and source_costs:
             expected_unit_cost = _exact_median(source_costs)
+            if Decimal(str(float(expected_unit_cost))) != expected_unit_cost:
+                expected_unit_cost = None
         if expected_unit_cost is None:
             computed_unpriced += 1
-            _issue(
-                issues,
-                "M001",
-                "money",
-                "needed item has no valid buyer override or factual supplier cost",
-                key=key,
-                actual={"unit_cost_eur": unit_cost, "line_cost_eur": line_cost},
-            )
+            if unit_cost is not None or line_cost is not None:
+                _issue(
+                    issues,
+                    "M001",
+                    "money",
+                    "unconfirmed cost must remain unknown",
+                    key=key,
+                    actual={"unit_cost_eur": unit_cost, "line_cost_eur": line_cost},
+                )
+            else:
+                _issue(
+                    issues,
+                    "G003",
+                    "coverage",
+                    "item has no usable verified cost scalar",
+                    key=key,
+                    severity="warning",
+                )
             continue
 
         _compare_decimal(
@@ -1016,10 +1276,12 @@ def validate_canonical_plan(
             expected=expected_unit_cost,
             actual=unit_cost,
         )
-        expected_line_cost = (expected_unit_cost * suggested_qty).quantize(
-            _CENT,
-            rounding=ROUND_HALF_UP,
-        )
+        expected_line_cost = _round_exact(Fraction(expected_unit_cost) * Fraction(suggested_qty), 2)
+        if Decimal(str(float(expected_line_cost))) != expected_line_cost:
+            computed_unpriced += 1
+            if line_cost is not None:
+                _issue(issues, "M003", "money", "unrepresentable line cents must remain unknown", key=key)
+            continue
         _compare_decimal(
             issues,
             code="M003",
@@ -1029,7 +1291,7 @@ def validate_canonical_plan(
             expected=expected_line_cost,
             actual=line_cost,
         )
-        priced_total += expected_line_cost
+        priced_total += Fraction(expected_line_cost)
 
     duplicate_products = {product_id: count for product_id, count in product_occurrences.items() if count > 1}
     if duplicate_products:
@@ -1060,7 +1322,8 @@ def validate_canonical_plan(
                 delta=available - remaining,
             )
 
-    expected_total_qty = total_qty.quantize(_CENT, rounding=ROUND_HALF_UP)
+    expected_total_qty = _fraction_decimal(total_qty)
+    priced_total = _fraction_decimal(priced_total)
     _compare_decimal(
         issues,
         code="M004",
@@ -1089,6 +1352,8 @@ def validate_canonical_plan(
             expected=priced_total,
             actual=payload.get("total_cost_eur"),
         )
+    if computed_unpriced and payload.get("total_cost_eur") is not None:
+        _issue(issues, "M006", "money", "total_cost_eur must be unknown when any line is unpriced")
     if payload.get("unpriced_item_count") != computed_unpriced:
         _issue(
             issues,
@@ -1116,8 +1381,16 @@ def validate_canonical_plan(
             severity="error" if strict_coverage else "warning",
         )
 
+    cost_metrics = _validate_purchase_contract(payload, facts, issues)
+    if cost_metrics:
+        cost_metrics.update(
+            priced_selected_pairs=len(items) - computed_unpriced,
+            computed_unpriced_items=computed_unpriced,
+            computed_priced_cost_eur=priced_total,
+        )
     metrics = {
         **facts.metrics,
+        "purchase_costs": cost_metrics,
         "plan_items": len(items),
         "unique_plan_products": len(product_occurrences),
         "computed_total_suggested_qty": expected_total_qty,
@@ -1200,19 +1473,77 @@ def run_reconciliation(
             metrics={},
         )
 
-    plans = [_as_plan_dict(plan_factory()) for _ in range(repeat_builds)]
-    digests = [canonical_json_digest(plan) for plan in plans]
+    try:
+        plans = [_as_plan_dict(plan_factory()) for _ in range(repeat_builds)]
+    except (NativePurchaseCostError, masters.MastersReadError) as exc:
+        _issue(
+            issues,
+            "S003",
+            "source_not_ready",
+            "required buyer-maintained input unavailable during plan build"
+            if isinstance(exc, masters.MastersReadError)
+            else "verified purchase-cost input unavailable during plan build",
+        )
+        return ReconciliationReport(
+            as_of,
+            exit_code_for_issues(issues),
+            issues,
+            source_epoch_before,
+            epoch_loader(as_of, history_days),
+            [],
+            readiness,
+            {},
+        )
+    stable_plans = []
+    for plan in plans:
+        stable = dict(plan)
+        if "cost_observation_manifest" in stable:
+            stable["cost_observation_manifest"] = stable_manifest(stable["cost_observation_manifest"])
+        stable_plans.append(stable)
+    digests = [canonical_json_digest(plan) for plan in stable_plans]
     if len(set(digests)) != 1:
         _issue(
             issues,
             "D001",
             "determinism",
-            "repeated read-only builds produced different canonical JSON",
+            "repeated read-only builds produced different financial or plan input",
             expected=digests[0],
             actual=digests[1:],
         )
 
-    facts = facts_loader(plans[0], as_of)
+    try:
+        facts = facts_loader(plans[0], as_of)
+    except (NativePurchaseCostError, masters.MastersReadError) as exc:
+        _issue(
+            issues,
+            "S003",
+            "source_not_ready",
+            "required buyer-maintained input unavailable"
+            if isinstance(exc, masters.MastersReadError)
+            else "verified purchase-cost input unavailable",
+        )
+        return ReconciliationReport(
+            as_of,
+            exit_code_for_issues(issues),
+            issues,
+            source_epoch_before,
+            epoch_loader(as_of, history_days),
+            digests,
+            readiness,
+            {},
+        )
+    if not facts.cost_manifest_matches:
+        _issue(issues, "S004", "source_not_ready", "purchase-cost financial input changed since plan build")
+        return ReconciliationReport(
+            as_of,
+            exit_code_for_issues(issues),
+            issues,
+            source_epoch_before,
+            epoch_loader(as_of, history_days),
+            digests,
+            readiness,
+            facts.metrics,
+        )
     plan_issues, metrics = validate_canonical_plan(
         plans[0],
         facts,

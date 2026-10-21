@@ -1,7 +1,8 @@
 """Read-only product/quantity/cent reconciliation gate for the canonical cart.
 
 The default path builds the plan in-process with every Redis operation disabled, then
-checks it against independent SQL reads.  It never invalidates or warms a cache.
+checks inventory against independent SQL and costs against freshly verified raw native
+observations. It never invalidates or warms a cache. Output contract is schema2.
 
 Examples:
   .venv/bin/python scripts/procure_reconcile.py --as-of 2026-07-25
@@ -149,7 +150,7 @@ def main(argv: list[str] | None = None) -> int:
         return int(report.exit_code)
     except Exception as exc:  # noqa: BLE001
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "as_of": as_of,
             "ok": False,
             "exit_code": int(ReconciliationExitCode.INTERNAL_ERROR),

@@ -1,9 +1,7 @@
-"""EUR unit-cost layer over authoritative supplier price history.
+"""Verified current receipt-cost history and separately labelled recorded sale prices.
 
-International product detail and price live on ``SupplyInvoiceOrderItem``; the
-parent ``SupplyOrderItem`` is only a synthetic debt placeholder in the current
-1C import. Domestic detail lives on ``SupplyOrderUkraineItem``. Both prices are
-converted from the supplier agreement currency with the source document date.
+Supplier costs use the native immutable-proof endpoint. Historical sale values
+remain tax-basis unverified and must never be compared as proven net margin.
 """
 from __future__ import annotations
 
@@ -13,6 +11,7 @@ from statistics import median
 from app.core.history import history_start_iso
 from app.core.logging import get_logger
 from app.data.db import in_clause, query
+from app.data.purchase_cost_cohort import PurchaseCostCohort, read_purchase_cost_cohort
 from app.data.synthetic import synthetic_product_id
 
 log = get_logger("cost_repository")
@@ -33,93 +32,39 @@ def _rounded_float(value: Decimal, quantum: Decimal = _FOUR_DECIMALS) -> float:
     return float(value.quantize(quantum, rounding=ROUND_HALF_UP))
 
 
+def _cohort_for(product_ids: list[int], as_of: str, history_days: int,
+                cohort: PurchaseCostCohort | None) -> PurchaseCostCohort:
+    result = cohort or read_purchase_cost_cohort(product_ids, as_of, history_days)
+    result.require_scope(product_ids, as_of, history_days)
+    return result
+
+
 def _fetch_cost_rows(
-    product_ids: list[int], as_of: str, history_days: int, producer_id: int | None = None
+    product_ids: list[int], as_of: str, history_days: int, producer_id: int | None = None,
+    *, cohort: PurchaseCostCohort | None = None,
 ) -> list[dict]:
-    syn = synthetic_product_id()
-    ids = [int(p) for p in product_ids if int(p) != syn]
-    out: list[dict] = []
-    for start in range(0, len(ids), _IN_CHUNK):
-        chunk = ids[start : start + _IN_CHUNK]
-        ph, params = in_clause("p", chunk)
-        params.update(
-            {
-                "asof": as_of,
-                "days": history_days,
-                "history_start": history_start_iso(),
-                "syn": syn,
-            }
-        )
-        international_producer_filter = "AND so.ClientID IS NOT NULL"
-        ukraine_producer_filter = "AND COALESCE(soui.SupplierID, sou.SupplierID) IS NOT NULL"
-        if producer_id is not None:
-            international_producer_filter = "AND so.ClientID = :pid"
-            ukraine_producer_filter = (
-                "AND (soui.SupplierID = :pid "
-                "OR (soui.SupplierID IS NULL AND sou.SupplierID = :pid))"
-            )
-            params["pid"] = producer_id
-        rows = query(
-            f"""
-            SELECT sioi.ProductID AS pid, so.ClientID AS producer_id,
-                   dbo.GetExchangedToEuroValue(
-                       sioi.UnitPrice, ISNULL(a.CurrencyID, 2), si.DateFrom
-                   ) AS cost_eur
-            FROM dbo.SupplyOrder so
-            JOIN dbo.SupplyInvoice si
-                 ON si.SupplyOrderID = so.ID AND si.Deleted = 0
-            JOIN dbo.SupplyInvoiceOrderItem sioi
-                 ON sioi.SupplyInvoiceID = si.ID AND sioi.Deleted = 0
-            LEFT JOIN dbo.ClientAgreement ca ON ca.ID = so.ClientAgreementID
-            LEFT JOIN dbo.Agreement a ON a.ID = ca.AgreementID
-            WHERE sioi.UnitPrice > 0
-                  AND sioi.ProductID <> :syn
-                  AND sioi.ProductID IN {ph}
-                  {international_producer_filter}
-                  AND si.DateFrom >= DATEADD(day, -:days, :asof)
-                  AND si.DateFrom >= :history_start
-                  AND si.DateFrom < :asof
-
-            UNION ALL
-
-            SELECT soui.ProductID AS pid,
-                   COALESCE(soui.SupplierID, sou.SupplierID) AS producer_id,
-                   dbo.GetExchangedToEuroValue(
-                       soui.UnitPrice, ISNULL(a.CurrencyID, 2), sou.FromDate
-                   ) AS cost_eur
-            FROM dbo.SupplyOrderUkraine sou
-            JOIN dbo.SupplyOrderUkraineItem soui
-                 ON soui.SupplyOrderUkraineID = sou.ID AND soui.Deleted = 0
-            LEFT JOIN dbo.ClientAgreement ca ON ca.ID = sou.ClientAgreementID
-            LEFT JOIN dbo.Agreement a ON a.ID = ca.AgreementID
-            WHERE sou.Deleted = 0
-                  AND NOT (sou.IsFromCockpit = 1 AND sou.IsPlaced = 0)
-                  AND soui.UnitPrice > 0
-                  AND soui.ProductID <> :syn
-                  AND soui.ProductID IN {ph}
-                  {ukraine_producer_filter}
-                  AND sou.FromDate >= DATEADD(day, -:days, :asof)
-                  AND sou.FromDate >= :history_start
-                  AND sou.FromDate < :asof
-            """,
-            params,
-        )
-        out.extend(rows)
-    return out
+    """One known observation once, including zero; no mutable currency conversion."""
+    if not product_ids:
+        return []
+    current = _cohort_for(product_ids, as_of, history_days, cohort)
+    selected = set(product_ids)
+    return [{"pid": row.product_id, "producer_id": row.supplier_id,
+             "observation_id": row.observation_id, "cost_eur": row.unit_net_cost_eur}
+            for snapshot in current.snapshots for row in snapshot.observations
+            if row.product_id in selected and row.status == "known"
+            and (producer_id is None or row.supplier_id == producer_id)]
 
 
 def producer_unit_costs_eur(
-    producer_id: int, product_ids: list[int], as_of: str, history_days: int = _HISTORY_DAYS
+    producer_id: int, product_ids: list[int], as_of: str, history_days: int = _HISTORY_DAYS,
+    *, cohort: PurchaseCostCohort | None = None,
 ) -> dict[int, float]:
-    """Median EUR unit cost per product for one producer."""
+    """Visible partial/complete known median; eligibility is separate provenance."""
     if not product_ids:
         return {}
-    by_pid: dict[int, list[Decimal]] = {}
-    for r in _fetch_cost_rows(product_ids, as_of, history_days, producer_id=producer_id):
-        c = r["cost_eur"]
-        if c is not None and _as_decimal(c) > 0:
-            by_pid.setdefault(int(r["pid"]), []).append(_as_decimal(c))
-    return {pid: _rounded_float(median(v)) for pid, v in by_pid.items() if v}
+    current = _cohort_for(product_ids, as_of, history_days, cohort)
+    return {pid: group.median_float for pid in product_ids
+            if (group := current.group(pid, producer_id)).median_float is not None}
 
 
 def sale_prices_eur(
@@ -163,24 +108,17 @@ def sale_prices_eur(
 
 
 def cheapest_alt_eur(
-    product_ids: list[int], as_of: str, history_days: int = _HISTORY_DAYS
+    product_ids: list[int], as_of: str, history_days: int = _HISTORY_DAYS,
+    *, cohort: PurchaseCostCohort | None = None,
 ) -> dict[int, dict]:
-    """Per product, the producer with the lowest median EUR cost (cross-supplier)."""
+    """Lower historical net-goods medians; never an available current supplier offer."""
     if not product_ids:
         return {}
-    pair: dict[tuple[int, int], list[Decimal]] = {}
-    for r in _fetch_cost_rows(product_ids, as_of, history_days, producer_id=None):
-        c = r["cost_eur"]
-        if c is None or _as_decimal(c) <= 0:
-            continue
-        pair.setdefault((int(r["pid"]), int(r["producer_id"])), []).append(_as_decimal(c))
-    best: dict[int, tuple[int, Decimal]] = {}
-    for (pid, producer), costs in pair.items():
-        m = median(costs)
-        cur = best.get(pid)
-        if cur is None or m < cur[1]:
-            best[pid] = (producer, m)
-    return {
-        pid: {"producer_id": pr, "cost_eur": _rounded_float(cost)}
-        for pid, (pr, cost) in best.items()
-    }
+    current = _cohort_for(product_ids, as_of, history_days, cohort)
+    result = {}
+    for product in product_ids:
+        usable = [group for group in current.supplier_groups(product) if group.median_float is not None]
+        if usable:
+            best = min(usable, key=lambda group: (group.median_unit_net_cost_eur, group.supplier_id))
+            result[product] = {"producer_id": best.supplier_id, "cost_eur": best.median_float}
+    return result

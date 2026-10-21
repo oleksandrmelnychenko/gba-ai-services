@@ -929,7 +929,8 @@ def procurement_source_readiness(as_of: str, history_days: int) -> dict:
             str(value) if value is not None else None
         )
     snapshot.update(coverage.as_metadata())
-    snapshot["history_not_applicable"] = ["inventory", "reservations"]
+    snapshot["history_scope"] = "demand"
+    snapshot["history_not_applicable"] = ["inventory", "reservations", "purchase_costs"]
     snapshot["model_version"] = MODEL_VERSION
     fingerprint_fields = {
         name: snapshot[name]

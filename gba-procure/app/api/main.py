@@ -1,4 +1,5 @@
 """FastAPI app — GBA Procurement / Replenishment Service."""
+
 from __future__ import annotations
 
 import hmac
@@ -28,6 +29,7 @@ from app.domain.models import (
     ProducerPurchasePlan,
 )
 from app.services.replenishment import policy, worker
+from app.services.replenishment.warm_requests import REQUEST_WARMS
 
 log = get_logger("api")
 settings = get_settings()
@@ -71,42 +73,42 @@ def _canonical_cart_readiness(
 
 
 def _warm_cart_on_startup() -> None:
-    """Warm the canonical cart plan in the background so an API restart self-heals:
-    the full all-producer build is ~70s cold and would 503 the first /plan/cart
-    (past the gba-server proxy timeout). The scheduler warms it daily; this closes
-    the gap on every API (re)start without blocking boot."""
-    try:
-        as_of = _today()
-        key = worker.cart_cache_key(as_of)
-        with _CART_BUILD_LOCK:
-            source = worker.get_source_readiness(as_of, force=True)
-            cached = cache.get(key)
-            if (
-                source.get("ready") is not True
-                or not worker.canonical_cart_payload_is_ready(
-                    cached,
-                    source_fingerprint=source.get("source_fingerprint"),
-                )
-            ):
-                if cached is not None:
-                    cache.delete(key)
-                stats = worker.warm_cart(as_of=as_of, cart_limit=worker.CART_LIMIT)
-                log.info("cart_warm_on_startup_done", **stats)
-            else:
-                log.info("cart_warm_on_startup_skipped", key=key, reason="already_cached")
-            charts_key = cache.make_key("charts", f"all:{worker.CHARTS_TOP_N}", as_of)
-            charts_payload = cache.get(charts_key)
-            if (
-                charts_payload is None
-                or charts_payload.get("_source_fingerprint")
-                != source.get("source_fingerprint")
-            ):
-                cstats = worker.warm_charts(as_of=as_of, top_n=worker.CHARTS_TOP_N)
-                log.info("charts_warm_on_startup_done", **cstats)
-            else:
-                log.info("charts_warm_on_startup_skipped", key=charts_key, reason="already_cached")
-    except Exception as exc:  # noqa: BLE001
-        log.warning("cart_warm_on_startup_failed", error=str(exc))
+    """Share the bounded job used by cold requests; startup owns no second build."""
+    _queue_canonical_cart(_today())
+
+
+def _cache_matches(payload: dict | None, source: dict | None) -> bool:
+    return worker.plan_cost_metadata_is_ready(payload) and (
+        source is None or payload.get("_source_fingerprint") == source.get("source_fingerprint")
+    )
+
+
+def _save_captured(key: str, plan, source: dict | None, ttl: int) -> None:
+    payload = plan.model_dump(mode="json")
+    if source is not None:
+        payload["_source_fingerprint"] = source.get("source_fingerprint")
+    if not worker.plan_cost_metadata_is_ready(payload):
+        raise worker.ProcurementBusinessReadinessError("captured_cost_metadata_invalid")
+    if not cache.set(key, payload, ttl=ttl):
+        raise worker.ProcurementBusinessReadinessError("captured_plan_cache_write_failed")
+
+
+def _queue_canonical_cart(as_of: str) -> None:
+    key = worker.cart_cache_key(as_of)
+
+    def build() -> None:
+        source = worker.require_source_readiness(as_of, force=True)
+        if not worker.canonical_cart_payload_is_ready(
+            cache.get(key), source_fingerprint=source.get("source_fingerprint")
+        ):
+            worker.warm_cart(as_of=as_of, cart_limit=worker.CART_LIMIT)
+        charts_key = cache.make_key("charts", f"all:{worker.CHARTS_TOP_N}", as_of)
+        if not worker.canonical_charts_payload_is_ready(
+            cache.get(charts_key), source_fingerprint=source.get("source_fingerprint")
+        ):
+            worker.warm_charts(as_of=as_of, top_n=worker.CHARTS_TOP_N)
+
+    REQUEST_WARMS.submit(key, build)
 
 
 def _report_mongo_orphans() -> None:
@@ -118,8 +120,12 @@ def _report_mongo_orphans() -> None:
             return
         for coll_name, r in report.items():
             if r["orphaned"]:
-                log.warning("mongo_orphan_docs", collection=coll_name, **r,
-                            note="dead pre-wipe IDs; no natural keys to remap; data retained")
+                log.warning(
+                    "mongo_orphan_docs",
+                    collection=coll_name,
+                    **r,
+                    note="dead pre-wipe IDs; no natural keys to remap; data retained",
+                )
             else:
                 log.info("mongo_orphan_check_clean", collection=coll_name, **r)
     except Exception as exc:  # noqa: BLE001
@@ -140,8 +146,12 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="GBA Procurement / Replenishment Service", version="0.1.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=settings.cors_allow_origins,
-                   allow_methods=["GET", "POST"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_allow_origins,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 
 @app.middleware("http")
@@ -223,13 +233,9 @@ def health() -> dict:
             business_reason,
             canonical_cart_items,
             source_readiness,
-        ) = (
-            _canonical_cart_readiness(_today())
-        )
+        ) = _canonical_cart_readiness(_today())
     source_history_start = settings.source_history_start_date.isoformat()
-    source_history_contract_ready = (
-        source_history_start == _EXPECTED_SOURCE_HISTORY_START
-    )
+    source_history_contract_ready = source_history_start == _EXPECTED_SOURCE_HISTORY_START
     source_readiness = {
         **(source_readiness or {}),
         "source_history_start": source_history_start,
@@ -248,7 +254,8 @@ def health() -> dict:
         "canonical_cart_items": canonical_cart_items,
         "source_readiness": source_readiness,
         **coverage.as_metadata(),
-        "history_not_applicable": ["inventory", "reservations"],
+        "history_scope": "demand",
+        "history_not_applicable": ["inventory", "reservations", "purchase_costs"],
         "source_history_contract_ready": source_history_contract_ready,
         "version": "0.1.0",
         "model_version": MODEL_VERSION,
@@ -275,228 +282,163 @@ def plan_producer(req: PlanRequest) -> ProducerPurchasePlan:
     started = time.time()
     try:
         as_of = req.as_of_date.isoformat() if req.as_of_date else _today()
-        source = (
-            worker.require_source_readiness(as_of)
-            if req.as_of_date is None
-            else None
-        )
-        key = cache.make_key("producer", req.producer_id, as_of) if req.only_needed else None
-        if key is not None:
-            cached = cache.get(key)
-            if (
-                cached is not None
-                and (
-                    source is None
-                    or cached.get("_source_fingerprint")
-                    == source.get("source_fingerprint")
-                )
-            ):
-                METRICS.record_request((time.time() - started) * 1000)
-                log.info("plan_cache_hit", producer_id=req.producer_id, items=cached.get("item_count"))
-                return ProducerPurchasePlan.model_validate(cached)
-            if cached is not None:
-                cache.delete(key)
-        plan = policy.build_plan(req.producer_id, as_of, only_needed=req.only_needed)
-        if key is not None:
-            payload = plan.model_dump(mode="json")
-            if source is not None:
-                payload["_source_fingerprint"] = source.get("source_fingerprint")
-            cache.set(key, payload, ttl=691200)
-        METRICS.record_request((time.time() - started) * 1000)
-        log.info("plan_built", producer_id=req.producer_id, items=plan.item_count)
-        return plan
+        source = worker.require_source_readiness(as_of) if req.as_of_date is None else None
+        key = cache.make_key("producer" if req.only_needed else "producerfull", req.producer_id, as_of)
+        cached = cache.get(key)
+        if _cache_matches(cached, source):
+            return ProducerPurchasePlan.model_validate(cached)
+
+        def build() -> None:
+            current = worker.require_source_readiness(as_of, force=True) if req.as_of_date is None else None
+            plan = policy.build_plan(req.producer_id, as_of, only_needed=req.only_needed)
+            _save_captured(key, plan, current, 691200 if req.only_needed else 3600)
+
+        REQUEST_WARMS.submit(key, build)
+        raise worker.ProcurementBusinessReadinessError("captured_plan_preparing")
     except worker.ProcurementBusinessReadinessError as exc:
         METRICS.record_request((time.time() - started) * 1000, error=True)
         raise HTTPException(status_code=503, detail="procurement_business_data_not_ready") from exc
     except Exception as exc:  # noqa: BLE001
-        METRICS.record_request((time.time() - started) * 1000, error=True)
         err_id = uuid.uuid4().hex
-        log.error("plan_failed", producer_id=req.producer_id, error_id=err_id, error=str(exc))
+        log.error("plan_failed", error_id=err_id, failure_type=type(exc).__name__)
         raise HTTPException(status_code=500, detail=f"plan_failed:{err_id}") from exc
-
-
-# Single-flight: a cold cart build is tens of seconds of DB work — when the as_of
-# rolls at midnight (or Redis was flushed), concurrent requests must not each run
-# their own build. One builds, the rest wait on the lock and re-read the cache.
-_CART_BUILD_LOCK = threading.Lock()
 
 
 @app.post("/plan/cart", response_model=CartReplenishmentPlan)
 def plan_cart(req: CartPlanRequest) -> CartReplenishmentPlan:
-    started = time.time()
     try:
         as_of = req.as_of_date.isoformat() if req.as_of_date else _today()
-        source = (
-            worker.require_source_readiness(as_of)
-            if req.as_of_date is None
-            else None
-        )
-        limit = req.limit
-        # budget <= 0 means "no budget limit" (the warehouse lens sends 0) — treat it as
-        # canonical so it hits the scheduler-warmed key instead of a cold per-request build
-        # (the full all-producer plan is ~70s cold, past the gba-server 60s proxy timeout).
+        source = worker.require_source_readiness(as_of) if req.as_of_date is None else None
+        # Existing warehouse requests use zero to mean unbounded, not a zero ceiling.
         budget = req.budget_eur if req.budget_eur and req.budget_eur > 0 else None
-        # Canonical = exactly what the scheduler warms (only_needed=True, no budget/window).
-        # Variants carry every plan-shaping parameter in the key (a shared key once served
-        # the wrong only_needed plan for 8 days) and live 1h so the slider can't grow Redis.
         canonical = (
             req.as_of_date is None
             and budget is None
             and req.active_days is None
             and req.only_needed
-            and limit == worker.CART_LIMIT
+            and req.limit == worker.CART_LIMIT
         )
-        key = (worker.cart_cache_key(as_of, limit) if canonical
-               else cache.make_key(
-                   "cartbudget",
-                   f"{limit if limit is not None else 'all'}:"
-                   f"{budget}:{req.method}:{req.active_days}:{int(req.only_needed)}",
-                   as_of,
-               ))
+        key = (
+            worker.cart_cache_key(as_of)
+            if canonical
+            else cache.make_key(
+                "cartbudget",
+                f"{req.limit if req.limit is not None else 'all'}:"
+                f"{budget}:{req.method}:{req.active_days}:{int(req.only_needed)}",
+                as_of,
+            )
+        )
         cached = cache.get(key)
-        cache_valid = cached is not None and (
-            source is None
-            or cached.get("_source_fingerprint") == source.get("source_fingerprint")
-        )
-        if canonical and cache_valid:
-            cache_valid = worker.canonical_cart_payload_is_ready(
-                cached,
-                source_fingerprint=source.get("source_fingerprint") if source else None,
+        if _cache_matches(cached, source) and (
+            not canonical
+            or worker.canonical_cart_payload_is_ready(
+                cached, source_fingerprint=source.get("source_fingerprint") if source else None
             )
-        if cached is not None and not cache_valid:
-            log.warning(
-                "stale_or_invalid_cart_cache_discarded",
-                as_of=as_of,
-                items=cached.get("item_count"),
-            )
-            cache.delete(key)
-            cached = None
-        if cached is not None:
-            METRICS.record_request((time.time() - started) * 1000)
-            log.info("cart_plan_cache_hit", items=cached.get("item_count"))
+        ):
             return CartReplenishmentPlan.model_validate(cached)
-        with _CART_BUILD_LOCK:
-            if req.as_of_date is None:
-                source = worker.require_source_readiness(as_of, force=True)
-            cached = cache.get(key)
-            cache_valid = cached is not None and (
-                source is None
-                or cached.get("_source_fingerprint") == source.get("source_fingerprint")
-            )
-            if canonical and cache_valid:
-                cache_valid = worker.canonical_cart_payload_is_ready(
-                    cached,
-                    source_fingerprint=source.get("source_fingerprint") if source else None,
+        # Budget/limit transforms retain the captured input and its original read window.
+        from_canonical = req.as_of_date is None and req.active_days is None and req.only_needed
+        if from_canonical:
+            captured = cache.get(worker.cart_cache_key(as_of))
+            if worker.canonical_cart_payload_is_ready(
+                captured, source_fingerprint=source.get("source_fingerprint") if source else None
+            ):
+                plan = policy.captured_cart_variant(
+                    CartReplenishmentPlan.model_validate(captured),
+                    budget_eur=budget,
+                    method=req.method,
+                    limit=req.limit,
                 )
-            if cached is not None and not cache_valid:
-                cache.delete(key)
-                cached = None
-            if cached is not None:
-                METRICS.record_request((time.time() - started) * 1000)
-                log.info("cart_plan_cache_hit", items=cached.get("item_count"))
-                return CartReplenishmentPlan.model_validate(cached)
-            plan = policy.build_cart_plan(as_of, only_needed=req.only_needed, limit=limit,
-                                          budget_eur=budget, method=req.method,
-                                          active_days=req.active_days,
-                                          source_fingerprint=(
-                                              source.get("source_fingerprint")
-                                              if source else None
-                                          ))
-            if canonical:
-                worker.cache_canonical_cart_plan(
-                    plan,
+                _save_captured(key, plan, source, 3600)
+                return plan
+            _queue_canonical_cart(as_of)
+        else:
+
+            def build() -> None:
+                current = (
+                    worker.require_source_readiness(as_of, force=True) if req.as_of_date is None else None
+                )
+                plan = policy.build_cart_plan(
                     as_of,
-                    cart_limit=limit,
-                    source_snapshot=source,
+                    only_needed=req.only_needed,
+                    limit=req.limit,
+                    budget_eur=budget,
+                    method=req.method,
+                    active_days=req.active_days,
+                    source_fingerprint=current.get("source_fingerprint") if current else None,
                 )
-            else:
-                payload = plan.model_dump(mode="json")
-                if source is not None:
-                    payload["_source_fingerprint"] = source.get("source_fingerprint")
-                cache.set(key, payload, ttl=3600)
-        METRICS.record_request((time.time() - started) * 1000)
-        log.info("cart_plan_built", items=plan.item_count)
-        return plan
+                _save_captured(key, plan, current, 3600)
+
+            REQUEST_WARMS.submit(key, build)
+        raise worker.ProcurementBusinessReadinessError("captured_plan_preparing")
     except worker.ProcurementBusinessReadinessError as exc:
-        METRICS.record_request((time.time() - started) * 1000, error=True)
-        log.warning("cart_plan_business_not_ready", as_of=as_of, error=str(exc))
-        raise HTTPException(
-            status_code=503,
-            detail="cart_business_data_not_ready",
-        ) from exc
-    except HTTPException:
-        METRICS.record_request((time.time() - started) * 1000, error=True)
-        raise
+        raise HTTPException(status_code=503, detail="cart_business_data_not_ready") from exc
     except Exception as exc:  # noqa: BLE001
-        METRICS.record_request((time.time() - started) * 1000, error=True)
         err_id = uuid.uuid4().hex
-        log.error("cart_plan_failed", error_id=err_id, error=str(exc))
+        log.error("cart_plan_failed", error_id=err_id, failure_type=type(exc).__name__)
         raise HTTPException(status_code=500, detail=f"cart_plan_failed:{err_id}") from exc
 
 
 @app.post("/plan/charts", response_model=PlanCharts)
 def plan_charts(req: PlanChartsRequest) -> PlanCharts:
-    started = time.time()
     try:
         as_of = req.as_of_date.isoformat() if req.as_of_date else _today()
-        source = (
-            worker.require_source_readiness(as_of)
-            if req.as_of_date is None
-            else None
-        )
-        top_n = req.top_n
+        source = worker.require_source_readiness(as_of) if req.as_of_date is None else None
         producer_key = req.producer_id if req.producer_id is not None else "all"
-        key = cache.make_key("charts", f"{producer_key}:{top_n}", as_of)
+        key = cache.make_key("charts", f"{producer_key}:{req.top_n}", as_of)
         cached = cache.get(key)
+        if _cache_matches(cached, source):
+            return PlanCharts.model_validate(cached)
+
+        def build() -> None:
+            current = worker.require_source_readiness(as_of, force=True) if req.as_of_date is None else None
+            plan_input = None
+            if req.producer_id is None:
+                captured = cache.get(worker.cart_cache_key(as_of))
+                if worker.canonical_cart_payload_is_ready(
+                    captured, source_fingerprint=current.get("source_fingerprint") if current else None
+                ):
+                    plan_input = CartReplenishmentPlan.model_validate(captured)
+                elif req.as_of_date is None:
+                    raise worker.ProcurementBusinessReadinessError("canonical_cart_preparing")
+            else:
+                captured = cache.get(cache.make_key("producerfull", req.producer_id, as_of))
+                if _cache_matches(captured, current):
+                    plan_input = ProducerPurchasePlan.model_validate(captured)
+            charts = policy.build_charts(
+                req.producer_id,
+                as_of,
+                top_n=req.top_n,
+                source_fingerprint=current.get("source_fingerprint") if current else None,
+                plan_input=plan_input,
+            )
+            _save_captured(key, charts, current, 691200)
+
         if (
-            cached is not None
-            and (
-                source is None
-                or cached.get("_source_fingerprint")
-                == source.get("source_fingerprint")
+            req.producer_id is None
+            and req.as_of_date is None
+            and not worker.canonical_cart_payload_is_ready(
+                cache.get(worker.cart_cache_key(as_of)),
+                source_fingerprint=source.get("source_fingerprint") if source else None,
             )
         ):
-            METRICS.record_request((time.time() - started) * 1000)
-            log.info("plan_charts_cache_hit", producer_id=req.producer_id, top_n=top_n)
-            return PlanCharts.model_validate(cached)
-        if cached is not None:
-            cache.delete(key)
-        charts = policy.build_charts(
-            req.producer_id,
-            as_of,
-            top_n=top_n,
-            source_fingerprint=source.get("source_fingerprint") if source else None,
-        )
-        payload = charts.model_dump(mode="json")
-        if source is not None:
-            payload["_source_fingerprint"] = source.get("source_fingerprint")
-        cache.set(key, payload, ttl=691200)
-        METRICS.record_request((time.time() - started) * 1000)
-        log.info("plan_charts_built", producer_id=req.producer_id, top_n=top_n,
-                 top_items=len(charts.top_items), series=len(charts.demand_series))
-        return charts
+            _queue_canonical_cart(as_of)
+        REQUEST_WARMS.submit(key, build)
+        raise worker.ProcurementBusinessReadinessError("captured_plan_preparing")
     except worker.ProcurementBusinessReadinessError as exc:
-        METRICS.record_request((time.time() - started) * 1000, error=True)
         raise HTTPException(status_code=503, detail="procurement_business_data_not_ready") from exc
     except Exception as exc:  # noqa: BLE001
-        METRICS.record_request((time.time() - started) * 1000, error=True)
         err_id = uuid.uuid4().hex
-        log.error("plan_charts_failed", producer_id=req.producer_id, error_id=err_id, error=str(exc))
+        log.error("plan_charts_failed", error_id=err_id, failure_type=type(exc).__name__)
         raise HTTPException(status_code=500, detail=f"plan_charts_failed:{err_id}") from exc
 
 
 class ProducerProfileUpdate(BaseModel):
     producer_id: int = Field(strict=True, gt=0)
-    service_level_target: float | None = Field(
-        default=None, gt=0, lt=1, allow_inf_nan=False
-    )
-    lead_time_override_days: float | None = Field(
-        default=None, ge=0, le=730, allow_inf_nan=False
-    )
+    service_level_target: float | None = Field(default=None, gt=0, lt=1, allow_inf_nan=False)
+    lead_time_override_days: float | None = Field(default=None, ge=0, le=730, allow_inf_nan=False)
     ordering_cost_eur: float | None = Field(default=None, ge=0, allow_inf_nan=False)
-    holding_rate_pct: float | None = Field(
-        default=None, ge=0, le=100, allow_inf_nan=False
-    )
+    holding_rate_pct: float | None = Field(default=None, ge=0, le=100, allow_inf_nan=False)
     autonomy_level: int | None = Field(default=None, strict=True, ge=0, le=2)
     auto_place_max_eur: float | None = Field(default=None, ge=0, allow_inf_nan=False)
 
@@ -550,7 +492,8 @@ def get_product_terms(producer_id: int = Query(gt=0)) -> dict:
 def set_product_terms(req: ProductTermsUpdate) -> dict:
     try:
         result = masters.upsert_product_terms(
-            req.producer_id, req.product_id,
+            req.producer_id,
+            req.product_id,
             req.model_dump(exclude_none=True, exclude={"producer_id", "product_id"}),
         )
         cache.invalidate_plans(req.producer_id)
@@ -572,8 +515,9 @@ class FeedbackRequest(BaseModel):
 @app.post("/feedback")
 def record_feedback(req: FeedbackRequest) -> dict:
     try:
-        result = feedback.record(req.producer_id, req.product_id, req.suggested_qty,
-                                 req.final_qty, req.action, req.abc, _today())
+        result = feedback.record(
+            req.producer_id, req.product_id, req.suggested_qty, req.final_qty, req.action, req.abc, _today()
+        )
         cache.invalidate_plans(req.producer_id)
         return result
     except ValueError as exc:
@@ -588,8 +532,11 @@ def get_learned_factors(producer_id: int = Query(gt=0)) -> dict:
     return {
         "producer_id": producer_id,
         "factors": feedback.learned_factors(
-            producer_id, settings.feedback_min_samples,
-            settings.override_factor_min, settings.override_factor_max),
+            producer_id,
+            settings.feedback_min_samples,
+            settings.override_factor_min,
+            settings.override_factor_max,
+        ),
     }
 
 

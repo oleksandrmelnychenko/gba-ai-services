@@ -1,5 +1,8 @@
 """Unit tests for cart replenishment — mocked repo + per-producer plan, no DB."""
+
 from __future__ import annotations
+
+from native_cost_fixture import prepare_plan_stubs
 
 from app.domain.models import (
     MODEL_VERSION,
@@ -13,14 +16,21 @@ from app.services.replenishment import policy
 
 
 def _sug(product_id: int, producer_id: int, qty: float, urgency: Urgency, cover: float) -> ReorderSuggestion:
-    fc = DemandForecast(product_id=product_id, mean_daily=1.0, std_daily=0.0, method="t",
-                        horizon_days=30, forecast_units=30.0)
-    inv = InventoryPosition(product_id=product_id, on_hand=0, reserved=0, on_order=0,
-                            available=0, position=0)
+    fc = DemandForecast(
+        product_id=product_id, mean_daily=1.0, std_daily=0.0, method="t", horizon_days=30, forecast_units=30.0
+    )
+    inv = InventoryPosition(product_id=product_id, on_hand=0, reserved=0, on_order=0, available=0, position=0)
     return ReorderSuggestion(
-        product_id=product_id, producer_id=producer_id, suggested_qty=qty,
-        reorder_point=10.0, safety_stock=2.0, days_of_cover=cover,
-        urgency=urgency, forecast=fc, inventory=inv, reason="t",
+        product_id=product_id,
+        producer_id=producer_id,
+        suggested_qty=qty,
+        reorder_point=10.0,
+        safety_stock=2.0,
+        days_of_cover=cover,
+        urgency=urgency,
+        forecast=fc,
+        inventory=inv,
+        reason="t",
     )
 
 
@@ -29,14 +39,18 @@ def test_build_cart_plan_flattens_sorts_and_filters(monkeypatch):
 
     plans = {
         10: ProducerPurchasePlan(
-            producer_id=10, lead_time_days=5.0, item_count=2,
+            producer_id=10,
+            lead_time_days=5.0,
+            item_count=2,
             items=[
                 _sug(1, 10, 4.0, Urgency.NORMAL, 12.0),
                 _sug(2, 10, 0.0, Urgency.NONE, 99.0),
             ],
         ),
         20: ProducerPurchasePlan(
-            producer_id=20, lead_time_days=5.0, item_count=2,
+            producer_id=20,
+            lead_time_days=5.0,
+            item_count=2,
             items=[
                 _sug(3, 20, 6.0, Urgency.HIGH, 3.0),
                 _sug(4, 20, 9.0, Urgency.HIGH, 1.0),
@@ -45,9 +59,13 @@ def test_build_cart_plan_flattens_sorts_and_filters(monkeypatch):
     }
     monkeypatch.setattr(policy.classify_svc, "get_abc_map", lambda as_of, history_days: {})
     monkeypatch.setattr(policy.repo, "producer_names", lambda ids: {})
-    monkeypatch.setattr(policy, "build_plan",
-                        lambda pid, as_of, only_needed=True, abc_map=None, producer_name=None: plans[pid])
+    monkeypatch.setattr(
+        policy,
+        "build_plan",
+        lambda pid, as_of, only_needed=True, abc_map=None, producer_name=None, **kwargs: plans[pid],
+    )
 
+    prepare_plan_stubs(monkeypatch, plans, "2026-06-15")
     plan = policy.build_cart_plan("2026-06-15", only_needed=True, limit=200)
 
     assert plan.item_count == 3
@@ -71,14 +89,17 @@ def test_build_cart_plan_budget_knapsack(monkeypatch):
     c = _sug(3, 10, 5.0, Urgency.CRITICAL, 1.0)
     c.line_cost_eur = 80.0
     c.unit_margin_eur = 10.0
-    plan_obj = ProducerPurchasePlan(producer_id=10, lead_time_days=5.0,
-                                    items=[a, b, c], item_count=3)
+    plan_obj = ProducerPurchasePlan(producer_id=10, lead_time_days=5.0, items=[a, b, c], item_count=3)
     monkeypatch.setattr(policy.repo, "all_producers", lambda as_of, history_days: [10])
     monkeypatch.setattr(policy.classify_svc, "get_abc_map", lambda as_of, history_days: {})
     monkeypatch.setattr(policy.repo, "producer_names", lambda ids: {})
-    monkeypatch.setattr(policy, "build_plan",
-                        lambda pid, as_of, only_needed=True, abc_map=None, producer_name=None: plan_obj)
+    monkeypatch.setattr(
+        policy,
+        "build_plan",
+        lambda pid, as_of, only_needed=True, abc_map=None, producer_name=None, **kwargs: plan_obj,
+    )
 
+    prepare_plan_stubs(monkeypatch, {10: plan_obj}, "2026-06-15")
     plan = policy.build_cart_plan("2026-06-15", budget_eur=130.0)
 
     assert plan.selected_count == 2
@@ -89,6 +110,7 @@ def test_build_cart_plan_budget_knapsack(monkeypatch):
 
 def test_milp_finds_optimal_knapsack_beating_greedy():
     from app.services.optimization import milp
+
     values = [6.0, 5.0, 5.0]
     costs = [6.0, 5.0, 5.0]
     chosen, used_milp = milp.select_within_budget(values, costs, 10.0)
@@ -112,7 +134,9 @@ def test_milp_never_labels_an_unsolved_model_as_exact():
 def test_build_cart_plan_respects_limit(monkeypatch):
     monkeypatch.setattr(policy.repo, "all_producers", lambda as_of, history_days: [10])
     plan_obj = ProducerPurchasePlan(
-        producer_id=10, lead_time_days=5.0, item_count=3,
+        producer_id=10,
+        lead_time_days=5.0,
+        item_count=3,
         items=[
             _sug(1, 10, 5.0, Urgency.HIGH, 2.0),
             _sug(2, 10, 5.0, Urgency.HIGH, 3.0),
@@ -121,9 +145,13 @@ def test_build_cart_plan_respects_limit(monkeypatch):
     )
     monkeypatch.setattr(policy.classify_svc, "get_abc_map", lambda as_of, history_days: {})
     monkeypatch.setattr(policy.repo, "producer_names", lambda ids: {})
-    monkeypatch.setattr(policy, "build_plan",
-                        lambda pid, as_of, only_needed=True, abc_map=None, producer_name=None: plan_obj)
+    monkeypatch.setattr(
+        policy,
+        "build_plan",
+        lambda pid, as_of, only_needed=True, abc_map=None, producer_name=None, **kwargs: plan_obj,
+    )
 
+    prepare_plan_stubs(monkeypatch, {10: plan_obj}, "2026-06-15")
     plan = policy.build_cart_plan("2026-06-15", only_needed=True, limit=2)
 
     assert plan.item_count == 2
@@ -146,9 +174,10 @@ def test_build_cart_plan_includes_zero_quantity_items_when_requested(monkeypatch
     monkeypatch.setattr(
         policy,
         "build_plan",
-        lambda pid, as_of, only_needed=True, abc_map=None, producer_name=None: plan_obj,
+        lambda pid, as_of, only_needed=True, abc_map=None, producer_name=None, **kwargs: plan_obj,
     )
 
+    prepare_plan_stubs(monkeypatch, {10: plan_obj}, "2026-06-15")
     plan = policy.build_cart_plan("2026-06-15", only_needed=False, limit=-1)
 
     assert plan.item_count == 2
@@ -185,9 +214,10 @@ def test_build_cart_plan_keeps_one_cheapest_supplier_option_per_product(monkeypa
     monkeypatch.setattr(
         policy,
         "build_plan",
-        lambda pid, as_of, only_needed=True, abc_map=None, producer_name=None: plans[pid],
+        lambda pid, as_of, only_needed=True, abc_map=None, producer_name=None, **kwargs: plans[pid],
     )
 
+    prepare_plan_stubs(monkeypatch, plans, "2026-06-15")
     plan = policy.build_cart_plan("2026-06-15", only_needed=True, limit=-1)
 
     assert {(i.product_id, i.producer_id) for i in plan.items} == {(1, 20), (2, 20)}

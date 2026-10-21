@@ -77,7 +77,7 @@ def _payload() -> dict:
         "effective_start": "2026-03-27",
         "effective_history_days": 120,
         "history_complete": True,
-        "history_not_applicable": ["inventory", "reservations"],
+        "history_not_applicable": ["inventory", "reservations", "purchase_costs"],
         "model_version": MODEL_VERSION,
     }
 
@@ -187,7 +187,7 @@ def test_valid_buyer_cost_override_supersedes_sql_median(
 
 @pytest.mark.parametrize(
     "override",
-    [0, -1, True, float("nan"), float("inf"), "not-a-number"],
+    [-1, True, float("nan"), float("inf"), "not-a-number"],
 )
 def test_invalid_buyer_cost_override_fails_closed(override):
     facts = _facts()
@@ -195,10 +195,7 @@ def test_invalid_buyer_cost_override_fails_closed(override):
 
     issues, metrics = validate_canonical_plan(_payload(), facts, AS_OF)
 
-    assert any(
-        issue.code == "M008" and issue.key["product_id"] == 101
-        for issue in issues
-    )
+    assert any(issue.code == "M008" and issue.key["product_id"] == 101 for issue in issues)
     assert metrics["applied_unit_cost_overrides"] == 0
     assert metrics["invalid_unit_cost_overrides"] == 1
     assert exit_code_for_issues(issues) == ReconciliationExitCode.MONEY_OR_CONTRACT_MISMATCH
@@ -221,7 +218,8 @@ def test_override_loader_preserves_selected_valid_and_dirty_values(monkeypatch):
         lambda: SimpleNamespace(use_masters=True),
     )
 
-    def load_terms(producer_id: int, product_ids: list[int]) -> dict:
+    def load_terms(producer_id: int, product_ids: list[int], *, required: bool) -> dict:
+        assert required is True
         calls.append((producer_id, product_ids))
         return terms[producer_id]
 
@@ -340,3 +338,11 @@ def test_report_is_machine_serializable_with_stable_exit_contract():
     assert decoded["ok"] is True
     assert decoded["exit_code"] == 0
     assert decoded["metrics"]["money"] == "213.85"
+
+
+def test_zero_override_retains_existing_clear_override_semantics():
+    facts = _facts()
+    facts.unit_cost_overrides_by_pair[(501, 101)] = 0
+    issues, metrics = validate_canonical_plan(_payload(), facts, AS_OF)
+    assert not [issue for issue in issues if issue.severity == "error"]
+    assert metrics["applied_unit_cost_overrides"] == metrics["invalid_unit_cost_overrides"] == 0

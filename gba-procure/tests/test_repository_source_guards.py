@@ -4,6 +4,7 @@ No DB, no Redis: these inspect the live source text of app.data.supply_repositor
 reintroducing a previously-shipped correctness bug fails CI immediately. Each bug that was
 caught only by live smoke (mocked tests stayed green) gets a guard here.
 """
+
 from __future__ import annotations
 
 import inspect
@@ -121,8 +122,6 @@ def test_open_cockpit_draft_never_self_learns_as_factual_supply():
     It must not feed itself back into candidates, costs, MOQ, lead-time geography,
     readiness or on-order before it becomes a placed document.
     """
-    from app.data import cost_repository as cost_repo
-
     predicate = "NOT (sou.IsFromCockpit = 1 AND sou.IsPlaced = 0)"
     for fn in (
         repo.producer_lead_times,
@@ -132,7 +131,6 @@ def test_open_cockpit_draft_never_self_learns_as_factual_supply():
         repo.all_producers,
         repo.procurement_source_readiness,
         repo._on_order_chunk,
-        cost_repo._fetch_cost_rows,
     ):
         assert predicate in _src(fn), fn.__name__
 
@@ -186,9 +184,9 @@ def test_on_order_does_not_source_from_synthetic_supplyorderitem_placeholder():
     """on_order MUST NOT read SupplyOrderItem (synthetic placeholder for not-yet-arrived orders)
     nor filter on SupplyOrder.Created (the 1C-sync stamp ~now) -- those made it always empty."""
     src = _src(repo._on_order_chunk)
-    assert "SupplyOrderItem" not in src           # synthetic-placeholder table
-    assert "so.Created" not in src                # rewritten sync timestamp
-    assert "IsOrderArrived" not in src            # boolean had no per-item received granularity
+    assert "SupplyOrderItem" not in src  # synthetic-placeholder table
+    assert "so.Created" not in src  # rewritten sync timestamp
+    assert "IsOrderArrived" not in src  # boolean had no per-item received granularity
 
 
 def test_on_order_reconstructs_open_minus_received_over_real_product_spine():
@@ -298,23 +296,27 @@ def test_derive_moq_terms_uses_real_invoice_and_ua_lines_not_placeholder_items()
     assert "dbo.SupplyOrderItem soi" not in src
 
 
-def test_cost_repository_converts_unitprice_to_eur_via_agreement_currency():
-    from app.data import cost_repository as cost_repo
-    src = _src(cost_repo._fetch_cost_rows)
-    assert "GetExchangedToEuroValue" in src
-    assert "ClientAgreement" in src
-    assert "a.CurrencyID" in src
-    assert "sioi.UnitPrice" in src
-    assert "soui.UnitPrice" in src
-    assert ":syn" in src
+def test_cost_paths_do_not_execute_mutable_invoice_currency_udf():
+    from app.data import cost_repository
+    from app.services import reconciliation
+
+    for module in (cost_repository, reconciliation):
+        source = inspect.getsource(module)
+        assert "GetExchangedToEuroValue" not in source
+        if module is cost_repository:
+            assert "sioi.UnitPrice" not in source and "soui.UnitPrice" not in source
 
 
-def test_cost_repository_windows_trailing_cost_on_datefrom_not_created():
-    """Costs use the factual international/UA document dates, never the parent sync stamp."""
-    from app.data import cost_repository as cost_repo
-    src = _src(cost_repo._fetch_cost_rows)
-    assert "si.DateFrom >= DATEADD(day, -:days, :asof)" in src
-    assert "si.DateFrom < :asof" in src
-    assert "sou.FromDate >= DATEADD(day, -:days, :asof)" in src
-    assert "sou.FromDate < :asof" in src
-    assert "so.Created" not in src
+def test_cost_repository_passes_exact_exclusive_asof_to_verified_cohort(monkeypatch):
+    from native_cost_fixture import make_cohort
+
+    from app.data import cost_repository
+
+    cohort = make_cohort([1], as_of="2026-06-15", costs={(7, 1): ["1.0001", "1.0002"]})
+    assert cost_repository.producer_unit_costs_eur(7, [1], "2026-06-15", cohort=cohort) == {1: 1.0002}
+    import pytest
+
+    from app.data.native_purchase_costs import NativePurchaseCostError
+
+    with pytest.raises(NativePurchaseCostError):
+        cost_repository.producer_unit_costs_eur(7, [1], "2026-06-16", cohort=cohort)

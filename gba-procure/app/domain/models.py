@@ -1,8 +1,9 @@
 """Domain models for procurement / replenishment."""
+
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -12,8 +13,71 @@ from app.core.history import rolling_coverage
 _MODEL_SETTINGS = get_settings()
 MODEL_VERSION = (
     f"procure-hist{_MODEL_SETTINGS.history_days}-"
-    f"floor{_MODEL_SETTINGS.source_history_start_date:%Y%m%d}-v2"
+    f"floor{_MODEL_SETTINGS.source_history_start_date:%Y%m%d}-v4-verified-net-cost"
 )
+
+
+class CostReasonCount(BaseModel):
+    reason: str
+    count: int = Field(ge=1)
+
+
+class CostPublication(BaseModel):
+    for_amg: bool
+    receipt_id: str
+    committed_at_utc: str
+    contract_version: str
+    canonical_chain_sha256: str
+    validated_at_utc: str
+
+
+class CostObservationComponent(BaseModel):
+    component_id: str
+    version: Literal[1] = 1
+    product_ids: list[int]
+    supplier_id: int | None
+    as_of_exclusive: str
+    history_days: int
+    effective_start_date: str
+    observation_started_at_utc: str
+    observation_completed_at_utc: str
+    fingerprint: str
+    publications: list[CostPublication]
+
+
+class CostObservationManifest(BaseModel):
+    version: Literal[1] = 1
+    scope: Literal["CurrentPostedReceipts"] = "CurrentPostedReceipts"
+    resolver_version: str = "current-posted-receipt-cost-v1"
+    basis: Literal["net_goods_excluding_vat_delivery_customs"] = "net_goods_excluding_vat_delivery_customs"
+    statistic: Literal["observation_median_half_up_4"] = "observation_median_half_up_4"
+    snapshot_relationship: Literal["single_snapshot", "separate_snapshots", "empty_scope"] = "empty_scope"
+    components: list[CostObservationComponent] = Field(default_factory=list)
+
+
+class CostProvenance(BaseModel):
+    version: Literal[1] = 1
+    source: Literal["receipt_history", "buyer_supplied"] = "receipt_history"
+    scope: Literal["CurrentPostedReceipts", "BuyerSupplied"] = "CurrentPostedReceipts"
+    resolver_version: str | None = "current-posted-receipt-cost-v1"
+    basis: Literal["net_goods_excluding_vat_delivery_customs", "buyer_tax_basis_unverified"] = (
+        "net_goods_excluding_vat_delivery_customs"
+    )
+    statistic: Literal["observation_median_half_up_4", "buyer_override"] = "observation_median_half_up_4"
+    canonical_unit_cost_eur: str | None = None
+    current_unit_ids: list[int] = Field(default_factory=list)
+    supplier_client_agreement_ids: list[int] = Field(default_factory=list)
+    observation_count: int = 0
+    known_count: int = 0
+    unknown_count: int = 0
+    coverage: Literal["complete", "partial", "unknown", "no_observations", "buyer_supplied"] = (
+        "no_observations"
+    )
+    reason_counts: list[CostReasonCount] = Field(default_factory=list)
+    aggregation_reason: str | None = None
+    component_refs: list[str] = Field(default_factory=list)
+    budget_eligible: bool = False
+    budget_exclusion_reasons: list[str] = Field(default_factory=lambda: ["no_observations"])
 
 
 class HistoryContractModel(BaseModel):
@@ -25,8 +89,14 @@ class HistoryContractModel(BaseModel):
     effective_history_days: int = 0
     history_complete: bool = False
     history_not_applicable: list[str] = Field(
-        default_factory=lambda: ["inventory", "reservations"]
+        default_factory=lambda: ["inventory", "reservations", "purchase_costs"]
     )
+    history_scope: Literal["demand"] = "demand"
+    cost_observation_manifest: CostObservationManifest = Field(default_factory=CostObservationManifest)
+    cost_total_basis: Literal[
+        "net_goods_excluding_vat_delivery_customs", "includes_buyer_values_with_unverified_tax_basis"
+    ] = "net_goods_excluding_vat_delivery_customs"
+    cost_totals_certified: bool = False
     model_version: str = MODEL_VERSION
 
     @model_validator(mode="before")
@@ -41,16 +111,16 @@ class HistoryContractModel(BaseModel):
         )
         for key, item in coverage.as_metadata().items():
             result.setdefault(key, item)
-        result.setdefault("history_not_applicable", ["inventory", "reservations"])
+        result.setdefault("history_not_applicable", ["inventory", "reservations", "purchase_costs"])
         result.setdefault("model_version", MODEL_VERSION)
         return result
 
 
 class Urgency(StrEnum):
-    CRITICAL = "critical"   # already below safety stock / stocked out
-    HIGH = "high"           # will breach reorder point within lead time
-    NORMAL = "normal"       # replenish on schedule
-    NONE = "none"           # sufficient cover
+    CRITICAL = "critical"  # already below safety stock / stocked out
+    HIGH = "high"  # will breach reorder point within lead time
+    NORMAL = "normal"  # replenish on schedule
+    NONE = "none"  # sufficient cover
 
 
 class DemandForecast(BaseModel):
@@ -64,16 +134,18 @@ class DemandForecast(BaseModel):
 
 class InventoryPosition(BaseModel):
     product_id: int
-    on_hand: float = 0.0      # gross physical = ProductAvailability.Amount + active reservations
-    reserved: float = 0.0     # ProductReservation
-    on_order: float = 0.0     # packed/committed supply not yet received
-    available: float = 0.0    # on_hand - reserved
-    position: float = 0.0     # available + on_order
+    on_hand: float = 0.0  # gross physical = ProductAvailability.Amount + active reservations
+    reserved: float = 0.0  # ProductReservation
+    on_order: float = 0.0  # packed/committed supply not yet received
+    available: float = 0.0  # on_hand - reserved
+    position: float = 0.0  # available + on_order
 
 
 class CheaperAlt(BaseModel):
     producer_id: int
     cost_eur: float
+    cost_provenance: CostProvenance = Field(default_factory=CostProvenance)
+    comparison_basis: Literal["historical_net_goods"] = "historical_net_goods"
 
 
 class ReorderSuggestion(BaseModel):
@@ -100,6 +172,13 @@ class ReorderSuggestion(BaseModel):
     line_cost_eur: float | None = None
     unit_sale_eur: float | None = None
     unit_margin_eur: float | None = None
+    cost_provenance: CostProvenance = Field(default_factory=CostProvenance)
+    sale_price_basis: Literal["historical_recorded_tax_basis_unverified", "unavailable"] = "unavailable"
+    margin_unavailable_reason: Literal["sale_tax_basis_unverified"] = "sale_tax_basis_unverified"
+    service_level_basis: Literal["abc_fallback_with_optional_producer_floor"] = (
+        "abc_fallback_with_optional_producer_floor"
+    )
+    budget_priority_weight: float = 0.0
     applied_service_level: float | None = None
     abc: str | None = None
     xyz: str | None = None
@@ -144,12 +223,18 @@ class CartReplenishmentPlan(HistoryContractModel):
     budget_eur: float | None = None
     budget_used_eur: float | None = None
     value_captured_eur: float | None = None
+    budget_objective: Literal["urgency_weighted_lines"] | None = None
+    budget_score: float | None = None
+    budget_basis: Literal["net_goods_excluding_vat_delivery_customs"] = (
+        "net_goods_excluding_vat_delivery_customs"
+    )
     selected_count: int | None = None
     deferred_count: int | None = None
     method_used: str | None = None
 
 
 # --- dashboard chart data (derived from build_plan; no policy/forecast math change) ---
+
 
 class UrgencyMixBucket(BaseModel):
     urgency: Urgency

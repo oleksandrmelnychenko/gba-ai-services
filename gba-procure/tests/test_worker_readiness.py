@@ -1,9 +1,11 @@
 """Input-aware business-readiness guards for procurement warm-up jobs."""
+
 from __future__ import annotations
 
 from types import SimpleNamespace
 
 import pytest
+from native_cost_fixture import attach_cost_metadata, make_cohort
 
 from app.domain.models import MODEL_VERSION, CartReplenishmentPlan, PlanCharts
 from app.services.replenishment import worker
@@ -28,25 +30,27 @@ def _plan(item_count: int):
 
 
 def _canonical_zero_payload(source_fingerprint: str = "source-fp") -> dict:
-    return {
-        "as_of_date": "2026-06-15",
-        "source_history_start": "2025-01-01",
-        "effective_start": "2026-02-15",
-        "effective_history_days": 120,
-        "history_complete": True,
-        "history_not_applicable": ["inventory", "reservations"],
-        "model_version": MODEL_VERSION,
-        "item_count": 0,
-        "total_item_count": 0,
-        "is_truncated": False,
-        "duplicate_supplier_options_removed": 0,
-        "total_suggested_qty": 0.0,
-        "total_cost_eur": 0.0,
-        "priced_cost_eur": 0.0,
-        "unpriced_item_count": 0,
-        "items": [],
-        "_source_fingerprint": source_fingerprint,
-    }
+    return attach_cost_metadata(
+        {
+            "as_of_date": "2026-06-15",
+            "source_history_start": "2025-01-01",
+            "effective_start": "2026-02-15",
+            "effective_history_days": 120,
+            "history_complete": True,
+            "history_not_applicable": ["inventory", "reservations", "purchase_costs"],
+            "model_version": MODEL_VERSION,
+            "item_count": 0,
+            "total_item_count": 0,
+            "is_truncated": False,
+            "duplicate_supplier_options_removed": 0,
+            "total_suggested_qty": 0.0,
+            "total_cost_eur": 0.0,
+            "priced_cost_eur": 0.0,
+            "unpriced_item_count": 0,
+            "items": [],
+            "_source_fingerprint": source_fingerprint,
+        }
+    )
 
 
 def _canonical_item_payload() -> dict:
@@ -60,25 +64,27 @@ def _canonical_item_payload() -> dict:
         "forecast": {"product_id": 101},
         "inventory": {"product_id": 101},
     }
-    return {
-        "as_of_date": "2026-06-15",
-        "source_history_start": "2025-01-01",
-        "effective_start": "2026-02-15",
-        "effective_history_days": 120,
-        "history_complete": True,
-        "history_not_applicable": ["inventory", "reservations"],
-        "model_version": MODEL_VERSION,
-        "item_count": 1,
-        "total_item_count": 1,
-        "is_truncated": False,
-        "duplicate_supplier_options_removed": 0,
-        "total_suggested_qty": 3.0,
-        "total_cost_eur": 11.42,
-        "priced_cost_eur": 11.42,
-        "unpriced_item_count": 0,
-        "items": [item],
-        "_source_fingerprint": "source-fp",
-    }
+    return attach_cost_metadata(
+        {
+            "as_of_date": "2026-06-15",
+            "source_history_start": "2025-01-01",
+            "effective_start": "2026-02-15",
+            "effective_history_days": 120,
+            "history_complete": True,
+            "history_not_applicable": ["inventory", "reservations", "purchase_costs"],
+            "model_version": MODEL_VERSION,
+            "item_count": 1,
+            "total_item_count": 1,
+            "is_truncated": False,
+            "duplicate_supplier_options_removed": 0,
+            "total_suggested_qty": 3.0,
+            "total_cost_eur": 11.42,
+            "priced_cost_eur": 11.42,
+            "unpriced_item_count": 0,
+            "items": [item],
+            "_source_fingerprint": "source-fp",
+        }
+    )
 
 
 def test_warm_cart_persists_an_evaluated_zero_item_plan_when_inputs_are_ready(
@@ -90,6 +96,7 @@ def test_warm_cart_persists_an_evaluated_zero_item_plan_when_inputs_are_ready(
         total_item_count=0,
         total_cost_eur=0.0,
         as_of_date="2026-06-15",
+        cost_totals_certified=True,
     )
     monkeypatch.setattr(worker, "get_source_readiness", lambda *args, **kwargs: _source())
     monkeypatch.setattr(worker.policy, "build_cart_plan", lambda *args, **kwargs: empty_plan)
@@ -175,6 +182,10 @@ def test_source_readiness_fails_closed_when_required_masters_store_is_down(monke
 def test_full_producer_warm_accepts_zero_suggestions_when_inputs_are_ready(monkeypatch):
     monkeypatch.setattr(worker, "get_source_readiness", lambda *args, **kwargs: _source())
     monkeypatch.setattr(worker, "warm_producer_candidates", lambda as_of: [10, 20])
+    monkeypatch.setattr(worker.policy.repo, "products_for_producer", lambda *args: [])
+    monkeypatch.setattr(
+        worker, "read_purchase_cost_cohort", lambda *args: make_cohort([], as_of="2026-06-15")
+    )
     monkeypatch.setattr(worker.policy, "build_plan", lambda *args, **kwargs: _plan(0))
     writes = []
     monkeypatch.setattr(
@@ -197,15 +208,12 @@ def test_full_producer_warm_accepts_zero_suggestions_when_inputs_are_ready(monke
 def test_resume_uses_only_producer_cache_from_the_same_source_epoch(monkeypatch):
     monkeypatch.setattr(worker, "get_source_readiness", lambda *args, **kwargs: _source())
     monkeypatch.setattr(worker, "warm_producer_candidates", lambda as_of: [10, 20])
+    monkeypatch.setattr(worker.policy.repo, "products_for_producer", lambda *args: [])
+    monkeypatch.setattr(
+        worker, "read_purchase_cost_cohort", lambda *args: make_cohort([], as_of="2026-06-15")
+    )
     cached = {
-        worker.cache.make_key("producer", 10, "2026-06-15"): {
-            "item_count": 2,
-            "_source_fingerprint": "source-fp",
-        },
-        worker.cache.make_key("producer", 20, "2026-06-15"): {
-            "item_count": 0,
-            "_source_fingerprint": "source-fp",
-        },
+        worker.cache.make_key("producer", pid, "2026-06-15"): _canonical_zero_payload() for pid in (10, 20)
     }
     monkeypatch.setattr(worker.cache, "get", cached.get)
     monkeypatch.setattr(
@@ -223,8 +231,8 @@ def test_resume_uses_only_producer_cache_from_the_same_source_epoch(monkeypatch)
     assert result["business_ready"] is True
     assert result["ok"] == 0
     assert result["skipped"] == 2
-    assert result["nonempty_producers"] == 1
-    assert result["producer_items"] == 2
+    assert result["nonempty_producers"] == 0
+    assert result["producer_items"] == 0
 
 
 def test_zero_item_canonical_payload_is_structurally_valid_for_ready_source():
@@ -350,6 +358,7 @@ def test_warm_cart_fails_closed_when_redis_does_not_confirm_write(monkeypatch):
         total_item_count=0,
         total_cost_eur=0.0,
         as_of_date="2026-06-15",
+        cost_totals_certified=True,
     )
     monkeypatch.setattr(worker, "get_source_readiness", lambda *args, **kwargs: _source())
     monkeypatch.setattr(worker.policy, "build_cart_plan", lambda *args, **kwargs: empty_plan)
@@ -393,8 +402,11 @@ def test_warm_charts_refuses_stale_canonical_cart(monkeypatch):
     ):
         worker.warm_charts(as_of="2026-06-15")
 
-    assert worker.cache.make_key(
-        "charts",
-        f"all:{worker.CHARTS_TOP_N}",
-        "2026-06-15",
-    ) in deleted
+    assert (
+        worker.cache.make_key(
+            "charts",
+            f"all:{worker.CHARTS_TOP_N}",
+            "2026-06-15",
+        )
+        in deleted
+    )

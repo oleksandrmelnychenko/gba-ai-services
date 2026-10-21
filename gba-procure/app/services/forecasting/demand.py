@@ -25,8 +25,8 @@ from app.data import supply_repository as repo
 from app.domain.models import DemandForecast
 
 _METHOD_MOVING_AVG = "moving_average_v0"
-_METHOD_CROSTON = "croston_v1"
-_METHOD_SBA = "sba_v1"
+_METHOD_CROSTON = "croston_v2_inclusive_window"
+_METHOD_SBA = "sba_v2_inclusive_window"
 _METHOD_EWMA = "ewma_v2_calendar_daily"
 
 
@@ -172,7 +172,10 @@ def _croston_rate(
     else:
         window_start = effective_start
     intervals: list[float] = []
-    prev = window_start
+    # The explicit observation window is [start, end): start is period one.
+    # Anchor one day before it, as the monthly implementation anchors at -1.
+    # Preserve the legacy inferred-window fallback when no boundary was supplied.
+    prev = window_start - timedelta(days=1) if effective_start is not None else window_start
     for d in days:
         gap = (d - prev).days
         intervals.append(float(gap) if gap > 0 else 1.0)

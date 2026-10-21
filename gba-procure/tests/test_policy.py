@@ -1,9 +1,9 @@
 """Fast unit tests for procurement math — no DB/Redis (pure logic)."""
+
 from __future__ import annotations
 
-from decimal import Decimal
-
 import pytest
+from native_cost_fixture import make_cohort
 
 from app.data import cost_repository as cost_repo
 from app.data.db import in_clause
@@ -66,21 +66,14 @@ def test_buyer_unit_cost_override_wins_over_factual_cost():
     assert policy._resolved_unit_cost(10.0, None) == 10.0
 
 
-def test_supplier_cost_median_preserves_sql_decimal_precision(monkeypatch):
-    monkeypatch.setattr(
-        cost_repo,
-        "_fetch_cost_rows",
-        lambda product_ids, as_of, history_days, producer_id=None: [
-            {"pid": 1, "producer_id": 10, "cost_eur": Decimal("1.0001")},
-            {"pid": 1, "producer_id": 10, "cost_eur": Decimal("1.0002")},
-        ],
-    )
-
-    assert cost_repo.producer_unit_costs_eur(10, [1], "2026-07-25") == {1: 1.0002}
+def test_supplier_cost_median_preserves_verified_decimal_precision():
+    cohort = make_cohort([1], as_of="2026-07-25", costs={(10, 1): ["1.0001", "1.0002"]})
+    assert cost_repo.producer_unit_costs_eur(10, [1], "2026-07-25", cohort=cohort) == {1: 1.0002}
 
 
 def test_method_for_xyz_dispatch():
     from app.services.forecasting import demand as d
+
     assert d.method_for_xyz("Z") == "sba"
     assert d.method_for_xyz("Y") == "ewma"
     assert d.method_for_xyz("X") == "moving_avg"
@@ -89,6 +82,7 @@ def test_method_for_xyz_dispatch():
 
 def test_ewma_forecast_is_positive_and_tagged():
     from app.services.forecasting import demand as d
+
     rows = [{"d": f"2026-{m:02d}-15", "units": m * 10} for m in range(1, 7)]
     f = d.forecast_from_rows(1, rows, 30, method="ewma")
     assert f.method == "ewma_v2_calendar_daily"
@@ -97,18 +91,21 @@ def test_ewma_forecast_is_positive_and_tagged():
 
 def test_abc_from_revenue_pareto():
     from app.services.classify import segmentation as seg
+
     assert seg.abc_from_revenue({1: 80.0, 2: 15.0, 3: 5.0}) == {1: "A", 2: "B", 3: "C"}
     assert seg.abc_from_revenue({1: 0.0, 2: 0.0}) == {1: "C", 2: "C"}
 
 
 def test_abc_dominant_item_is_a():
     from app.services.classify import segmentation as seg
+
     assert seg.abc_from_revenue({1: 100.0}) == {1: "A"}
     assert seg.abc_from_revenue({1: 90.0, 2: 9.0, 3: 1.0})[1] == "A"
 
 
 def test_xyz_regular_vs_intermittent_and_zero_months():
     from app.services.classify import segmentation as seg
+
     regular = [{"d": f"2026-{m:02d}-15", "units": 10} for m in range(1, 7)]
     assert seg.xyz_from_daily(regular, "2026-06-30", 180)[0] == "X"
     assert seg.xyz_from_daily([{"d": "2026-01-15", "units": 60}], "2026-06-30", 180)[0] == "Z"
@@ -117,31 +114,33 @@ def test_xyz_regular_vs_intermittent_and_zero_months():
 
 
 def test_king_safety_stock_uses_lead_time_variance():
-    fc = DemandForecast(product_id=1, mean_daily=10.0, std_daily=3.0, method="t",
-                        horizon_days=30, forecast_units=300.0)
-    inv = InventoryPosition(product_id=1, on_hand=0, reserved=0, on_order=0,
-                            available=0, position=0)
-    with_lt_var = policy._suggest_one(1, 9, fc, inv, lead_time_days=30,
-                                      lead_time_std_days=15, z=2.3263, horizon=30)
-    demand_only = policy._suggest_one(1, 9, fc, inv, lead_time_days=30,
-                                      lead_time_std_days=0, z=2.3263, horizon=30)
+    fc = DemandForecast(
+        product_id=1, mean_daily=10.0, std_daily=3.0, method="t", horizon_days=30, forecast_units=300.0
+    )
+    inv = InventoryPosition(product_id=1, on_hand=0, reserved=0, on_order=0, available=0, position=0)
+    with_lt_var = policy._suggest_one(
+        1, 9, fc, inv, lead_time_days=30, lead_time_std_days=15, z=2.3263, horizon=30
+    )
+    demand_only = policy._suggest_one(
+        1, 9, fc, inv, lead_time_days=30, lead_time_std_days=0, z=2.3263, horizon=30
+    )
     assert with_lt_var.safety_stock > demand_only.safety_stock
     assert with_lt_var.safety_stock == pytest.approx(351.03, abs=0.5)
 
 
 def test_urgency_tracks_reorder_decision():
-    fc = DemandForecast(product_id=1, mean_daily=2.0, std_daily=1.0, method="t",
-                        horizon_days=30, forecast_units=60.0)
-    inv = InventoryPosition(product_id=1, on_hand=0, reserved=0, on_order=0,
-                            available=0, position=0)
-    sug = policy._suggest_one(1, 9, fc, inv, lead_time_days=10, lead_time_std_days=2,
-                              z=1.6449, horizon=30)
+    fc = DemandForecast(
+        product_id=1, mean_daily=2.0, std_daily=1.0, method="t", horizon_days=30, forecast_units=60.0
+    )
+    inv = InventoryPosition(product_id=1, on_hand=0, reserved=0, on_order=0, available=0, position=0)
+    sug = policy._suggest_one(1, 9, fc, inv, lead_time_days=10, lead_time_std_days=2, z=1.6449, horizon=30)
     assert sug.suggested_qty > 0
     assert sug.urgency != Urgency.NONE
 
 
 def test_abc_floor_lifts_low_margin_important_items():
     from app.core.config import get_settings
+
     s = get_settings()
     sl_a = policy._economic_service_level(10.1, 10.0, 30, 30, s, abc="A")
     sl_c = policy._economic_service_level(10.1, 10.0, 30, 30, s, abc="C")
@@ -151,6 +150,7 @@ def test_abc_floor_lifts_low_margin_important_items():
 
 def test_economic_service_level_bounds_and_monotonicity():
     from app.core.config import get_settings
+
     s = get_settings()
     assert policy._economic_service_level(5.0, 6.0, 30, 30, s) == s.service_level_min
     sl_low = policy._economic_service_level(50.5, 50.0, 30, 30, s)
@@ -160,10 +160,10 @@ def test_economic_service_level_bounds_and_monotonicity():
 
 
 def test_reorder_math_triggers_when_below_rop():
-    fc = DemandForecast(product_id=1, mean_daily=2.0, std_daily=1.0, method="t",
-                        horizon_days=30, forecast_units=60.0)
-    inv = InventoryPosition(product_id=1, on_hand=5, reserved=0, on_order=0,
-                            available=5, position=5)
+    fc = DemandForecast(
+        product_id=1, mean_daily=2.0, std_daily=1.0, method="t", horizon_days=30, forecast_units=60.0
+    )
+    inv = InventoryPosition(product_id=1, on_hand=5, reserved=0, on_order=0, available=5, position=5)
     sug = policy._suggest_one(1, 99, fc, inv, lead_time_days=10, z=1.6449, horizon=30)
     # lead_demand=20, safety=1.6449*sqrt(10)*1 ~= 5.2, ROP ~= 25.2 ; position 5 << ROP -> order
     assert sug.suggested_qty > 0
@@ -172,26 +172,27 @@ def test_reorder_math_triggers_when_below_rop():
 
 
 def test_no_order_when_well_stocked():
-    fc = DemandForecast(product_id=1, mean_daily=1.0, std_daily=0.0, method="t",
-                        horizon_days=30, forecast_units=30.0)
-    inv = InventoryPosition(product_id=1, on_hand=1000, reserved=0, on_order=0,
-                            available=1000, position=1000)
+    fc = DemandForecast(
+        product_id=1, mean_daily=1.0, std_daily=0.0, method="t", horizon_days=30, forecast_units=30.0
+    )
+    inv = InventoryPosition(product_id=1, on_hand=1000, reserved=0, on_order=0, available=1000, position=1000)
     sug = policy._suggest_one(1, 99, fc, inv, lead_time_days=10, z=1.6449, horizon=30)
     assert sug.suggested_qty == 0.0
     assert sug.urgency == Urgency.NONE
 
 
 def test_zero_demand_is_infinite_cover():
-    fc = DemandForecast(product_id=1, mean_daily=0.0, std_daily=0.0, method="t",
-                        horizon_days=30, forecast_units=0.0)
-    inv = InventoryPosition(product_id=1, on_hand=10, reserved=0, on_order=0,
-                            available=10, position=10)
+    fc = DemandForecast(
+        product_id=1, mean_daily=0.0, std_daily=0.0, method="t", horizon_days=30, forecast_units=0.0
+    )
+    inv = InventoryPosition(product_id=1, on_hand=10, reserved=0, on_order=0, available=10, position=10)
     sug = policy._suggest_one(1, 99, fc, inv, lead_time_days=10, z=1.6449, horizon=30)
     assert sug.suggested_qty == 0.0
 
 
 def test_lead_time_geo_fallback_by_currency(monkeypatch):
     from app.services.forecasting import lead_time as lt
+
     monkeypatch.setattr(lt.repo, "producer_lead_times", lambda pid, asof, lo, hi: [])
     monkeypatch.setattr(lt.repo, "producer_agreement_currency", lambda pid, asof: 10038)
     mean, std, src = lt.producer_lead_time(1, "2026-06-15")
@@ -204,26 +205,40 @@ def test_lead_time_geo_fallback_by_currency(monkeypatch):
 
 def test_seasonal_index_shrinks_and_bounds():
     from app.services.forecasting import demand as d
+
     assert d.seasonal_index_for([{"d": "2026-01-15", "units": 10}], 1, min_months=12) == 1.0
-    rows = [{"d": f"{y}-{m:02d}-15", "units": (100 if m == 6 else 10)}
-            for y in (2024, 2025) for m in range(1, 13)]
+    rows = [
+        {"d": f"{y}-{m:02d}-15", "units": (100 if m == 6 else 10)} for y in (2024, 2025) for m in range(1, 13)
+    ]
     idx_jun = d.seasonal_index_for(rows, 6, k=4, lo=0.6, hi=1.6, min_months=12)
     idx_jan = d.seasonal_index_for(rows, 1, k=4, lo=0.6, hi=1.6, min_months=12)
     assert idx_jun > idx_jan
     assert 0.6 <= idx_jan <= idx_jun <= 1.6
 
 
-@pytest.mark.parametrize("reserved,on_order,position,expected_qty", [
-    (0, 0, 20, 0), (15, 0, 5, 35), (15, 8, 13, 0), (25, 0, -5, 45),
-])
+@pytest.mark.parametrize(
+    "reserved,on_order,position,expected_qty",
+    [
+        (0, 0, 20, 0),
+        (15, 0, 5, 35),
+        (15, 8, 13, 0),
+        (25, 0, -5, 45),
+    ],
+)
 def test_reservations_and_incoming_supply_affect_actual_plan(
-    monkeypatch, reserved, on_order, position, expected_qty,
+    monkeypatch, reserved, on_order, position, expected_qty
 ):
     from app.core.config import get_settings
-    settings = get_settings().model_copy(update={
-        "use_masters": False, "use_feedback": False, "seasonality_enabled": False,
-        "economic_service_level": False, "forecast_horizon_days": 30,
-    })
+
+    settings = get_settings().model_copy(
+        update={
+            "use_masters": False,
+            "use_feedback": False,
+            "seasonality_enabled": False,
+            "economic_service_level": False,
+            "forecast_horizon_days": 30,
+        }
+    )
     monkeypatch.setattr(policy, "get_settings", lambda: settings)
     monkeypatch.setattr(policy.lead_time_svc, "producer_lead_time", lambda *a: (10.0, 0.0, "test"))
     monkeypatch.setattr(policy.repo, "products_for_producer", lambda *a: [1])
@@ -231,13 +246,25 @@ def test_reservations_and_incoming_supply_affect_actual_plan(
     monkeypatch.setattr(policy.repo, "reserved", lambda *a: {1: float(reserved)})
     monkeypatch.setattr(policy.repo, "on_order", lambda *a: {1: float(on_order)})
     monkeypatch.setattr(policy.repo, "product_daily_demand_bulk", lambda *a: {})
-    monkeypatch.setattr(policy.repo, "product_meta", lambda *a: {})
-    monkeypatch.setattr(policy.cost_repo, "producer_unit_costs_eur", lambda *a: {})
+    monkeypatch.setattr(policy.cost_repo, "producer_unit_costs_eur", lambda *a, **k: {})
     monkeypatch.setattr(policy.cost_repo, "sale_prices_eur", lambda *a: {})
-    monkeypatch.setattr(policy.cost_repo, "cheapest_alt_eur", lambda *a: {})
-    monkeypatch.setattr(policy.demand_svc, "forecast_from_rows", lambda *a, **kw: DemandForecast(
-        product_id=1, mean_daily=1.0, std_daily=0.0, method="test", horizon_days=30, forecast_units=30.0))
-    plan = policy.build_plan(99, "2026-09-07", only_needed=False, abc_map={1: "C"}, producer_name="Test")
+    monkeypatch.setattr(policy.cost_repo, "cheapest_alt_eur", lambda *a, **k: {})
+    monkeypatch.setattr(
+        policy.demand_svc,
+        "forecast_from_rows",
+        lambda *a, **kw: DemandForecast(
+            product_id=1, mean_daily=1.0, std_daily=0.0, method="test", horizon_days=30, forecast_units=30.0
+        ),
+    )
+    monkeypatch.setattr(policy.repo, "product_meta", lambda *a: {})
+    plan = policy.build_plan(
+        99,
+        "2026-09-07",
+        only_needed=False,
+        abc_map={1: "C"},
+        producer_name="Test",
+        cost_cohort=make_cohort([1], as_of="2026-09-07", costs={(99, 1): [None]}),
+    )
     item = plan.items[0]
     assert item.inventory.position == position
     assert item.inventory.available == 20 - reserved

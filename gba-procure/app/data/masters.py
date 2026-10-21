@@ -1,8 +1,10 @@
 """Buyer-maintained masters in MongoDB: per-producer profile + per (producer,product) terms.
 
-Graceful: a missing/unreachable Mongo yields empty masters (no rounding, no override) so the
-plan still builds. Collections live in the shared gba-nba Mongo instance, procure_ prefixed.
+Optional reads may return empty masters. Plan and reconciliation readers require successful
+reads so a store failure cannot remove buyer overrides or procurement constraints.
+Collections live in the shared gba-nba Mongo instance, procure_ prefixed.
 """
+
 from __future__ import annotations
 
 from datetime import date
@@ -12,10 +14,15 @@ from pymongo.collection import Collection
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
+from app.core.readiness import ProcurementBusinessReadinessError
 
 log = get_logger("masters")
 
 _client: MongoClient | None = None
+
+
+class MastersReadError(ProcurementBusinessReadinessError):
+    """Required buyer-maintained inputs could not be read; contains only a safe reason."""
 
 
 def _get_client() -> MongoClient | None:
@@ -50,35 +57,69 @@ def ensure_indexes() -> None:
     if pp is not None:
         pp.create_index([("producer_id", ASCENDING)], unique=True, name="uq_producer")
     if pt is not None:
-        pt.create_index([("producer_id", ASCENDING), ("product_id", ASCENDING)],
-                        unique=True, name="uq_producer_product")
+        pt.create_index(
+            [("producer_id", ASCENDING), ("product_id", ASCENDING)], unique=True, name="uq_producer_product"
+        )
 
 
-def producer_profile(producer_id: int) -> dict | None:
-    coll = _producer_profiles()
-    if coll is None:
-        return None
+def producer_profile(producer_id: int, *, required: bool = False) -> dict | None:
     try:
-        doc = coll.find_one({"producer_id": int(producer_id)}, {"_id": 0})
+        coll = _producer_profiles()
+        if coll is None:
+            if required:
+                raise MastersReadError("masters_store_unavailable")
+            return None
+        doc = coll.find_one({"producer_id": int(producer_id)}, {"_id": 0}, max_time_ms=2000)
         return doc
+    except MastersReadError:
+        raise
     except Exception as exc:  # noqa: BLE001
-        log.warning("producer_profile_read_failed", producer_id=producer_id, error=str(exc))
+        if required:
+            raise MastersReadError("masters_profile_read_failed") from exc
+        log.warning("producer_profile_read_failed", producer_id=producer_id, error_type=type(exc).__name__)
         return None
 
 
-def product_terms_for(producer_id: int, product_ids: list[int]) -> dict[int, dict]:
-    coll = _product_terms()
-    if coll is None or not product_ids:
+def product_terms_for(producer_id: int, product_ids: list[int], *, required: bool = False) -> dict[int, dict]:
+    if not product_ids:
         return {}
     try:
+        coll = _product_terms()
+        if coll is None:
+            if required:
+                raise MastersReadError("masters_store_unavailable")
+            return {}
         cur = coll.find(
             {"producer_id": int(producer_id), "product_id": {"$in": [int(p) for p in product_ids]}},
             {"_id": 0},
+            max_time_ms=2000,
         )
         return {int(d["product_id"]): d for d in cur}
+    except MastersReadError:
+        raise
     except Exception as exc:  # noqa: BLE001
-        log.warning("product_terms_read_failed", producer_id=producer_id, error=str(exc))
+        if required:
+            raise MastersReadError("masters_terms_read_failed") from exc
+        log.warning("product_terms_read_failed", producer_id=producer_id, error_type=type(exc).__name__)
         return {}
+
+
+def require_read_access() -> None:
+    """Bounded collection permission checks, including valid empty collections.
+
+    This is an early readiness check. Actual plan reads remain required independently;
+    an earlier successful probe never authorizes a later failed read.
+    """
+    for get_collection in (_producer_profiles, _product_terms):
+        try:
+            coll = get_collection()
+            if coll is None:
+                raise MastersReadError("masters_store_unavailable")
+            coll.find_one({}, {"_id": 1}, max_time_ms=2000)
+        except MastersReadError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise MastersReadError("masters_collections_unavailable") from exc
 
 
 def list_product_terms(producer_id: int) -> list[dict]:
@@ -112,7 +153,8 @@ def upsert_product_terms(producer_id: int, product_id: int, terms: dict) -> dict
     }
     coll.update_one(
         {"producer_id": int(producer_id), "product_id": int(product_id)},
-        {"$set": doc}, upsert=True,
+        {"$set": doc},
+        upsert=True,
     )
     return doc
 
@@ -164,7 +206,7 @@ def orphan_report() -> dict[str, dict] | None:
     def _alive(table: str, ids: list[int]) -> set[int]:
         alive: set[int] = set()
         for i in range(0, len(ids), 1000):
-            chunk = ids[i:i + 1000]
+            chunk = ids[i : i + 1000]
             if not chunk:
                 continue
             ph, params = in_clause("p", chunk)
@@ -181,10 +223,14 @@ def orphan_report() -> dict[str, dict] | None:
         dead_products = sorted(set(products) - _alive("Product", products))
         orphaned = 0
         if dead_producers or dead_products:
-            orphaned = coll.count_documents({"$or": [
-                {"producer_id": {"$in": dead_producers}},
-                {"product_id": {"$in": dead_products}},
-            ]})
+            orphaned = coll.count_documents(
+                {
+                    "$or": [
+                        {"producer_id": {"$in": dead_producers}},
+                        {"product_id": {"$in": dead_products}},
+                    ]
+                }
+            )
         out[name] = {
             "total": coll.count_documents({}),
             "orphaned": orphaned,
