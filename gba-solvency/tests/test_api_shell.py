@@ -7,6 +7,7 @@ import types
 from fastapi.testclient import TestClient
 
 from app.api import main
+from app.core.serving_context import observation_fields
 from app.domain.models import (
     DebtLoadSource,
     Rating,
@@ -31,6 +32,7 @@ def _fake_score(client_id: int) -> SolvencyScore:
         return_quality=SubFactor(value=1.0, points=10.0, weight=0.10),
     )
     return SolvencyScore(
+        as_of_date="2026-06-01", **observation_fields("2026-06-01"),
         client_id=client_id, score=85, rating=Rating.A, sub_factors=sf,
         caps_applied=[], debt_load_source=DebtLoadSource.LIVE_PROXY, raw_score=85.5,
     )

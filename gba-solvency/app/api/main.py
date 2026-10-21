@@ -12,6 +12,8 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import date
 
+from app.core.serving_context import ServingConfigurationError
+
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -279,6 +281,8 @@ def score(req: ScoreRequest) -> SolvencyScore:
         )
     except ClientIdentityMismatchError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ServingConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except LookupError as exc:
@@ -305,6 +309,8 @@ def score_batch(req: BatchScoreRequest) -> dict:
             window_months=req.window_months,
             use_cache=req.use_cache,
         )
+    except ServingConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
@@ -328,6 +334,8 @@ def charts(
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ServingConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001

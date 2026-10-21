@@ -5,15 +5,15 @@
   "reason": "insufficient_unique_positive_clients",
   "source_history_start": "2025-01-01",
   "minimum_unique_positive_clients": 30,
-  "observed_unique_positive_clients": 3,
-  "observed_positive_rows": 19,
-  "observed_atrisk_rows": 1074,
-  "dataset_sha256": "c07d45c44ac01a0ade4cac8f8bce2c99caad1c82466422bc2063f516756470b3",
+  "observed_unique_positive_clients": 0,
+  "observed_positive_rows": 0,
+  "observed_atrisk_rows": 1073,
+  "dataset_sha256": "f807fb2c0cf2de2e2f50da54ff7b981022db3ed6707b8d3b547307815d70e432",
   "dataset_lineage": {
     "lineage_schema_version": 1,
     "dataset_role": "forward_6m_training",
     "builder": "scripts/build_vintages.py",
-    "built_at": "2026-08-07T07:15:07+00:00",
+    "built_at": "2026-10-19T00:38:11+00:00",
     "source_history_start": "2025-01-01",
     "transactional_history_policy": "clamped_to_source_history_start",
     "current_state_exceptions": [
@@ -79,12 +79,12 @@
         "history_complete": false
       }
     ],
-    "rows": 32891,
-    "positives": 19,
-    "unique_clients": 4112,
-    "unique_positive_clients": 3,
+    "rows": 26208,
+    "positives": 0,
+    "unique_clients": 3276,
+    "unique_positive_clients": 0,
     "target_column": "forward_default",
-    "parquet_sha256": "c07d45c44ac01a0ade4cac8f8bce2c99caad1c82466422bc2063f516756470b3"
+    "parquet_sha256": "f807fb2c0cf2de2e2f50da54ff7b981022db3ed6707b8d3b547307815d70e432"
   },
-  "evaluated_at": "2026-08-07T07:15:36+00:00"
+  "evaluated_at": "2026-10-19T00:38:40+00:00"
 }

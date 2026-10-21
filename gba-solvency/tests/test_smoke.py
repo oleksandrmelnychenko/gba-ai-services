@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from app.core.config import Settings
 from app.data.db import in_clause
+from app.core.serving_context import observation_fields
 from app.domain.models import (
     AgingBar,
     CapType,
@@ -80,6 +81,7 @@ def test_score_contract_shape():
         return_quality=SubFactor(value=1.0, points=10.0, weight=0.10),
     )
     score = SolvencyScore(
+        as_of_date="2026-06-01", **observation_fields("2026-06-01"),
         client_id=42, score=85, rating=Rating.A, sub_factors=sf,
         caps_applied=[], debt_load_source=DebtLoadSource.LIVE_PROXY, raw_score=85.5,
     )
@@ -102,6 +104,7 @@ def test_caps_serialize_as_strings():
         return_quality=SubFactor(value=0.0, points=0.0, weight=0.10),
     )
     score = SolvencyScore(
+        as_of_date="2026-06-01", **observation_fields("2026-06-01"),
         client_id=1, score=20, rating=Rating.D, sub_factors=sf,
         caps_applied=[CapType.UTILIZATION_HARD_40, CapType.BLOCKED_HALF],
         debt_load_source=DebtLoadSource.DEBT_TABLE, raw_score=72.0,
@@ -115,11 +118,11 @@ def test_cache_key_stable_and_versioned():
     k1 = make_key(123, "2026-06-01", 12)
     k2 = make_key(123, "2026-06-01", 12)
     assert k1 == k2
-    assert k1.startswith("solv:response-v4:history-20250101:")
+    assert k1.startswith("solv:response-v5:history-20250101:")
     assert ":123:" in k1
     assert "creditscore-v3" in k1
     ck = make_charts_key(123, "2026-06-01", 12)
-    assert ck.startswith("solvchart:response-v4:history-20250101:")
+    assert ck.startswith("solvchart:response-v5:history-20250101:")
 
 
 def test_api_money_uses_half_up_and_rounds_only_after_aggregate():

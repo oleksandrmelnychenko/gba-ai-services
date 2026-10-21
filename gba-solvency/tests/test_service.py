@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import pytest
+from datetime import datetime, timezone
+from app.core import serving_context
+from app.core.serving_context import observation_fields
 
 from app.domain.models import (
     ClientIdentityMismatchError,
@@ -36,6 +39,12 @@ def _stub_current(band: str = "A", score: float = 100.0, pd: float = 0.001) -> d
         "model": "woe_logistic_scorecard_current_state",
         "model_version": "sev180-current-v1",
     }
+
+
+@pytest.fixture(autouse=True)
+def _fixed_serving_day(monkeypatch):
+    # Existing fixtures intentionally describe this day; the production clock is never bypassed.
+    monkeypatch.setattr(serving_context, "utc_now", lambda: datetime(2026, 6, 1, 9, tzinfo=timezone.utc))
 
 
 @pytest.fixture(autouse=True)
@@ -315,6 +324,7 @@ def test_score_client_cache_hit_hydrates(monkeypatch):
     from app.domain.models import Contribution, Risk90d, SolvencyScore
 
     cached_obj = SolvencyScore(
+        **observation_fields("2026-06-01"),
         client_id=9, applicable=True, score=46, rating=Rating.D, pd=0.65,
         contributions=[Contribution(feature="n_open_debt_lines", value=2.0, points=3.7)],
         risk_90d=Risk90d(
@@ -347,6 +357,7 @@ def test_score_client_rejects_legacy_forward_risk_cache(monkeypatch):
     from app.domain.models import Contribution, ForwardRisk, SolvencyScore
 
     cached_obj = SolvencyScore(
+        **observation_fields("2026-06-01"),
         client_id=9,
         applicable=True,
         score=46,
@@ -388,6 +399,7 @@ def test_score_client_rejects_internally_inconsistent_risk_cache(monkeypatch):
     from app.domain.models import Contribution, Risk90d, SolvencyScore
 
     cached_obj = SolvencyScore(
+        **observation_fields("2026-06-01"),
         client_id=9,
         applicable=True,
         score=46,
@@ -430,6 +442,7 @@ def test_score_client_ignores_cache_entry_for_another_client(monkeypatch):
     from app.domain.models import Contribution, Risk90d, SolvencyScore
 
     cached_obj = SolvencyScore(
+        **observation_fields("2026-06-01"),
         client_id=99, applicable=True, score=46, rating=Rating.D, pd=0.65,
         contributions=[Contribution(feature="n_open_debt_lines", value=2.0, points=3.7)],
         risk_90d=Risk90d(
@@ -469,11 +482,10 @@ def test_build_charts_assembles_from_repo(monkeypatch):
         "open_count": 1, "max_age_days": 10, "avg_age_days": 5.0})
     monkeypatch.setattr(service.repo, "total_sales_count", lambda *a, **k: 10)
 
-    from app.services.solvency import charts as charts_builder
-    monkeypatch.setattr(
-        charts_builder, "_score_sparkline",
-        lambda *a, **k: [],
-    )
+    def no_historical_features(*_args, **_kwargs):
+        raise AssertionError("charts must not recompute current features as historical scores")
+    monkeypatch.setattr(service.risk_dataset, "features_one", no_historical_features)
+    monkeypatch.setattr(service, "score_current", no_historical_features)
 
     out = service.build_charts(11, "2026-06-01", 12)
     assert out.limit_utilization_gauge.value == 0.8
@@ -486,66 +498,8 @@ def test_build_charts_assembles_from_repo(monkeypatch):
     assert out.aging_over_time_heatmap == "pending"
     assert len(out.turnover_trend) == 2
 
-
-def test_score_sparkline_uses_v3_score_current_not_legacy(monkeypatch):
-    """The score sparkline is on the v3 model: each month's point is features_one -> score_current
-    (the SAME supervised scorecard the headline /score uses), NOT the legacy stale-discipline
-    compute_score. We stub the v3 path to a per-month score keyed by the point-in-time as-of and
-    assert the points reflect score_current, that compute_score is never called, and that the
-    final point's as-of equals the chart as_of (so the last point matches the live /score).
-    """
-    from app.services.solvency import charts as charts_builder
-
-    seen_as_of: list[str] = []
-
-    def fake_features_one(client_id, as_of, window_months):
-        seen_as_of.append(as_of)
-        return {"as_of": as_of}  # carry the as-of through to the score stub
-
-    def fake_score_current(feats):
-        # deterministic, distinct per month so a wrong source/order is visible
-        return {"score": float(70 + int(feats["as_of"][8:10]) % 30)}
-
-    def _boom_legacy(*a, **k):  # the legacy path must NOT be touched anymore
-        raise AssertionError("legacy compute_score must not be called by the sparkline")
-
-    monkeypatch.setattr(charts_builder.risk_dataset, "features_one", fake_features_one)
-    monkeypatch.setattr(charts_builder, "score_current", fake_score_current)
-    monkeypatch.setattr(charts_builder.scoring, "compute_score", _boom_legacy)
-
-    as_of = "2026-06-26"
-    points = charts_builder._score_sparkline(411780, as_of, 12)
-
-    assert len(points) == 12
-    # contract shape is preserved: ScorePoint(period="YYYY-MM", score=int)
-    assert all(isinstance(p.score, int) for p in points)
-    assert points[-1].period == "2026-06"
-    # the LAST point is computed as-of the chart's own as_of (clamped) — matching the live /score.
-    # (months are fanned out, so seen_as_of order is non-deterministic; assert membership + the
-    # emitted point, which pool.map keeps in input order.)
-    assert as_of in seen_as_of
-    assert points[-1].score == int(round(fake_score_current({"as_of": as_of})["score"]))
-
-
-def test_score_sparkline_does_not_fabricate_pre_source_months(monkeypatch):
-    from app.services.solvency import charts as charts_builder
-
-    seen_as_of: list[str] = []
-    monkeypatch.setattr(
-        charts_builder.risk_dataset,
-        "features_one",
-        lambda _client_id, as_of, _window: seen_as_of.append(as_of) or {},
-    )
-    monkeypatch.setattr(charts_builder, "score_current", lambda _features: {"score": 50.0})
-
-    points = charts_builder._score_sparkline(411780, "2025-06-30", 12)
-
-    assert [point.period for point in points] == [
-        "2025-01",
-        "2025-02",
-        "2025-03",
-        "2025-04",
-        "2025-05",
-        "2025-06",
-    ]
-    assert all(as_of >= "2025-01-01" for as_of in seen_as_of)
+    assert out.score_sparkline == []
+    assert out.score_sparkline_status == "unavailable"
+    assert out.score_sparkline_reason_code == "historical_state_not_recorded"
+    assert out.score_sparkline_reason
+    assert out.fx_date == out.as_of_date

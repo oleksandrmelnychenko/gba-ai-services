@@ -22,6 +22,8 @@ Scenarios:
 """
 from __future__ import annotations
 
+from zoneinfo import ZoneInfo
+
 import os
 from datetime import UTC, datetime
 
@@ -29,7 +31,7 @@ import pytest
 
 pytestmark = pytest.mark.integration
 
-_AS_OF = os.environ.get("SOLVENCY_TEST_AS_OF", datetime.now(UTC).date().isoformat())
+_AS_OF = os.environ.get("SOLVENCY_TEST_AS_OF", datetime.now(ZoneInfo("Europe/Kyiv")).date().isoformat())
 SEV180_MIN_EUR = 100.0
 
 NONEXISTENT_CLIENT_ID = 999999999

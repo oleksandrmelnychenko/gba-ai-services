@@ -56,14 +56,18 @@ def test_forward_model_fails_closed_from_supported_status_evidence(
     monkeypatch, tmp_path
 ):
     status = tmp_path / "forward-status.json"
-    _write(status, json.loads(score_forward._STATUS.read_text()))
+    source = json.loads(score_forward._STATUS.read_text())
+    observed = source["observed_unique_positive_clients"]
+    assert source["minimum_unique_positive_clients"] == 30
+    assert observed < 30
+    _write(status, source)
     monkeypatch.setattr(score_forward, "_STATUS", status)
     score_forward._load_status.cache_clear()
     score_forward._load.cache_clear()
 
     with pytest.raises(
         score_forward.ForwardModelUnavailableError,
-        match="3 < 30 unique positive clients",
+        match=f"{observed} < 30 unique positive clients",
     ):
         score_forward.score_forward({"total_debt_eur": 100.0})
 

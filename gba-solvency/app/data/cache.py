@@ -24,7 +24,7 @@ from app.core.metrics import METRICS
 log = get_logger("cache")
 
 _RETRY_COOLDOWN_S = 30.0
-_RESPONSE_CONTRACT = "response-v4"
+_RESPONSE_CONTRACT = "response-v5"
 _client: redis.Redis | None = None
 _unavailable_until = 0.0
 

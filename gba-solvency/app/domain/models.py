@@ -7,7 +7,7 @@ from __future__ import annotations
 import uuid
 from datetime import date
 from enum import IntEnum, StrEnum
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -177,7 +177,22 @@ class Risk90d(BaseModel):
         return self
 
 
-class SolvencyScore(BaseModel):
+class CurrentObservation(BaseModel):
+    state_basis: Literal["current_observation"]
+    business_timezone: Literal["Europe/Kyiv"]
+    fx_date: str
+
+    @model_validator(mode="after")
+    def _current_observation_dates(self) -> Self:
+        as_of = getattr(self, "as_of_date", None)
+        if not isinstance(as_of, str) or date.fromisoformat(as_of).isoformat() != as_of:
+            raise ValueError("as_of_date must be an ISO calendar date")
+        if self.fx_date != as_of:
+            raise ValueError("fx_date must equal the current observation as_of_date")
+        return self
+
+
+class SolvencyScore(CurrentObservation):
     client_id: int
     client_net_uid: str | None = Field(
         default=None,
@@ -211,7 +226,7 @@ class SolvencyScore(BaseModel):
     effective_start: str | None = None
     history_complete: bool = True
     as_of_date: str | None = None
-    window_months: int = 12
+    window_months: int = Field(default=12, ge=12, le=12, strict=True)
     model_version: str = "creditscore-v3"
     current_model_run_id: str | None = None
 
@@ -265,14 +280,17 @@ class TrendPoint(BaseModel):
         return float(round_cent(value))
 
 
-class SolvencyCharts(BaseModel):
+class SolvencyCharts(CurrentObservation):
     client_id: int
     applicable: bool = True
     limit_utilization_gauge: GaugeChart
     payment_discipline_donut: list[DonutSlice]
     open_invoice_aging_bars: list[AgingBar]
     turnover_vs_exposure: list[TurnoverExposurePoint]
-    score_sparkline: list[ScorePoint]
+    score_sparkline: list[ScorePoint] = Field(max_length=0)
+    score_sparkline_status: Literal["unavailable", "not_applicable"]
+    score_sparkline_reason_code: Literal["historical_state_not_recorded", "client_not_buyer"]
+    score_sparkline_reason: str = Field(min_length=1)
     turnover_trend: list[TrendPoint]
     aging_over_time_heatmap: str = Field(
         default="pending",
@@ -282,8 +300,19 @@ class SolvencyCharts(BaseModel):
     effective_start: str | None = None
     history_complete: bool = True
     as_of_date: str | None = None
-    window_months: int = 12
-    model_version: str = "creditscore100-v2"
+    window_months: int = Field(default=12, ge=1, le=60, strict=True)
+    model_version: str = "creditscore-v3"
+
+    @model_validator(mode="after")
+    def _historical_score_unavailable(self) -> Self:
+        expected = ("unavailable", "historical_state_not_recorded") if self.applicable else (
+            "not_applicable", "client_not_buyer"
+        )
+        if (self.score_sparkline_status, self.score_sparkline_reason_code) != expected:
+            raise ValueError("score sparkline availability does not match client applicability")
+        if not self.score_sparkline_reason.strip():
+            raise ValueError("score sparkline reason must not be blank")
+        return self
 
 
 class ScoreRequest(BaseModel):
@@ -292,7 +321,7 @@ class ScoreRequest(BaseModel):
     )
     client_net_uid: str | None = Field(default=None, description="dbo.Client.NetUID alternative")
     as_of_date: date | None = None
-    window_months: int = Field(default=12, ge=1, le=60)
+    window_months: int = Field(default=12, ge=12, le=12, strict=True)
     use_cache: bool = True
 
     @model_validator(mode="after")
@@ -316,7 +345,7 @@ class ScoreRequest(BaseModel):
 class BatchScoreRequest(BaseModel):
     client_ids: list[int] = Field(..., min_length=1, max_length=500)
     as_of_date: date | None = None
-    window_months: int = Field(default=12, ge=1, le=60)
+    window_months: int = Field(default=12, ge=12, le=12, strict=True)
     use_cache: bool = True
 
     @field_validator("client_ids")

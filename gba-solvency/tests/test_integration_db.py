@@ -10,6 +10,8 @@ raise LookupError, and a real client must score within 0..100.
 """
 from __future__ import annotations
 
+from zoneinfo import ZoneInfo
+
 import os
 from datetime import UTC, datetime
 
@@ -65,7 +67,7 @@ skip_no_settings_db = pytest.mark.skipif(
     reason="DB settings unavailable; configure service .env or DB_* environment variables",
 )
 
-_CURRENT_AS_OF = datetime.now(UTC).strftime("%Y-%m-%d")
+_CURRENT_AS_OF = datetime.now(ZoneInfo("Europe/Kyiv")).strftime("%Y-%m-%d")
 _AS_OF = os.environ.get("SOLVENCY_TEST_AS_OF", _CURRENT_AS_OF)
 
 

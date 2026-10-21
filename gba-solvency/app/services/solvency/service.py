@@ -7,7 +7,12 @@ from datetime import datetime
 from pydantic import ValidationError
 
 from app.core.config import get_settings
-from app.core.history import coverage, require_supported_as_of
+from app.core.history import coverage
+from app.core.serving_context import (
+    NON_BUYER_SCORE_REASON,
+    observation_fields,
+    resolve_current_context,
+)
 from app.core.logging import get_logger
 from app.core.metrics import METRICS
 from app.data import cache
@@ -88,12 +93,7 @@ def _resolve_client_id(client_id: int | None, client_net_uid: str | None) -> int
     return resolved
 
 
-def _as_of(as_of_date: str | None) -> str:
-    resolved = as_of_date or datetime.now().strftime("%Y-%m-%d")
-    return require_supported_as_of(resolved).isoformat()
-
-
-def _hydrate_score(data: dict, expected_client_id: int) -> SolvencyScore | None:
+def _hydrate_score(data: dict, expected_client_id: int, as_of: str, window_months: int) -> SolvencyScore | None:
     """Rebuild a v3 SolvencyScore from a cached JSON dict (pydantic validates the shape).
 
     Entries cached before the data_sufficiency fields existed are treated as a miss (returns
@@ -114,7 +114,10 @@ def _hydrate_score(data: dict, expected_client_id: int) -> SolvencyScore | None:
         result = SolvencyScore.model_validate(data)
     except ValidationError:
         return None
-    if result.client_id != expected_client_id or result.as_of_date is None:
+    if (result.client_id != expected_client_id or result.as_of_date != as_of
+            or result.window_months != window_months
+            or not result.applicable
+            or result.model_version != get_settings().model_version):
         return None
     if (
         result.applicable
@@ -125,6 +128,13 @@ def _hydrate_score(data: dict, expected_client_id: int) -> SolvencyScore | None:
             or result.forward_risk_status != ForwardRiskStatus.NOT_APPLICABLE
             or result.forward_risk_reason != "replaced_by_operational_90d"
             or not result.current_model_run_id
+        )
+    ):
+        return None
+    if result.data_sufficiency == DataSufficiency.INSUFFICIENT and any(
+        value is not None for value in (
+            result.score, result.rating, result.pd, result.contributions, result.risk_90d,
+            result.forward_risk, result.current_model_run_id, result.currency_breakdown,
         )
     ):
         return None
@@ -151,10 +161,15 @@ def _hydrate_charts(
     }
     if not required_metadata.issubset(data):
         return None
-    result = SolvencyCharts.model_validate(data)
+    try:
+        result = SolvencyCharts.model_validate(data)
+    except ValidationError:
+        return None
     expected_history = coverage(as_of, window_months)
     if (
         result.client_id != expected_client_id
+        or not result.applicable
+        or result.model_version != get_settings().model_version
         or result.as_of_date != as_of
         or result.window_months != window_months
         or result.source_history_start
@@ -272,6 +287,7 @@ def _not_applicable(
         effective_start=history.effective_start.isoformat(),
         history_complete=history.history_complete,
         as_of_date=as_of,
+        **observation_fields(as_of),
         window_months=window_months,
         model_version=settings.model_version,
         current_model_run_id=None,
@@ -294,12 +310,17 @@ def _not_applicable_charts(cid: int, as_of: str, window_months: int) -> Solvency
         open_invoice_aging_bars=[],
         turnover_vs_exposure=[],
         score_sparkline=[],
+        score_sparkline_status="not_applicable",
+        score_sparkline_reason_code="client_not_buyer",
+        score_sparkline_reason=NON_BUYER_SCORE_REASON,
         turnover_trend=[],
         aging_over_time_heatmap="not_applicable",
+        model_version=get_settings().model_version,
         source_history_start=history.source_history_start.isoformat(),
         effective_start=history.effective_start.isoformat(),
         history_complete=history.history_complete,
         as_of_date=as_of,
+        **observation_fields(as_of),
         window_months=window_months,
     )
 
@@ -345,6 +366,7 @@ def _build_score(
             effective_start=history.effective_start.isoformat(),
             history_complete=history.history_complete,
             as_of_date=as_of,
+            **observation_fields(as_of),
             window_months=window_months,
             model_version=settings.model_version,
             current_model_run_id=None,
@@ -379,6 +401,7 @@ def _build_score(
         effective_start=history.effective_start.isoformat(),
         history_complete=history.history_complete,
         as_of_date=as_of,
+        **observation_fields(as_of),
         window_months=window_months,
         model_version=settings.model_version,
         current_model_run_id=current["model_version"],
@@ -401,7 +424,8 @@ def score_client(
     unavailable/null for backwards compatibility.
     """
     started = datetime.now()
-    as_of = _as_of(as_of_date)
+    context = resolve_current_context(as_of_date, window_months, scoring=True)
+    as_of = context.as_of
     cid = _resolve_client_id(client_id, client_net_uid)
     settings = get_settings()
 
@@ -423,7 +447,7 @@ def score_client(
     if use_cache:
         cached = cache.get(key)
         if cached is not None:
-            result = _hydrate_score(cached, cid)
+            result = _hydrate_score(cached, cid, as_of, window_months)
             if result is not None:
                 if client_net_uid is not None:
                     result = result.model_copy(
@@ -435,7 +459,7 @@ def score_client(
     error = False
     try:
         features = risk_dataset.features_one(cid, as_of, window_months)
-        fx_date = settings.resolve_fx_date(as_of_date)
+        fx_date = context.fx_date
         currency = _currency_breakdown(cid, as_of, window_months, fx_date)
         result = _build_score(
             cid,
@@ -493,9 +517,10 @@ def score_batch(
     isolated so one bad id never fails the batch.
     """
     started = datetime.now()
+    context = resolve_current_context(as_of_date, window_months, scoring=True)
     settings = get_settings()
-    fx_date = settings.resolve_fx_date(as_of_date)
-    as_of = _as_of(as_of_date)
+    fx_date = context.fx_date
+    as_of = context.as_of
 
     results: list[SolvencyScore] = []
     errors: list[dict] = []
@@ -518,7 +543,7 @@ def score_batch(
             if use_cache:
                 cached = cache.get(cache.make_key(cid, as_of, window_months))
                 if cached is not None:
-                    hydrated = _hydrate_score(cached, cid)
+                    hydrated = _hydrate_score(cached, cid, as_of, window_months)
                     if hydrated is not None:
                         resolved[cid] = hydrated
                         continue
@@ -588,7 +613,8 @@ def build_charts(
     window_months: int,
 ) -> SolvencyCharts:
     started = datetime.now()
-    as_of = _as_of(as_of_date)
+    context = resolve_current_context(as_of_date, window_months, scoring=False)
+    as_of = context.as_of
     if not repo.client_exists(client_id):
         raise LookupError(f"client_id not found: {client_id}")
 
@@ -607,7 +633,7 @@ def build_charts(
             METRICS.record_request((datetime.now() - started).total_seconds() * 1000)
             return result
 
-    result = charts_builder.build_charts(client_id, as_of, window_months)
+    result = charts_builder.build_charts(client_id, as_of, window_months, context=context)
     cache.set(key, result.model_dump(mode="json"))
 
     latency = (datetime.now() - started).total_seconds() * 1000
