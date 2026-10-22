@@ -37,16 +37,26 @@
     {
       "service": "gba-procure",
       "deployment_working_directory": "/root/projects/gba-procure",
-      "standalone_source_commit": "3900a7ceb2d0a4ab8195c1940ce09e19a41050a0",
-      "standalone_source_tree": "09737ba3b81f5f56f90b4ff1e46755a792d9aab8",
+      "standalone_source_commit": "804f29dd94a2e717f80abdbf80d0178f1442cd41",
+      "standalone_source_tree": "1dd470cad93991200971ab1c65ae80c5a8a71c01",
       "standalone_worktree_clean_at_review": true,
       "published_subdirectory": "gba-procure",
-      "integrated_subtree_tree": "09737ba3b81f5f56f90b4ff1e46755a792d9aab8",
-      "byte_identical_tracked_files": 75,
-      "standalone_tracked_files": 75,
+      "integrated_subtree_tree": "1dd470cad93991200971ab1c65ae80c5a8a71c01",
+      "byte_identical_tracked_files": 76,
+      "standalone_tracked_files": 76,
       "files_different_from_deployment_snapshot": [],
       "files_only_in_publication_tree": [],
-      "status": "running deployment snapshot; tracked tree exactly matches published subtree"
+      "status": "running deployment snapshot; tracked tree exactly matches published subtree",
+      "deployment_review_date": "2026-10-22",
+      "published_content_commit": "77a75450ab2392bc60ad8553f2e8a0eefb44d169",
+      "web_deployment": {
+        "service": "gba-procure.service",
+        "scope": "Shared DEV/QA; PROD endpoint unconfigured",
+        "startup_warm_enabled": false,
+        "workers_and_schedulers_restarted": false,
+        "health_http_status": 200,
+        "source_history_start": "2025-01-01"
+      }
     },
     {
       "service": "gba-products",
