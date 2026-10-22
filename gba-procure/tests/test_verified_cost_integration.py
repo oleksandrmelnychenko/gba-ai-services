@@ -420,3 +420,25 @@ def test_reconciliation_does_not_treat_missing_scalar_as_confirmed_zero(captured
     row["unit_cost_eur"] = row["line_cost_eur"] = None
     issues, _ = recon.validate_canonical_plan(payload, source_facts(plan, cohort), "2026-09-08")
     assert {"M002", "M003"}.issubset({issue.code for issue in issues})
+
+
+def test_cached_legacy_charts_gain_evidence_without_queue_or_generation(captured, api_memory, monkeypatch):
+    plan, _ = captured
+    store, jobs = api_memory
+    monkeypatch.setattr(policy.repo, "product_daily_demand_bulk", lambda *a: {})
+    charts = policy.build_charts(None, "2026-09-08", top_n=15, plan_input=plan)
+    raw = charts.model_dump(mode="json")
+    raw.pop("population")
+    for item in raw["top_items"]:
+        item.pop("evidence")
+    raw["_source_fingerprint"] = "same"
+    payload = plan.model_dump(mode="json")
+    payload["_source_fingerprint"] = "same"
+    store[main.cache.make_key("charts", "all:15", "2026-09-08")] = raw
+    store[worker.cart_cache_key("2026-09-08")] = payload
+    monkeypatch.setattr(policy, "build_charts", lambda *a, **k: pytest.fail("must not generate"))
+    result = main.plan_charts(main.PlanChartsRequest())
+    assert result.population.item_count == len(plan.items)
+    assert all(item.evidence is not None for item in result.top_items)
+    assert not jobs
+    assert "population" not in raw  # no cache write

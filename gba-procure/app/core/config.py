@@ -36,6 +36,8 @@ class Settings(BaseSettings):
 
     api_host: str = "0.0.0.0"
     api_port: int = 8001
+    # Web-only maintenance deployments may preserve caches without starting work.
+    warm_on_startup: bool = True
     log_level: str = "INFO"
 
     # Shared secret the trusted gba-server proxy must present (X-Internal-Api-Key).

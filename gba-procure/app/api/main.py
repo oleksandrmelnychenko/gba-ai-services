@@ -137,7 +137,8 @@ async def lifespan(app: FastAPI):
     get_engine()
     if not settings.internal_api_key:
         log.warning("internal_api_key_not_set", note="gba-procure running OPEN — set INTERNAL_API_KEY")
-    threading.Thread(target=_warm_cart_on_startup, daemon=True, name="cart-warm").start()
+    if settings.warm_on_startup:
+        threading.Thread(target=_warm_cart_on_startup, daemon=True, name="cart-warm").start()
     threading.Thread(target=_report_mongo_orphans, daemon=True, name="mongo-orphan-check").start()
     log.info("service_starting", service="gba-procure")
     yield
@@ -388,7 +389,15 @@ def plan_charts(req: PlanChartsRequest) -> PlanCharts:
         key = cache.make_key("charts", f"{producer_key}:{req.top_n}", as_of)
         cached = cache.get(key)
         if _cache_matches(cached, source):
-            return PlanCharts.model_validate(cached)
+            charts = PlanCharts.model_validate(cached)
+            if charts.population is None:
+                plan_key = worker.cart_cache_key(as_of) if req.producer_id is None else cache.make_key("producerfull", req.producer_id, as_of)
+                captured = cache.get(plan_key)
+                if (_cache_matches(captured, source) and captured.get("_source_fingerprint") == cached.get("_source_fingerprint")
+                        and bool(cached.get("_source_fingerprint"))):
+                    plan_type = CartReplenishmentPlan if req.producer_id is None else ProducerPurchasePlan
+                    charts = policy.enrich_captured_charts(charts, plan_type.model_validate(captured))
+            return charts
 
         def build() -> None:
             current = worker.require_source_readiness(as_of, force=True) if req.as_of_date is None else None

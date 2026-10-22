@@ -162,3 +162,41 @@ def test_build_charts_cart_wide_uses_cart_plan(monkeypatch):
     assert charts.producer_id is None
     assert seen["limit"] == -1  # unlimited cart for full chart distribution
     assert charts.top_items[0].product_id == 1
+
+
+def test_population_and_evidence_do_not_shrink_with_top_n(monkeypatch):
+    items = [_sug(i, float(i), Urgency.HIGH, 2.0) for i in range(1, 21)]
+    items[0].unit_cost_eur = 0.0
+    items[0].line_cost_eur = 0.0  # legitimate known zero, not missing cost
+    monkeypatch.setattr(policy, "build_plan", lambda *a, **k: _plan(items))
+    monkeypatch.setattr(policy.repo, "product_daily_demand_bulk", lambda *a: {})
+    small = policy.build_charts(99, "2026-10-22", top_n=1)
+    large = policy.build_charts(99, "2026-10-22", top_n=20)
+    assert small.population == large.population
+    assert small.population.item_count == 20
+    assert small.population.total_suggested_qty == 210
+    assert small.population.unpriced_item_count == 19
+    assert small.population.budget_eur is None
+    assert small.population.approval_status == "not_provided"
+    assert small.top_items[0].evidence.line_cost_eur is None
+    zero = next(row for row in large.top_items if row.product_id == 1)
+    assert zero.evidence.line_cost_eur == 0
+    assert zero.evidence.forecast_method == "t"
+    assert zero.evidence.inventory.available == 0
+
+
+def test_legacy_chart_enrichment_is_read_only_and_rejects_mixed_plan(monkeypatch):
+    items = [_sug(1, 5.0, Urgency.HIGH, 2.0), _sug(2, 7.0, Urgency.CRITICAL, 1.0)]
+    plan = _plan(items).model_copy(update={"as_of_date": "2026-10-22"})
+    monkeypatch.setattr(policy.repo, "product_daily_demand_bulk", lambda *a: {})
+    charts = policy.build_charts(99, "2026-10-22", top_n=1, plan_input=plan)
+    legacy = charts.model_copy(update={"population": None, "top_items": [row.model_copy(update={"evidence": None}) for row in charts.top_items]})
+    monkeypatch.setattr(policy.repo, "product_daily_demand_bulk", lambda *a: (_ for _ in ()).throw(AssertionError("must not query")))
+    enriched = policy.enrich_captured_charts(legacy, plan)
+    assert enriched.population.item_count == 2
+    assert enriched.population.total_suggested_qty == 12
+    assert enriched.top_items[0].evidence.forecast_method == "t"
+    assert legacy.population is None
+    assert policy.enrich_captured_charts(legacy, plan.model_copy(update={"as_of_date": "2026-10-21"})).population is None
+    mismatched = plan.model_copy(update={"items": [items[0], items[1].model_copy(update={"suggested_qty": 8})]})
+    assert policy.enrich_captured_charts(legacy, mismatched).population is None

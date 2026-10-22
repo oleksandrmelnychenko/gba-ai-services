@@ -246,7 +246,32 @@ class DaysOfCoverBucket(BaseModel):
     count: int
 
 
+class ChartItemEvidence(BaseModel):
+    inventory: InventoryPosition
+    forecast_method: str
+    forecast_units: float
+    forecast_horizon_days: int
+    unit_cost_eur: float | None
+    line_cost_eur: float | None
+    cost_coverage: str
+    budget_eligible: bool
+    budget_exclusion_reasons: list[str]
+    reason: str
+
+
+class ChartPopulation(BaseModel):
+    scope: Literal["supplier_assortment", "needed_cart"]
+    item_count: int
+    unique_product_count: int
+    total_suggested_qty: float
+    unpriced_item_count: int
+    budget_ineligible_item_count: int
+    budget_eur: float | None = None
+    approval_status: Literal["not_provided"] = "not_provided"
+
+
 class TopItem(BaseModel):
+    evidence: ChartItemEvidence | None = None
     product_id: int
     product_name: str | None = None
     vendor_code: str | None = None
@@ -278,6 +303,8 @@ class DemandSeries(BaseModel):
 
 
 class PlanCharts(HistoryContractModel):
+    # Null on legacy caches: absence must not be represented as zero/full coverage.
+    population: ChartPopulation | None = None
     producer_id: int | None = None
     top_n: int = 15
     urgency_mix: list[UrgencyMixBucket]

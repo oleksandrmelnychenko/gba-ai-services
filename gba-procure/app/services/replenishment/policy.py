@@ -43,6 +43,8 @@ from app.domain.models import (
     ProducerPurchasePlan,
     ReorderSuggestion,
     TopItem,
+    ChartItemEvidence,
+    ChartPopulation,
     Urgency,
     UrgencyMixBucket,
 )
@@ -934,6 +936,7 @@ def build_charts(
             on_hand=it.inventory.on_hand,
             reorder_point=it.reorder_point,
             urgency=it.urgency,
+            evidence=_chart_item_evidence(it),
         )
         for it in ranked[:top_n]
     ]
@@ -952,6 +955,7 @@ def build_charts(
     )
 
     return PlanCharts(
+        population=_chart_population(plan, producer_id),
         producer_id=producer_id,
         as_of_date=as_of,
         top_n=top_n,
@@ -964,3 +968,46 @@ def build_charts(
         cost_totals_certified=plan.cost_totals_certified,
         **coverage.as_metadata(),
     )
+
+
+def _chart_item_evidence(item: ReorderSuggestion) -> ChartItemEvidence:
+    return ChartItemEvidence(
+        inventory=item.inventory, forecast_method=item.forecast.method,
+        forecast_units=item.forecast.forecast_units, forecast_horizon_days=item.forecast.horizon_days,
+        unit_cost_eur=item.unit_cost_eur, line_cost_eur=item.line_cost_eur,
+        cost_coverage=item.cost_provenance.coverage, budget_eligible=item.cost_provenance.budget_eligible,
+        budget_exclusion_reasons=item.cost_provenance.budget_exclusion_reasons, reason=item.reason,
+    )
+
+
+def _chart_population(plan, producer_id: int | None) -> ChartPopulation:
+    return ChartPopulation(
+        scope="supplier_assortment" if producer_id is not None else "needed_cart",
+        item_count=len(plan.items), unique_product_count=len({item.product_id for item in plan.items}),
+        total_suggested_qty=sum(item.suggested_qty for item in plan.items),
+        unpriced_item_count=sum(item.line_cost_eur is None for item in plan.items),
+        budget_ineligible_item_count=sum(not item.cost_provenance.budget_eligible for item in plan.items),
+        budget_eur=getattr(plan, "budget_eur", None),
+    )
+
+
+def enrich_captured_charts(charts: PlanCharts, plan) -> PlanCharts:
+    """Add evidence from the same cached plan; no SQL, generation, ranking or writes."""
+    if charts.as_of_date != plan.as_of_date or charts.producer_id != getattr(plan, "producer_id", None):
+        return charts
+    if getattr(plan, "is_truncated", False) or plan.item_count != len(plan.items):
+        return charts
+    if charts.cost_observation_manifest != plan.cost_observation_manifest:
+        return charts
+    if sum(bucket.count for bucket in charts.urgency_mix) != len(plan.items):
+        return charts
+    items = {(item.product_id, item.producer_id): item for item in plan.items}
+    for top in charts.top_items:
+        item = items.get((top.product_id, top.producer_id))
+        if (item is None or item.suggested_qty != top.suggested_qty or item.urgency != top.urgency
+                or item.inventory.on_hand != top.on_hand or item.reorder_point != top.reorder_point):
+            return charts
+    return charts.model_copy(update={
+        "population": _chart_population(plan, charts.producer_id),
+        "top_items": [top.model_copy(update={"evidence": _chart_item_evidence(items[(top.product_id, top.producer_id)])}) for top in charts.top_items],
+    })
