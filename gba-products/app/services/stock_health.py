@@ -47,7 +47,6 @@ def snapshot(as_of: str) -> dict:
         velocity[pid] = exact.decimal_value(
             row.get("sold_qty") or 0,
             "sales_velocity.sold_qty",
-            non_negative=True,
         )
     sold_recently = {
         exact.positive_int(product_id, "sold_product_ids.product_id")
@@ -84,7 +83,7 @@ def snapshot(as_of: str) -> dict:
         sold_qty = velocity.get(pid, Decimal("0"))
         if velocity_days == 0 and sold_qty > 0:
             raise ValueError("sales velocity has demand outside the effective history window")
-        daily_rate = sold_qty / Decimal(velocity_days) if velocity_days > 0 else Decimal("0")
+        daily_rate = max(Decimal(0), sold_qty) / Decimal(velocity_days) if velocity_days > 0 else Decimal("0")
         band = classify_band(float(qty), float(daily_rate), pid in sold_recently, cfg)
         cover = (qty / daily_rate) if daily_rate > 0 else None
         row_qty = exact.quantity(qty, "qty_on_hand")
@@ -98,6 +97,7 @@ def snapshot(as_of: str) -> dict:
                 "qty_on_hand": row_qty,
                 "eur_value": row_eur,
                 "valuation_available": valuation_available,
+                "demand_adjustments_present": sold_qty < 0,
                 "cover_days": exact.cover_days(cover) if cover is not None else None,
                 "band": band.value,
             }

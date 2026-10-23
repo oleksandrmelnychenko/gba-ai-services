@@ -169,3 +169,15 @@ def test_region_filter_keeps_global_and_regional_uncertainty_separate():
     assert row["net_revenue_eur"] is None
     assert row["regional_unresolved_amount_count"] == 0
     assert row["regional_net_revenue_eur"] == 20
+
+
+def test_stock_snapshot_accepts_signed_sales_adjustment_without_changing_stock(monkeypatch):
+    from app.services import stock_health
+    monkeypatch.setattr(stock_health.sig, "on_hand_stock", lambda: [{"product_id": 42, "qty_on_hand": 2, "eur_value": 10, "unit_cost_eur": 5}])
+    monkeypatch.setattr(stock_health.sig, "sales_velocity", lambda *_: [{"product_id": 42, "sold_qty": -1}])
+    monkeypatch.setattr(stock_health.sig, "sold_product_ids", lambda *_: {42})
+    snapshot = stock_health.snapshot("2026-10-24")
+    assert snapshot["total_qty"] == 2
+    assert snapshot["total_eur_value"] == 10
+    assert snapshot["rows"][0]["demand_adjustments_present"] is True
+    assert snapshot["rows"][0]["cover_days"] is None
