@@ -20,6 +20,7 @@ from app.core.logging import get_logger
 from app.core.metrics import METRICS
 from app.core.source import validate_source_database
 from app.data import cache
+from app.data import canonical_sales as canonical
 from app.data import signals_repository as sig
 from app.data.db import dispose, get_engine
 from app.domain.models import (
@@ -140,6 +141,8 @@ _HISTORY_RESPONSE_FIELDS = (
     "history_complete",
     "history_fingerprint",
     "history_windows",
+    "time_zone", "sales_basis", "net_sales_basis", "margin_basis",
+    "import_completeness_confirmed", "period_end_exclusive", "period_end_inclusive",
 )
 
 
@@ -383,12 +386,19 @@ def _regional_sales(as_of: str, window_days: int, region_id: int) -> list[dict]:
     return rows
 
 
+def _public_financial_values(row: dict) -> dict:
+    fields = ("revenue_eur", "gross_revenue_eur", "returned_value_eur", "known_returned_value_eur",
+              "net_revenue_eur", "known_net_revenue_eur", "regional_net_revenue_eur", "regional_known_net_revenue_eur")
+    return {field: None if row[field] is None else exact.money(row[field], field, non_negative=False)
+            for field in fields if field in row}
+
+
 def _normalize_product_region_rows(rows: list[dict]) -> list[dict]:
     normalized: list[dict] = []
-    identities: set[tuple[int, int]] = set()
+    identities: set[tuple[int, int | None]] = set()
     for row in rows:
         pid = exact.positive_int(row.get("product_id"), "regional product_id")
-        rid = exact.positive_int(row.get("region_id"), "regional region_id")
+        rid = None if row.get("region_id") is None else exact.positive_int(row["region_id"], "regional region_id")
         identity = (pid, rid)
         if identity in identities:
             raise ValueError(f"duplicate regional product identity {identity}")
@@ -396,15 +406,16 @@ def _normalize_product_region_rows(rows: list[dict]) -> list[dict]:
         normalized.append(
             {
                 **row,
+                **_public_financial_values(row),
                 "product_id": pid,
                 "region_id": rid,
                 "regional_units": exact.quantity(
                     row.get("regional_units") or 0,
-                    "regional_units",
+                    "regional_units", non_negative=False,
                 ),
                 "regional_revenue_eur": exact.money(
                     row.get("regional_revenue_eur") or 0,
-                    "regional_revenue_eur",
+                    "regional_revenue_eur", non_negative=False,
                 ),
                 "regional_order_count": exact.non_negative_int(
                     row.get("regional_order_count") or 0,
@@ -421,15 +432,16 @@ def _normalize_product_region_rows(rows: list[dict]) -> list[dict]:
 
 def _normalize_region_summary_rows(rows: list[dict]) -> list[dict]:
     normalized: list[dict] = []
-    region_ids: set[int] = set()
+    region_ids: set[int | None] = set()
     for row in rows:
-        rid = exact.positive_int(row.get("region_id"), "region_id")
+        rid = None if row.get("region_id") is None else exact.positive_int(row["region_id"], "region_id")
         if rid in region_ids:
             raise ValueError(f"duplicate region_id {rid}")
         region_ids.add(rid)
         normalized.append(
             {
                 **row,
+                **_public_financial_values(row),
                 "region_id": rid,
                 "client_count": exact.non_negative_int(
                     row.get("client_count") or 0,
@@ -443,10 +455,10 @@ def _normalize_region_summary_rows(rows: list[dict]) -> list[dict]:
                     row.get("product_count") or 0,
                     "product_count",
                 ),
-                "units": exact.quantity(row.get("units") or 0, "region units"),
+                "units": exact.quantity(row.get("units") or 0, "region units", non_negative=False),
                 "revenue_eur": exact.money(
                     row.get("revenue_eur") or 0,
-                    "region revenue_eur",
+                    "region revenue_eur", non_negative=False,
                 ),
             }
         )
@@ -473,6 +485,11 @@ def _attach_regional_sales(rows: list[dict], regional_rows: list[dict]) -> list[
             "regional_client_count": regional["regional_client_count"],
             "region_id": regional["region_id"],
             "region_name": regional.get("region_name"),
+            "regional_net_revenue_eur": regional.get("regional_net_revenue_eur"),
+            "regional_known_net_revenue_eur": regional.get("regional_known_net_revenue_eur"),
+            "regional_returned_value_eur": regional.get("returned_value_eur"),
+            "regional_known_returned_value_eur": regional.get("known_returned_value_eur"),
+            "regional_unresolved_amount_count": regional.get("unresolved_amount_count"),
         })
     return out
 
@@ -488,7 +505,7 @@ _SORTS = {
 }
 _SORT_ALIASES = {"demand_score": "demand", "margin_score": "margin", "region_revenue": "regional_revenue"}
 _REGIONAL_SORTS = {"regional_revenue", "regional_units"}
-_PORTFOLIO_ROW_FIELDS = {"health", "demand_score", "margin_score", "action_label"}
+_PORTFOLIO_ROW_FIELDS = {"health", "demand_score", "margin_score", "action_label", "financial_basis", "net_revenue_eur"}
 _FILTER_VALUES = {
     "band": {b.value for b in InventoryBand} | {"unknown"},
     "abc": {a.value for a in AbcClass} | {"unknown"},
@@ -630,19 +647,19 @@ def assortment_regions(as_of_date: date | None = None, window_days: int | None =
         cached = cache.get(key)
         rows = cached.get("regions") if isinstance(cached, dict) else None
         if rows is None:
-            rows = _normalize_region_summary_rows(
-                sig.regional_demand_summary(as_of, win)
-            )
+            rows = sig.regional_demand_summary(as_of, win)
             cache.set(key, {"regions": rows})
-        else:
-            rows = _normalize_region_summary_rows(rows)
-        rows = rows[:max(0, limit)]
+        financial_summary = canonical.money_summary(rows)
+        total_regions = len(rows)
+        rows = _normalize_region_summary_rows(rows)[:max(0, limit)]
         METRICS.record_request((time.time() - started) * 1000)
         return {
             "as_of": as_of,
             **history_metadata,
             "window_days": win,
             "count": len(rows),
+            "total_region_count": total_regions,
+            "financial_summary": financial_summary,
             "regions": rows,
         }
     except Exception as exc:  # noqa: BLE001
@@ -759,7 +776,7 @@ def product_regions(
             rows,
             key=lambda row: exact.decimal_value(
                 row["regional_revenue_eur"],
-                "regional_revenue_eur",
+                "regional_revenue_eur", non_negative=False,
             ),
             reverse=True,
         )

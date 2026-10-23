@@ -5,7 +5,8 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, time, timezone
+from zoneinfo import ZoneInfo
 from typing import Any
 
 
@@ -31,6 +32,12 @@ def as_date(value: date | datetime | str) -> date:
     if isinstance(value, date):
         return value
     return date.fromisoformat(value)
+
+
+
+def kyiv_midnight_utc(value: date | datetime | str) -> datetime:
+    """Convert each Kyiv calendar boundary separately, including 23/25-hour DST days."""
+    return datetime.combine(as_date(value), time.min, ZoneInfo("Europe/Kyiv")).astimezone(timezone.utc).replace(tzinfo=None)
 
 
 def resolve_history_window(
@@ -87,7 +94,7 @@ def month_history_window(
 def history_contract_fingerprint(source_history_start: date | datetime | str) -> str:
     """Stable cache/API epoch for the source-floor contract."""
     source_start = as_date(source_history_start).isoformat()
-    return hashlib.sha256(f"products-history-v1|{source_start}".encode()).hexdigest()[:16]
+    return hashlib.sha256(f"products-history-v2-confirmed-sales-kyiv|{source_start}".encode()).hexdigest()[:16]
 
 
 def window_metadata(window: HistoryWindow) -> dict[str, Any]:
@@ -97,6 +104,9 @@ def window_metadata(window: HistoryWindow) -> dict[str, Any]:
         "effective_start": window.effective_start.isoformat(),
         "history_complete": window.history_complete,
         "effective_days": window.effective_days,
+        "end_exclusive": window.as_of.isoformat(),
+        "end_inclusive": (window.as_of - timedelta(days=1)).isoformat() if window.effective_days else None,
+        "time_zone": "Europe/Kyiv",
     }
 
 
@@ -112,6 +122,13 @@ def combined_history_metadata(windows: Mapping[str, HistoryWindow]) -> dict[str,
     if any(window.source_history_start != source_start for window in values):
         raise ValueError("history windows must share source_history_start")
     return {
+        "time_zone": "Europe/Kyiv",
+        "sales_basis": "confirmed-invoices-gross-with-vat",
+        "net_sales_basis": "confirmed-invoices-minus-active-returns-with-vat",
+        "margin_basis": "estimated-current-stock-cost",
+        "import_completeness_confirmed": False,
+        "period_end_exclusive": as_of.isoformat(),
+        "period_end_inclusive": (as_of - timedelta(days=1)).isoformat(),
         "source_history_start": source_start.isoformat(),
         "requested_start": min(window.requested_start for window in values).isoformat(),
         "effective_start": min(window.effective_start for window in values).isoformat(),

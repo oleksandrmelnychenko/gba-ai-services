@@ -1,0 +1,24 @@
+{
+  "contract": "native-confirmed-gross-and-active-returns-with-vat-v1",
+  "source_files": {
+    "src/Global.Business.Assistant.Operations.Infrastructure.Persistence/Report/Repositories/SalesReportProjectionRepository.cs": "2e75f70f48a48096d772fc6f712a6caa1d2dfa3916af87a524c084be9af0a3b7",
+    "src/Global.Business.Assistant.Operations.Infrastructure.Persistence/Report/Repositories/NativeSalesNetReportProjectionRepository.cs": "d4e9058f20f04da15794acba321200a66a3b0795b9b59930dc6409ae3c08a988",
+    "src/Global.Business.Assistant.Operations.Infrastructure.Persistence/Report/Repositories/NativeReturnCurrencyEvidenceSql.cs": "dcca34427aeda40685aaf8a6637735cb3ef83fdbe7542cda5dadedc84bdb509a",
+    "src/Global.Business.Assistant.Operations.Infrastructure.Persistence/Report/Repositories/NativeReportDecimalSql.cs": "9a2d2cefccace7e7470be6afe8c3253d2ed78e225721aaaff4ba744481e752e4"
+  },
+  "artifacts": {
+    "sales_from.sql": "63c05307372196c73a5aa1f8a244cd86be40d10bd23e5df22306e49d13c70824",
+    "sales_where.sql": "8589bb9c0aa77ab02cc7ef880a7b3648122e84d30b31e694b9bb39c14c199c9d",
+    "decimal_product.sql": "b6f79082fa6fb813d9e41d4f7a76465926891ddee417c1a72f72448d7e330042",
+    "return_from.sql": "c875a0d6c5e1595cd847f918877d7393aec706ac368ed81fe0044e24518b8843",
+    "return_value.sql": "318c2bc63839c4fe7f7835355af9117f9e506ae3bc04aa4c2e7865fcea0e98a3",
+    "return_unresolved.sql": "faaee28b8367a00b9a9ec45f990646df8bfaa4e268da4c0c7f887ac29d563429",
+    "return_currency.sql": "cf6052e89048235d1f4997311ad5b7b97df4e356a7c0d2f1c8a2df5d3d15a420"
+  },
+  "notes": [
+    "SQL fragments are extracted from native report source, with no currency-proof simplification.",
+    "Runtime only replaces named date bindings; gross and return dates use separate Kyiv UTC boundaries.",
+    "Return cost/VAT joins omitted because only gross EUR and returned quantity are requested.",
+    "Regeneration requires unit tests and live parity against NativeSalesNet on identical scopes."
+  ]
+}

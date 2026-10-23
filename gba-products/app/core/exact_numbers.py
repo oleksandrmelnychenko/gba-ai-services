@@ -85,10 +85,12 @@ def cover_days(value: Any, field: str = "cover_days") -> float:
 
 
 def decimal_sum(values: list[Any], field: str, *, non_negative: bool = False) -> Decimal:
-    total = Decimal("0")
-    for value in values:
-        total += decimal_value(value, field, non_negative=non_negative)
-    return total
+    with localcontext() as context:
+        context.prec = 50
+        total = Decimal("0")
+        for value in values:
+            total += decimal_value(value, field, non_negative=non_negative)
+        return total
 
 
 def positive_int(value: Any, field: str) -> int:

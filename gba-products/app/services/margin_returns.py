@@ -7,20 +7,26 @@ crash. revenue_eur / unit_cost_eur / avg_price_eur / eur_value are already EUR; 
 """
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import Decimal, localcontext
 
 from app.core import exact_numbers as exact
 
 
 def _margin_eur(row: dict) -> Decimal:
     """Margin-€ contribution = margin_pct * revenue_eur. Caller guards margin_pct is not None."""
+    basis = row.get("financial_basis", {})
+    if basis.get("unit_cost_eur") is not None and "units" in basis:
+        with localcontext() as context:
+            context.prec = 50
+            return (exact.decimal_value(basis["revenue_eur"], "raw gross revenue")
+                    - exact.decimal_value(basis["unit_cost_eur"], "current unit cost")
+                    * exact.decimal_value(basis["units"], "gross units"))
     return exact.decimal_value(
         row["margin_pct"] or 0,
         "margin_pct",
     ) * exact.decimal_value(
         row["revenue_eur"] or 0,
         "revenue_eur",
-        non_negative=True,
     )
 
 
@@ -30,12 +36,10 @@ def _enrich(row: dict) -> dict:
     revenue = exact.decimal_value(
         row.get("revenue_eur") or 0,
         "revenue_eur",
-        non_negative=True,
     )
     annual = exact.decimal_value(
         row.get("annual_units") or 0,
         "annual_units",
-        non_negative=True,
     )
     rate = exact.decimal_value(
         row.get("return_rate") or 0,
@@ -45,7 +49,6 @@ def _enrich(row: dict) -> dict:
     returned = exact.decimal_value(
         row.get("returned_units") if row.get("returned_units") is not None else rate * annual,
         "returned_units",
-        non_negative=True,
     )
     return {
         "product_id": row["product_id"],
@@ -59,12 +62,12 @@ def _enrich(row: dict) -> dict:
             if margin_pct is not None
             else None
         ),
-        "revenue_eur": exact.money(revenue, "revenue_eur"),
+        "revenue_eur": exact.money(revenue, "revenue_eur", non_negative=False),
         "unit_cost_eur": row.get("unit_cost_eur"),
         "avg_price_eur": row.get("avg_price_eur"),
-        "annual_units": exact.quantity(annual, "annual_units"),
+        "annual_units": exact.quantity(annual, "annual_units", non_negative=False),
         "return_rate": exact.ratio(rate, "return_rate", non_negative=True),
-        "returned_units": exact.quantity(returned, "returned_units"),
+        "returned_units": exact.quantity(returned, "returned_units", non_negative=False),
         "band": row.get("band"),
         "lifecycle": row.get("lifecycle"),
         "abc": row.get("abc"),
@@ -106,24 +109,21 @@ def margin_returns_summary(rows: list[dict]) -> dict:
     overall return rate (Σ returned units / Σ annual_units), and the relevant counts."""
     known = [r for r in rows if r.get("margin_pct") is not None]
     rev_known = exact.decimal_sum(
-        [row["revenue_eur"] or 0 for row in known],
+        [row.get("financial_basis", {}).get("revenue_eur", row["revenue_eur"]) for row in known],
         "known revenue_eur",
-        non_negative=True,
     )
-    wsum = sum((_margin_eur(row) for row in known), Decimal("0"))
+    wsum = exact.decimal_sum([_margin_eur(row) for row in known], "estimated margin")
     weighted_margin = (wsum / rev_known) if rev_known > 0 else None
 
     neg = [r for r in known if r["margin_pct"] < 0]
     eur_at_negative_margin = exact.decimal_sum(
-        [row["revenue_eur"] or 0 for row in neg],
+        [row.get("financial_basis", {}).get("revenue_eur", row["revenue_eur"]) for row in neg],
         "negative-margin revenue_eur",
-        non_negative=True,
     )
 
     total_units = exact.decimal_sum(
         [row.get("annual_units") or 0 for row in rows],
         "annual_units",
-        non_negative=True,
     )
     total_returned = sum(
         (
@@ -139,20 +139,20 @@ def margin_returns_summary(rows: list[dict]) -> dict:
                     * exact.decimal_value(
                         row.get("annual_units") or 0,
                         "annual_units",
-                        non_negative=True,
                     )
                 ),
                 "returned_units",
-                non_negative=True,
             )
             for row in rows
         ),
         Decimal("0"),
     )
-    overall_return_rate = (total_returned / total_units) if total_units > 0 else 0.0
+    return_denominator = exact.decimal_sum([row.get("return_sold_units", row.get("annual_units", 0)) for row in rows], "return-period sales")
+    overall_return_rate = (max(Decimal(0), total_returned) / return_denominator) if return_denominator > 0 else 0.0
 
     return {
         "total_skus": len(rows),
+        "estimated_profit_eur": exact.money(wsum, "estimated profit", non_negative=False),
         "skus_with_known_margin": len(known),
         "skus_unknown_margin": len(rows) - len(known),
         "weighted_avg_margin_pct": (
@@ -163,14 +163,14 @@ def margin_returns_summary(rows: list[dict]) -> dict:
         "negative_margin_skus": len(neg),
         "eur_at_negative_margin": exact.money(
             eur_at_negative_margin,
-            "eur_at_negative_margin",
+            "eur_at_negative_margin", non_negative=False,
         ),
         "revenue_eur_known_margin": exact.money(
             rev_known,
-            "revenue_eur_known_margin",
+            "revenue_eur_known_margin", non_negative=False,
         ),
-        "total_annual_units": exact.quantity(total_units, "total_annual_units"),
-        "total_returned_units": exact.quantity(total_returned, "total_returned_units"),
+        "total_annual_units": exact.quantity(total_units, "total_annual_units", non_negative=False),
+        "total_returned_units": exact.quantity(total_returned, "total_returned_units", non_negative=False),
         "overall_return_rate": exact.ratio(
             overall_return_rate,
             "overall_return_rate",

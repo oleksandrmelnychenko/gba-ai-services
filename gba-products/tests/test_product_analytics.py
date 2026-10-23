@@ -85,7 +85,8 @@ def test_route_returns_dense_sales_series_and_marks_partial_current_month(monkey
     }
     assert body["snapshot"]["found"] is True
     assert body["snapshot"]["name"] == "Test product"
-    assert body["sales_series"] == [
+    original_fields = ("month", "period_start", "period_end_exclusive", "is_complete", "units", "order_count", "revenue_eur", "avg_price_eur")
+    assert [{key: row[key] for key in original_fields} for row in body["sales_series"]] == [
         {
             "month": "2026-05",
             "period_start": "2026-05-01",
@@ -119,7 +120,7 @@ def test_route_returns_dense_sales_series_and_marks_partial_current_month(monkey
     ]
     assert body["data_quality"]["stock_is_current"] is True
     assert body["data_quality"]["stock_history_available"] is False
-    assert body["data_quality"]["sales_date_field"] == "Order.Created"
+    assert body["data_quality"]["sales_date_field"] == "Sale.EffectiveDate"
     assert body["data_quality"]["effective_start"] == "2026-05-01"
     assert body["data_quality"]["zero_fill_begins_at"] == "2026-05-01"
 

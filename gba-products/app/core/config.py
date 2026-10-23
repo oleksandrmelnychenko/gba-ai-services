@@ -65,7 +65,7 @@ class Settings(BaseSettings):
     # Stock semantics changed from the now-empty ReSaleAvailability cost layer to operational
     # ProductAvailability, and v4 makes all currency/quantity boundaries Decimal + HALF_UP.
     # v5 adds the factual source-history floor and invalidates every pre-floor dense/cache outcome.
-    model_version: str = "products-v5-source-history-floor"
+    model_version: str = "products-v6-confirmed-sales-kyiv"
 
     # Earliest factually available historical source date. All rolling SQL, dense grids,
     # denominators, producer lookups, API metadata, and cache epochs are clamped to this floor.

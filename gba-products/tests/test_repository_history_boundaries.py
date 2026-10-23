@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from datetime import datetime
 
 from app.data import signals_repository as sig
 
@@ -13,12 +14,11 @@ def test_rolling_day_sql_params_clamp_to_source_floor(monkeypatch):
     sig.sales_velocity("2025-01-11", 180)
 
     sql, params = captured[0]
-    assert sig._SALES_HISTORY_WINDOW in sql
+    assert "s.EffectiveDate >= :history_start AND s.EffectiveDate < :asof" in sql
     assert params == {
-        "asof": "2025-01-11",
-        "source_history_start": "2025-01-01",
-        "history_start": "2025-01-01",
-        "synth": 999,
+        "asof": datetime(2025, 1, 10, 22),
+        "source_history_start": datetime(2024, 12, 31, 22),
+        "history_start": datetime(2024, 12, 31, 22),
     }
 
 
@@ -29,9 +29,9 @@ def test_rolling_day_sql_params_use_requested_start_when_complete(monkeypatch):
     sig.sold_product_ids("2026-07-25", 180)
 
     assert captured[0] == {
-        "asof": "2026-07-25",
-        "source_history_start": "2025-01-01",
-        "history_start": "2026-01-26",
+        "asof": datetime(2026, 7, 24, 21),
+        "source_history_start": datetime(2024, 12, 31, 22),
+        "history_start": datetime(2026, 1, 25, 22),
     }
 
 
@@ -43,15 +43,14 @@ def test_monthly_and_explicit_sales_queries_enforce_floor(monkeypatch):
     sig.monthly_units("2026-07-25", 24)
     sig.monthly_product_sales(42, "2024-08-01", "2026-07-25")
 
-    assert captured[0][1]["history_start"] == "2025-01-01"
+    assert captured[0][1]["history_start"] == datetime(2024, 12, 31, 22)
     assert captured[1][1] == {
-        "asof": "2026-07-25",
-        "source_history_start": "2025-01-01",
-        "history_start": "2025-01-01",
+        "asof": datetime(2026, 7, 24, 21),
+        "source_history_start": datetime(2024, 12, 31, 22),
+        "history_start": datetime(2024, 12, 31, 22),
         "product_id": 42,
-        "synth": 999,
     }
-    assert sig._SALES_HISTORY_WINDOW in captured[1][0]
+    assert "s.EffectiveDate >= :history_start AND s.EffectiveDate < :asof" in captured[1][0]
 
 
 def test_product_meta_is_point_in_time_and_floor_bounded(monkeypatch):
@@ -65,8 +64,8 @@ def test_product_meta_is_point_in_time_and_floor_bounded(monkeypatch):
     assert "si.DateFrom < :asof" in sql
     assert "sou.FromDate >= :source_history_start" in sql
     assert "sou.FromDate < :asof" in sql
-    assert params["source_history_start"] == "2025-01-01"
-    assert params["asof"] == "2026-07-25"
+    assert params["source_history_start"] == datetime(2024, 12, 31, 22)
+    assert params["asof"] == datetime(2026, 7, 24, 21)
     assert params["p0"] == 42
 
 

@@ -1,0 +1,1 @@
+FROM dbo.Sale s JOIN dbo.[Order] o ON o.ID = s.OrderID JOIN dbo.OrderItem oi ON oi.OrderID = o.ID AND oi.Deleted = 0 JOIN dbo.ClientAgreement ca ON ca.ID = s.ClientAgreementID JOIN dbo.Agreement ag ON ag.ID = ca.AgreementID LEFT JOIN dbo.Product p ON p.ID = oi.ProductID LEFT JOIN dbo.MeasureUnit mu ON mu.ID = p.MeasureUnitID AND mu.Deleted = 0

@@ -62,23 +62,27 @@ class MonthlySalesPoint(BaseModel):
     order_count: int
     revenue_eur: float
     avg_price_eur: float | None
+    gross_revenue_eur: float
+    returned_units: float | None
+    returned_value_eur: float | None
+    known_returned_value_eur: float
+    net_revenue_eur: float | None
+    known_net_revenue_eur: float
+    unresolved_amount_count: int | None
+    financial_basis: dict[str, Any]
 
 
 class ProductAnalyticsDataQuality(BaseModel):
     """Machine-readable disclosure of the analytics source and its known limits."""
 
-    sales_date_field: Literal["Order.Created"] = "Order.Created"
-    sales_validity_filter: Literal["OrderItem.IsValidForCurrentSale = 1"] = (
-        "OrderItem.IsValidForCurrentSale = 1"
-    )
+    sales_date_field: Literal["Sale.EffectiveDate"] = "Sale.EffectiveDate"
+    sales_validity_filter: str = "confirmed active Sale; active OrderItem; accounting-owned balance carriers excluded"
     sales_window_end: Literal["exclusive"] = "exclusive"
-    revenue_basis: Literal[
-        "SUM(CAST(OrderItem.Qty AS decimal) * CAST(OrderItem.PricePerItem AS decimal)); "
-        "PricePerItem is EUR"
-    ] = (
-        "SUM(CAST(OrderItem.Qty AS decimal) * CAST(OrderItem.PricePerItem AS decimal)); "
-        "PricePerItem is EUR"
-    )
+    time_zone: Literal["Europe/Kyiv"] = "Europe/Kyiv"
+    revenue_basis: Literal["confirmed-invoices-gross-with-vat"] = "confirmed-invoices-gross-with-vat"
+    net_sales_basis: Literal["confirmed-invoices-minus-active-returns-with-vat"] = "confirmed-invoices-minus-active-returns-with-vat"
+    margin_basis: Literal["estimated-current-stock-cost"] = "estimated-current-stock-cost"
+    import_completeness_confirmed: Literal[False] = False
     avg_price_basis: Literal["revenue_eur / units (quantity-weighted)"] = (
         "revenue_eur / units (quantity-weighted)"
     )

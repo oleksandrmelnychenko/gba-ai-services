@@ -7,11 +7,13 @@ still computed per-SKU (where cost is known) and feeds the health-score.
 """
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import Decimal, localcontext
 
 from app.core import exact_numbers as exact
 from app.core.config import get_settings
+from app.core.history import window_metadata
 from app.data import signals_repository as sig
+from app.data import canonical_sales as canonical
 from app.services import classification as cl
 from app.services import health_score, history_policy
 from app.services.stock_health import classify_band
@@ -35,10 +37,15 @@ def build_portfolio(as_of: str) -> dict:
         sig.avg_sale_price_eur(as_of, cfg.dead_window_days),
         "avg_sale_price_eur",
     )
+    return_prices = prices if cfg.return_window_days == cfg.dead_window_days else _index_by_product(
+        sig.avg_sale_price_eur(as_of, cfg.return_window_days), "return_window_sales")
     rets = _index_by_product(
         sig.returns_for_products(as_of, cfg.return_window_days),
         "returns_for_products",
     )
+
+    net_returns = rets if cfg.return_window_days == cfg.dead_window_days else _index_by_product(
+        sig.returns_for_products(as_of, cfg.dead_window_days), "net_sales_returns")
 
     labels = cl.month_labels(
         as_of,
@@ -57,10 +64,9 @@ def build_portfolio(as_of: str) -> dict:
         product_months[label] = exact.decimal_value(
             r.get("units") or 0,
             "monthly_units.units",
-            non_negative=True,
         )
 
-    universe = set(stock) | set(monthly) | set(vel)
+    universe = set(stock) | set(monthly) | set(vel) | set(prices) | set(net_returns) | set(rets)
     rows: list[dict] = []
     for pid in universe:
         st = stock.get(pid)
@@ -89,12 +95,11 @@ def build_portfolio(as_of: str) -> dict:
         sold_recent_qty = exact.decimal_value(
             vel[pid]["sold_qty"] if pid in vel else 0,
             "sold_qty",
-            non_negative=True,
         )
         if velocity_days == 0 and sold_recent_qty > 0:
             raise ValueError("sales velocity has demand outside the effective history window")
         daily_rate = (
-            sold_recent_qty / Decimal(velocity_days)
+            max(Decimal(0), sold_recent_qty) / Decimal(velocity_days)
             if velocity_days > 0
             else Decimal("0")
         )
@@ -103,7 +108,7 @@ def build_portfolio(as_of: str) -> dict:
 
         monthly_values = monthly.get(pid, {})
         series = cl.series_from(
-            {label: float(value) for label, value in monthly_values.items()},
+            {label: float(max(Decimal(0), value)) for label, value in monthly_values.items()},
             labels,
         )
         annual_units = sum(
@@ -119,20 +124,15 @@ def build_portfolio(as_of: str) -> dict:
         revenue_eur = exact.decimal_value(
             price_row.get("revenue_eur") if price_row else 0,
             "revenue_eur",
-            non_negative=True,
         )
         priced_qty = exact.decimal_value(
             price_row.get("sold_qty") if price_row else 0,
             "priced sold_qty",
-            non_negative=True,
         )
         avg_price = revenue_eur / priced_qty if priced_qty > 0 else Decimal("0")
         if price_row is not None and price_row.get("avg_price_eur") is not None:
-            reported_avg = exact.unit_price(
-                price_row["avg_price_eur"],
-                "repository avg_price_eur",
-            )
-            if reported_avg != exact.unit_price(avg_price, "derived avg_price_eur"):
+            reported_avg = exact.unit_price(price_row["avg_price_eur"], "repository avg_price_eur", non_negative=False)
+            if priced_qty != 0 and reported_avg != exact.unit_price(revenue_eur / priced_qty, "derived avg_price_eur", non_negative=False):
                 raise ValueError(f"price aggregate mismatch for product {pid}")
         margin_pct = None
         if unit_cost is not None and avg_price > 0:
@@ -140,9 +140,22 @@ def build_portfolio(as_of: str) -> dict:
         returned_qty = exact.decimal_value(
             rets[pid].get("returned_qty") if pid in rets else 0,
             "returned_qty",
-            non_negative=True,
         )
-        return_rate = (returned_qty / annual_units) if annual_units > 0 else Decimal("0")
+        return_sold_qty = exact.decimal_value(return_prices.get(pid, {}).get("sold_qty", 0), "return-window sold quantity")
+        return_rate = (max(Decimal(0), returned_qty) / return_sold_qty) if return_sold_qty > 0 else Decimal("0")
+        net_return = net_returns.get(pid)
+        known_returned = exact.decimal_value(
+            net_return["known_returned_value_eur"] if net_return else 0, "known returned amount")
+        unresolved = exact.non_negative_int(
+            net_return["unresolved_amount_count"] if net_return else 0, "unresolved amount count")
+        with localcontext() as context:
+            context.prec = 50
+            known_net = revenue_eur - known_returned
+        financial_basis = {"revenue_eur": format(revenue_eur, "f"),
+                           "units": format(priced_qty, "f"),
+                           "unit_cost_eur": None if unit_cost is None else format(unit_cost, "f"),
+                           "known_returned_value_eur": format(known_returned, "f"),
+                           "unresolved_amount_count": unresolved}
         rows.append({
             "product_id": pid,
             "qty_on_hand": exact.quantity(qty, "qty_on_hand"),
@@ -162,9 +175,19 @@ def build_portfolio(as_of: str) -> dict:
                 if margin_pct is not None
                 else None
             ),
-            "annual_units": exact.quantity(annual_units, "annual_units"),
-            "returned_units": exact.quantity(returned_qty, "returned_units"),
-            "revenue_eur": exact.money(revenue_eur, "revenue_eur"),
+            "annual_units": exact.quantity(priced_qty, "annual_units", non_negative=False),
+            "classification_units": exact.quantity(annual_units, "classification units", non_negative=False),
+            "return_sold_units": exact.quantity(return_sold_qty, "return-window sold units", non_negative=False),
+            "returned_units": exact.quantity(returned_qty, "returned_units", non_negative=False),
+            "revenue_eur": exact.money(revenue_eur, "revenue_eur", non_negative=False),
+            "gross_revenue_eur": exact.money(revenue_eur, "gross revenue", non_negative=False),
+            "returned_value_eur": None if unresolved else exact.money(known_returned, non_negative=False),
+            "known_returned_value_eur": exact.money(known_returned, non_negative=False),
+            "net_revenue_eur": None if unresolved else exact.money(known_net, non_negative=False),
+            "known_net_revenue_eur": exact.money(known_net, non_negative=False),
+            "unresolved_amount_count": unresolved,
+            "financial_basis": financial_basis,
+            "demand_adjustments_present": sold_recent_qty < 0 or any(v < 0 for v in monthly_values.values()),
             "cover_days": exact.cover_days(cover) if cover is not None else None,
             "return_rate": exact.ratio(return_rate, "return_rate", non_negative=True),
             "band": band.value,
@@ -227,6 +250,7 @@ def build_portfolio(as_of: str) -> dict:
         **history_policy.portfolio_metadata(as_of, cfg),
         "count": len(rows),
         "overview": _overview(rows),
+        "financial_window": window_metadata(windows["dead"]),
         "rows": rows,
     }
     _validate_portfolio_result(result)
@@ -244,30 +268,22 @@ def _index_by_product(rows: list[dict], source: str) -> dict[int, dict]:
 
 
 def _assign_abc(rows: list[dict], cfg) -> None:
-    total_rev = exact.decimal_sum(
-        [row["revenue_eur"] for row in rows],
-        "portfolio revenue_eur",
-        non_negative=True,
-    )
-    if total_rev <= 0:
-        for r in rows:
-            r["abc"] = "unknown"
-        return
-    cumulative = Decimal("0")
-    for row in sorted(
-        rows,
-        key=lambda item: (
-            exact.decimal_value(item["revenue_eur"], "revenue_eur"),
-            -int(item["product_id"]),
-        ),
-        reverse=True,
-    ):
-        cumulative += exact.decimal_value(
-            row["revenue_eur"],
-            "revenue_eur",
-            non_negative=True,
-        )
-        row["abc"] = cl.abc_classify(float(cumulative / total_rev), cfg).value
+    # Signed accounting adjustments remain in financial totals. ABC ranks positive
+    # commercial contribution only; nonpositive contribution is explicitly unknown.
+    def contribution(row):
+        return max(Decimal(0), exact.decimal_value(
+            row.get("financial_basis", {}).get("revenue_eur", row["revenue_eur"]), "ABC contribution"))
+    with localcontext() as context:
+        context.prec = 50
+        total = sum((contribution(row) for row in rows), Decimal(0))
+        cumulative = Decimal(0)
+        for row in sorted(rows, key=lambda row: (contribution(row), -int(row["product_id"])), reverse=True):
+            amount = contribution(row)
+            if amount <= 0 or total <= 0:
+                row["abc"] = "unknown"
+            else:
+                cumulative += amount
+                row["abc"] = cl.abc_classify(float(cumulative / total), cfg).value
 
 
 def _overview(rows: list[dict]) -> dict:
@@ -288,14 +304,7 @@ def _overview(rows: list[dict]) -> dict:
             ),
             "total_eur_value",
         ),
-        "total_revenue_eur": exact.money(
-            exact.decimal_sum(
-                [row["revenue_eur"] for row in rows],
-                "overview revenue_eur",
-                non_negative=True,
-            ),
-            "total_revenue_eur",
-        ),
+        **canonical.money_summary([row["financial_basis"] for row in rows]),
         "by_band": tally("band"),
         "by_lifecycle": tally("lifecycle"),
         "by_action": tally("action_label"),
@@ -328,13 +337,16 @@ def _validate_portfolio_result(result: dict) -> None:
     )
     expected_revenue = exact.money(
         exact.decimal_sum(
-            [row["revenue_eur"] for row in rows],
+            [row.get("financial_basis", {}).get("revenue_eur", row["revenue_eur"]) for row in rows],
             "portfolio revenue_eur",
-            non_negative=True,
         ),
-        "portfolio total_revenue_eur",
+        "portfolio total_revenue_eur", non_negative=False,
     )
     if overview["total_eur_value"] != expected_value:
         raise ValueError("overview total_eur_value does not match rows")
     if overview["total_revenue_eur"] != expected_revenue:
         raise ValueError("overview total_revenue_eur does not match rows")
+    if rows and all("financial_basis" in row for row in rows):
+        expected = canonical.money_summary([row["financial_basis"] for row in rows])
+        if any(overview.get(key) != value for key, value in expected.items()):
+            raise ValueError("overview financial totals do not match canonical additive basis")

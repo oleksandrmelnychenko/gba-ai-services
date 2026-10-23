@@ -27,17 +27,13 @@ LOAD-BEARING DATA RULES (verified on ConcordDb_V5):
     must spell out IS NULL or the untyped historical lot layer silently vanishes from every stock signal.
     gba-pricing (pricing_repository.unit_cost_eur) and gba-procure deliberately exclude these too.
   - Sellable warehouses: Storage.Deleted=0 AND ForDefective=0 AND (AvailableForReSale=1 OR IsResale=1).
-  - SALE-side OrderItem.PricePerItem is ALREADY EUR — never wrap/convert it. Qty/Amount columns
-    are SQL ``float`` in the legacy schema, so every quantity and money aggregate casts operands
-    to Decimal BEFORE SUM/multiplication. Multiplying float * decimal promotes the expression to
-    binary float and can move an accounting half-cent.
-  - Time windows MUST use Order.Created. OrderItem.Created is truncated (~3 days) and is unusable.
-  - SALE VALIDITY (Sale/Order/OrderItem spine) = oi.IsValidForCurrentSale = 1, NOT Deleted = 0.
-    In this 1С-synced DB dbo.[Order]/OrderItem are ~80%/84% Deleted=1 (the sync flips Deleted on
-    every superseded/revision row), so o.Deleted=0 AND oi.Deleted=0 silently keeps only ~16% of real
-    sale lines and undercounts every sales-based signal ~3.5x. IsValidForCurrentSale is the canonical
-    "this line is the live sale" flag (only 231 invalid lines DB-wide). This applies ONLY to the
-    Sale/Order/OrderItem spine — returns (SaleReturn/SaleReturnItem) and side tables keep Deleted=0.
+  - Sales use the native report fact set: confirmed active Sale, active OrderItem, the sale's
+    own ClientAgreement, and Sale.EffectiveDate. Accounting-owned balance carriers are excluded
+    by immutable provenance, never by a guessed synthetic product ID or deletion statistics.
+  - Gross EUR remains gross (before returns) for ABC/average price. Net EUR is a separate signed
+    measure. Active returns use their own FromDate and actual Amount with generated currency proof.
+  - Every calendar boundary is a Europe/Kyiv midnight converted independently to UTC.
+
 """
 from __future__ import annotations
 
@@ -54,6 +50,8 @@ from app.core.history import (
     resolve_history_window,
 )
 from app.data.db import in_clause, query
+from app.data import canonical_sales as canonical
+from app.core.history import kyiv_midnight_utc
 
 # 1С debt/balance-import document type on dbo.ProductIncome.SourceDocumentType. Such lots carry an
 # inflated balance-import AccountingPrice across BOTH Consignment.IsImportedFromOneC and IsVirtual;
@@ -68,29 +66,9 @@ _SELLABLE_STORAGE = (
 _PA_QTY = "CAST(pa.Amount AS decimal(18, 8))"
 _COST_QTY = "CAST(ci.RemainingQty AS decimal(18, 8))"
 _COST_PRICE = "CAST(ci.AccountingPrice AS decimal(28, 14))"
-_SALE_QTY = "CAST(oi.Qty AS decimal(18, 8))"
-_SALE_PRICE = "CAST(oi.PricePerItem AS decimal(28, 14))"
-_SALE_AMOUNT = f"{_SALE_QTY} * {_SALE_PRICE}"
-_RETURN_QTY = "CAST(sri.Qty AS decimal(18, 8))"
-
-_SALES_HISTORY_WINDOW = (
-    "o.Created >= :source_history_start "
-    "AND o.Created >= :history_start "
-    "AND o.Created < :asof"
-)
-_RETURNS_HISTORY_WINDOW = (
-    "sr.FromDate >= :source_history_start "
-    "AND sr.FromDate >= :history_start "
-    "AND sr.FromDate < :asof"
-)
-
-# The synthetic "Ввід боргів" (debt-entry) product carries accounting noise — it is a 1С
-# debt-injection line, not a real sale or return (it ranks #1 by revenue, ~€7.4M). Every
-# sales-spine aggregate (velocity / avg sale price / monthly units) and the returns query must
-# exclude it; sold_product_ids is only a membership set (never aggregated) so it is left as-is.
-# The ID is NOT stable (the 1С sync re-mints the Product row), so it is resolved from the live
-# table at startup and re-resolved hourly; settings.synthetic_product_id (env) overrides when
-# set, and the last known live row is the offline fallback.
+# Legacy synthetic-product identity is retained for startup diagnostics only.
+# Financial population comes from native confirmed-sale ownership rules, never a
+# mutable product name/ID exclusion. The resolver does not filter these aggregates.
 _SYNTHETIC_FALLBACK_ID = 29555414
 _SYNTHETIC_REFRESH_SECONDS = 3600
 _synthetic_cached: tuple[int, float] | None = None
@@ -98,9 +76,9 @@ _synthetic_cached: tuple[int, float] | None = None
 
 def _window_params(as_of: str, window: HistoryWindow) -> dict[str, Any]:
     return {
-        "asof": as_of,
-        "source_history_start": window.source_history_start.isoformat(),
-        "history_start": window.effective_start.isoformat(),
+        "asof": kyiv_midnight_utc(as_of),
+        "source_history_start": kyiv_midnight_utc(window.source_history_start),
+        "history_start": kyiv_midnight_utc(window.effective_start),
     }
 
 
@@ -335,261 +313,137 @@ def stock_source_readiness() -> dict[str, Any]:
     return snapshot
 
 
+def _confirmed_query(sql: str, params: dict) -> list[dict]:
+    return canonical.validate_rows(query(sql, params))
+
+
 def sold_product_ids(as_of: str, window_days: int) -> set[int]:
-    """Distinct ProductIDs with at least one valid sale line in the window (Order.Created)."""
+    """Products with confirmed invoice demand in the exact Kyiv calendar interval."""
     _, params = _day_history_params(as_of, window_days)
-    rows = query(
-        f"""
-        SELECT DISTINCT oi.ProductID AS product_id
-        FROM dbo.OrderItem oi
-        JOIN dbo.[Order] o ON o.ID = oi.OrderID
-        WHERE oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
-              AND {_SALES_HISTORY_WINDOW}
-        """,
-        params,
-    )
-    return {int(r["product_id"]) for r in rows}
+    rows = _confirmed_query(canonical.facts_cte() + """
+        SELECT product_id, SUM(arithmetic_failures) AS arithmetic_failures
+        FROM salesFacts GROUP BY product_id
+        """, params)
+    return {exact.positive_int(row["product_id"], "confirmed product_id") for row in rows}
 
 
 def sales_velocity(as_of: str, window_days: int,
                    product_ids: Sequence[int] | None = None) -> list[dict]:
-    """Per-product sold qty / order count / recency over the window (Order.Created)."""
+    """Confirmed gross demand, invoice count and recency; returns never become negative demand."""
     _, params = _day_history_params(as_of, window_days)
-    params["synth"] = synthetic_product_id()
-    flt = _in_filter("oi.ProductID", "p", product_ids, params)
-    return query(
-        f"""
-        SELECT oi.ProductID AS product_id,
-               SUM({_SALE_QTY}) AS sold_qty,
-               COUNT(DISTINCT o.ID) AS order_count,
-               MAX(o.Created) AS last_sale,
-               MIN(o.Created) AS first_sale,
-               DATEDIFF(day, MAX(o.Created), :asof) AS days_since_last
-        FROM dbo.OrderItem oi
-        JOIN dbo.[Order] o ON o.ID = oi.OrderID
-        WHERE oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL AND oi.ProductID <> :synth
-              AND {_SALES_HISTORY_WINDOW}{flt}
-        GROUP BY oi.ProductID
-        """,
-        params,
-    )
+    flt = _in_filter("product_id", "p", product_ids, params)
+    return _confirmed_query(canonical.facts_cte() + f"""
+        SELECT product_id, SUM(sold_qty) AS sold_qty,
+               COUNT(DISTINCT sale_id) AS order_count,
+               MAX(event_local) AS last_sale, MIN(event_local) AS first_sale,
+               DATEDIFF(day, MAX(event_local), CAST(CAST(:asof AS datetime2) AT TIME ZONE 'UTC' AT TIME ZONE 'FLE Standard Time' AS datetime2)) AS days_since_last,
+               SUM(arithmetic_failures) AS arithmetic_failures
+        FROM salesFacts WHERE 1=1{flt}
+        GROUP BY product_id
+        """, params)
 
 
 def avg_sale_price_eur(as_of: str, window_days: int,
                        product_ids: Sequence[int] | None = None) -> list[dict]:
-    """Per-product qty-weighted average SALE price in EUR (OrderItem.PricePerItem is already EUR)."""
+    """Quantity-weighted confirmed gross price; zero-price lines remain in the population."""
     _, params = _day_history_params(as_of, window_days)
-    params["synth"] = synthetic_product_id()
-    flt = _in_filter("oi.ProductID", "p", product_ids, params)
-    return query(
-        f"""
-        WITH Sales AS (
-            SELECT oi.ProductID AS product_id,
-                   SUM({_SALE_AMOUNT}) AS revenue_eur,
-                   SUM({_SALE_QTY}) AS sold_qty
-            FROM dbo.OrderItem oi
-            JOIN dbo.[Order] o ON o.ID = oi.OrderID
-            WHERE oi.IsValidForCurrentSale = 1
-                  AND oi.ProductID IS NOT NULL
-                  AND oi.ProductID <> :synth
-                  AND oi.PricePerItem > 0
-                  AND {_SALES_HISTORY_WINDOW}{flt}
-            GROUP BY oi.ProductID
-        )
-        SELECT product_id,
-               CAST(revenue_eur / NULLIF(sold_qty, 0) AS decimal(28, 8))
-                   AS avg_price_eur,
-               revenue_eur,
-               sold_qty
-        FROM Sales
-        """,
-        params,
-    )
+    flt = _in_filter("product_id", "p", product_ids, params)
+    return _confirmed_query(canonical.facts_cte() + f"""
+        SELECT product_id, SUM(revenue_eur) AS revenue_eur, SUM(sold_qty) AS sold_qty,
+               CAST(SUM(revenue_eur) / NULLIF(SUM(sold_qty), 0) AS decimal(28,8)) AS avg_price_eur,
+               SUM(arithmetic_failures) AS arithmetic_failures
+        FROM salesFacts WHERE 1=1{flt}
+        GROUP BY product_id
+        """, params)
 
 
 def returns_for_products(as_of: str, window_days: int,
                          product_ids: Sequence[int] | None = None) -> list[dict]:
-    """Per-product real returned quantity over the window.
-
-    LOAD-BEARING RETURNS RULES (verified on ConcordDb_V5, N=2.6k active return lines):
-      - The return DATE is SaleReturn.FromDate. SaleReturn.Created (and SaleReturnItem.Created)
-        is a bulk-sync MIRROR timestamp — it clusters on a handful of import days, so windowing on
-        it silently mis-dates every return. Window on sr.FromDate.
-      - Returned QUANTITY is SUM(SaleReturnItem.Qty). This is the canonical server rule:
-        GetAllOrderedProductsHistory groups SaleReturnItem by OrderItemID and sums Qty, return
-        reports sum Qty directly, and mutation/import paths persist Qty. Group by
-        (SaleReturnID, OrderItemID) first so price/flags stay one-per-return-line; SUM within the
-        group intentionally preserves partial quantities and multiple active rows. MAX(OrderItem.Qty)
-        is not a fallback: it destroys partial returns and replaces duplicate-row quantities with
-        the original sold quantity.
-      - oi.Deleted is NOT filtered: processing a return marks the original sale line Deleted=1, so
-        ~73% of returned lines are "deleted" — filtering them drops most real returns.
-      - Active returns only: sr.Deleted = 0 AND sr.IsCanceled = 0. Exclude the synthetic debt-entry
-        product. oi.PricePerItem is already EUR (no conversion).
-    """
+    """Active return Qty and actual EUR Amount, on FromDate, with complete native currency proof."""
     _, params = _day_history_params(as_of, window_days)
-    params["synth"] = synthetic_product_id()
-    flt = _in_filter("oi.ProductID", "p", product_ids, params)
-    return query(
-        f"""
-        SELECT product_id,
-               SUM(returned_qty) AS returned_qty,
-               COUNT(*) AS return_lines,
-               CAST(
-                   SUM(returned_qty * price_eur)
-                   AS decimal(38, 8)
-               ) AS returned_value_eur,
-               SUM(money_returned) AS money_returned_lines
-        FROM (
-            SELECT oi.ProductID AS product_id,
-                   sri.SaleReturnID,
-                   sri.OrderItemID,
-                   SUM({_RETURN_QTY}) AS returned_qty,
-                   MAX({_SALE_PRICE}) AS price_eur,
-                   MAX(CASE WHEN sri.IsMoneyReturned = 1 THEN 1 ELSE 0 END) AS money_returned
-            FROM dbo.SaleReturnItem sri
-            JOIN dbo.OrderItem oi ON oi.ID = sri.OrderItemID
-            JOIN dbo.SaleReturn sr ON sr.ID = sri.SaleReturnID
-                 AND sr.Deleted = 0 AND sr.IsCanceled = 0
-            WHERE sri.Deleted = 0 AND oi.ProductID IS NOT NULL AND oi.ProductID <> :synth
-                  AND {_RETURNS_HISTORY_WINDOW}{flt}
-            GROUP BY oi.ProductID, sri.SaleReturnID, sri.OrderItemID
-        ) line
+    flt = _in_filter("product_id", "p", product_ids, params)
+    rows = _confirmed_query(canonical.facts_cte(returns=True) + f"""
+        SELECT product_id, SUM(returned_qty) AS returned_qty, COUNT_BIG(*) AS return_lines,
+               SUM(known_returned_value_eur) AS known_returned_value_eur,
+               CASE WHEN SUM(unresolved_amount_count)=0 THEN SUM(known_returned_value_eur) END AS returned_value_eur,
+               SUM(unresolved_amount_count) AS unresolved_amount_count,
+               SUM(money_returned_lines) AS money_returned_lines,
+               SUM(arithmetic_failures) AS arithmetic_failures,
+               SUM(ambiguous_lines) AS ambiguous_lines
+        FROM returnFacts WHERE 1=1{flt}
         GROUP BY product_id
-        """,
-        params,
-    )
+        """, params)
+    return rows
 
 
 def monthly_units(as_of: str, months: int,
                   product_ids: Sequence[int] | None = None) -> list[dict]:
-    """Per-product per-month units sold over the trailing window (Order.Created) — feeds XYZ CV,
-    trend and lifecycle. Months with no sales are absent; the caller fills the grid with zeros."""
+    """Confirmed gross demand in Kyiv calendar months; zero buckets are filled by the caller."""
     _, params = _month_history_params(as_of, months)
-    params["synth"] = synthetic_product_id()
-    flt = _in_filter("oi.ProductID", "p", product_ids, params)
-    return query(
-        f"""
-        SELECT oi.ProductID AS product_id,
-               CONVERT(char(7), o.Created, 126) AS ym,
-               SUM({_SALE_QTY}) AS units
-        FROM dbo.OrderItem oi
-        JOIN dbo.[Order] o ON o.ID = oi.OrderID
-        WHERE oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL AND oi.ProductID <> :synth
-              AND {_SALES_HISTORY_WINDOW}{flt}
-        GROUP BY oi.ProductID, CONVERT(char(7), o.Created, 126)
-        """,
-        params,
-    )
+    flt = _in_filter("product_id", "p", product_ids, params)
+    return _confirmed_query(canonical.facts_cte() + f"""
+        SELECT product_id, CONVERT(char(7), event_local, 126) AS ym,
+               SUM(sold_qty) AS units, SUM(arithmetic_failures) AS arithmetic_failures
+        FROM salesFacts WHERE 1=1{flt}
+        GROUP BY product_id, CONVERT(char(7), event_local, 126)
+        """, params)
 
 
 def monthly_product_sales(product_id: int, window_start: str, as_of: str) -> list[dict]:
-    """Calendar-month actual sales for one product over ``[window_start, as_of)``.
-
-    This intentionally repeats the canonical sales-spine rules used by the portfolio signals:
-    ``Order.Created`` is the business date, ``IsValidForCurrentSale`` selects the live line, and
-    ``OrderItem.PricePerItem`` is already EUR. The caller owns the dense month grid because SQL only
-    returns months with sales.
-    """
+    """Gross and signed net amounts share one canonical fact population and Kyiv month grid."""
     _, params = _explicit_history_params(as_of, window_start)
-    params.update(
-        {
-            "product_id": int(product_id),
-            "synth": synthetic_product_id(),
-        }
-    )
-    return query(
-        f"""
-        WITH MonthlySales AS (
-            SELECT CONVERT(char(7), o.Created, 126) AS ym,
-                   SUM({_SALE_QTY}) AS units,
-                   COUNT(DISTINCT o.ID) AS order_count,
-                   SUM({_SALE_AMOUNT}) AS revenue_eur
-            FROM dbo.OrderItem oi
-            JOIN dbo.[Order] o ON o.ID = oi.OrderID
-            WHERE oi.IsValidForCurrentSale = 1
-                  AND oi.ProductID = :product_id
-                  AND oi.ProductID <> :synth
-                  AND {_SALES_HISTORY_WINDOW}
-            GROUP BY CONVERT(char(7), o.Created, 126)
-        )
-        SELECT ym,
-               units,
-               order_count,
-               revenue_eur,
-               CAST(revenue_eur / NULLIF(units, 0) AS decimal(28, 8))
-                   AS avg_price_eur
-        FROM MonthlySales
+    params["product_id"] = exact.positive_int(product_id, "product_id")
+    return canonical.financial_rows(query(canonical.facts_cte(returns=True) + f"""
+        SELECT CONVERT(char(7), event_local, 126) AS ym,
+               SUM(sold_qty) AS units, SUM(returned_qty) AS returned_units,
+               COUNT(DISTINCT CASE WHEN is_return=0 THEN sale_id END) AS order_count,
+               {canonical.FINANCIAL_SELECT}
+        FROM financialFacts WHERE product_id = :product_id
+        GROUP BY CONVERT(char(7), event_local, 126)
         ORDER BY ym
-        """,
-        params,
-    )
+        """, params))
+
+
+def _region_filter(region_id: int | None, params: dict) -> str:
+    if region_id == 0:
+        return " AND region_id IS NULL"
+    if region_id is not None:
+        params["region_id"] = exact.positive_int(region_id, "region_id")
+        return " AND region_id = :region_id"
+    return ""
 
 
 def regional_product_sales(as_of: str, window_days: int, product_ids: Sequence[int] | None = None,
                            region_id: int | None = None) -> list[dict]:
-    """Per-product regional demand over the window.
-
-    Region is the oblast-level natural key `Client.RegionID`, reached through the sale's
-    ClientAgreement (`Order.ClientAgreementID -> ClientAgreement.ClientID -> Client.RegionID`).
-    Do NOT use `RegionCodeID`: it is per-client address/code granularity and does not group demand.
-    """
+    """Current client region over canonical gross/net facts; null region is retained once."""
     _, params = _day_history_params(as_of, window_days)
-    params["synth"] = synthetic_product_id()
-    flt = _in_filter("oi.ProductID", "p", product_ids, params)
-    region_filter = ""
-    if region_id is not None:
-        params["region_id"] = int(region_id)
-        region_filter = " AND c.RegionID = :region_id"
-    return query(
-        f"""
-        SELECT oi.ProductID AS product_id,
-               c.RegionID AS region_id,
-               MAX(r.Name) AS region_name,
-               SUM({_SALE_QTY}) AS regional_units,
-               SUM({_SALE_AMOUNT}) AS regional_revenue_eur,
-               COUNT(DISTINCT o.ID) AS regional_order_count,
-               COUNT(DISTINCT ca.ClientID) AS regional_client_count
-        FROM dbo.OrderItem oi
-        JOIN dbo.[Order] o ON o.ID = oi.OrderID
-        JOIN dbo.ClientAgreement ca ON ca.ID = o.ClientAgreementID
-        JOIN dbo.Client c ON c.ID = ca.ClientID
-        LEFT JOIN dbo.Region r ON r.ID = c.RegionID
-        WHERE oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL AND oi.ProductID <> :synth
-              AND c.RegionID IS NOT NULL
-              AND {_SALES_HISTORY_WINDOW}{flt}{region_filter}
-        GROUP BY oi.ProductID, c.RegionID
-        """,
-        params,
-    )
+    flt = _in_filter("product_id", "p", product_ids, params) + _region_filter(region_id, params)
+    rows = canonical.financial_rows(query(canonical.facts_cte(returns=True) + f"""
+        SELECT product_id, region_id, MAX(region_name) AS region_name,
+               SUM(sold_qty) AS regional_units, SUM(returned_qty) AS returned_units,
+               COUNT(DISTINCT CASE WHEN is_return=0 THEN sale_id END) AS regional_order_count,
+               COUNT(DISTINCT client_id) AS regional_client_count,
+               {canonical.FINANCIAL_SELECT}
+        FROM financialFacts WHERE 1=1{flt}
+        GROUP BY product_id, region_id
+        """, params))
+    return [{**row, "regional_revenue_eur": row["revenue_eur"],
+             "regional_net_revenue_eur": row["net_revenue_eur"],
+             "regional_known_net_revenue_eur": row["known_net_revenue_eur"]} for row in rows]
 
 
 def regional_demand_summary(as_of: str, window_days: int) -> list[dict]:
-    """Portfolio demand summary by Client.RegionID over the sales window."""
+    """All current client regions, including unassigned, over one gross/net population."""
     _, params = _day_history_params(as_of, window_days)
-    params["synth"] = synthetic_product_id()
-    return query(
-        f"""
-        SELECT c.RegionID AS region_id,
-               MAX(r.Name) AS region_name,
-               COUNT(DISTINCT ca.ClientID) AS client_count,
-               COUNT(DISTINCT o.ID) AS order_count,
-               COUNT(DISTINCT oi.ProductID) AS product_count,
-               SUM({_SALE_QTY}) AS units,
-               SUM({_SALE_AMOUNT}) AS revenue_eur
-        FROM dbo.OrderItem oi
-        JOIN dbo.[Order] o ON o.ID = oi.OrderID
-        JOIN dbo.ClientAgreement ca ON ca.ID = o.ClientAgreementID
-        JOIN dbo.Client c ON c.ID = ca.ClientID
-        LEFT JOIN dbo.Region r ON r.ID = c.RegionID
-        WHERE oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL AND oi.ProductID <> :synth
-              AND c.RegionID IS NOT NULL
-              AND {_SALES_HISTORY_WINDOW}
-        GROUP BY c.RegionID
-        ORDER BY revenue_eur DESC
-        """,
-        params,
-    )
+    return canonical.financial_rows(query(canonical.facts_cte(returns=True) + f"""
+        SELECT region_id, MAX(region_name) AS region_name,
+               COUNT(DISTINCT client_id) AS client_count,
+               COUNT(DISTINCT CASE WHEN is_return=0 THEN sale_id END) AS order_count,
+               COUNT(DISTINCT product_id) AS product_count,
+               SUM(sold_qty) AS units, SUM(returned_qty) AS returned_units,
+               {canonical.FINANCIAL_SELECT}
+        FROM financialFacts GROUP BY region_id ORDER BY revenue_eur DESC
+        """, params))
 
 
 def product_meta(product_ids: Sequence[int], as_of: str) -> dict[int, dict]:
@@ -603,8 +457,8 @@ def product_meta(product_ids: Sequence[int], as_of: str) -> dict[int, dict]:
         ph, params = in_clause("p", chunk)
         params.update(
             {
-                "asof": as_of,
-                "source_history_start": source_window.source_history_start.isoformat(),
+                "asof": kyiv_midnight_utc(as_of),
+                "source_history_start": kyiv_midnight_utc(source_window.source_history_start),
             }
         )
         rows = query(

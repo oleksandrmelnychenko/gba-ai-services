@@ -1,0 +1,1 @@
+WHERE s.Deleted = 0 AND s.ChangedToInvoice IS NOT NULL AND NOT EXISTS (SELECT 1 FROM dbo.DataSyncAccountingSourceTarget accountingTarget WHERE accountingTarget.TargetEntityType = N'Sale' AND accountingTarget.TargetEntityID = s.ID AND accountingTarget.IsCurrent = 1 AND accountingTarget.OwnershipType = 1)
