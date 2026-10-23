@@ -1,6 +1,10 @@
 """Pure unit tests for Lens 4 margin/returns rankings (no DB, synthetic portfolio rows)."""
 from __future__ import annotations
 
+from decimal import Decimal
+import pytest
+
+from app.core import exact_numbers as exact
 from app.services import margin_returns as mr
 
 
@@ -118,3 +122,22 @@ def test_empty_rows_no_crash():
     assert s["total_skus"] == 0
     assert s["weighted_avg_margin_pct"] is None
     assert s["overall_return_rate"] == 0.0
+
+
+@pytest.mark.parametrize("amount,display,total", [("1.005", 1.01, 2.01), ("-1.005", -1.01, -2.01)])
+def test_margin_rows_expose_exact_additive_basis_for_summary(amount, display, total):
+    rows = [_row(pid, -0.1, display, annual_units=1) | {"financial_basis": {"revenue_eur": amount}}
+            for pid in (1, 2)]
+    negative = mr.negative_margin(rows)
+    assert [row["revenue_eur"] for row in negative] == [display, display]
+    assert all(row["financial_basis"]["revenue_eur"] == amount for row in negative)
+    exact_total = exact.money(sum(Decimal(row["financial_basis"]["revenue_eur"]) for row in negative), non_negative=False)
+    assert exact_total == total == mr.margin_returns_summary(rows)["eur_at_negative_margin"]
+    assert len(mr.margin_leaders(rows, limit=1)) == 1
+    assert len(negative) == 2  # complete negative population, independently of ranking limit
+
+
+def test_margin_basis_falls_back_to_legacy_displayed_revenue():
+    row = mr.margin_leaders([_row(1, 0.1, 12.34)], limit=1)[0]
+    assert row["financial_basis"] == {"revenue_eur": "12.34"}
+    assert row["revenue_eur"] == 12.34

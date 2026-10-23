@@ -37,6 +37,10 @@ def _enrich(row: dict) -> dict:
         row.get("revenue_eur") or 0,
         "revenue_eur",
     )
+    revenue_basis = exact.decimal_value(
+        row.get("financial_basis", {}).get("revenue_eur", revenue),
+        "raw revenue_eur",
+    )
     annual = exact.decimal_value(
         row.get("annual_units") or 0,
         "annual_units",
@@ -62,7 +66,8 @@ def _enrich(row: dict) -> dict:
             if margin_pct is not None
             else None
         ),
-        "revenue_eur": exact.money(revenue, "revenue_eur", non_negative=False),
+        "revenue_eur": exact.money(revenue_basis, "revenue_eur", non_negative=False),
+        "financial_basis": {"revenue_eur": format(revenue_basis, "f")},
         "unit_cost_eur": row.get("unit_cost_eur"),
         "avg_price_eur": row.get("avg_price_eur"),
         "annual_units": exact.quantity(annual, "annual_units", non_negative=False),
