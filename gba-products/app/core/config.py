@@ -3,13 +3,32 @@ from __future__ import annotations
 
 from datetime import date
 from functools import lru_cache
+from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    source_environment: Literal["local", "dev", "qa"] = "dev"
+    cache_namespace: str = "products"
+    warmers_enabled: bool = True
+
+    @model_validator(mode="after")
+    def validate_source_isolation(self):
+        if self.source_environment == "qa":
+            if (self.db_name, self.redis_db, self.cache_namespace) != ("ConcordDb_V5_QA", 12, "products-qa"):
+                raise ValueError("QA products requires isolated SQL, Redis DB and cache namespace")
+            if self.warmers_enabled:
+                raise ValueError("QA products background warmers must remain disabled")
+            if not self.internal_api_key or self.db_user.lower() == "sa":
+                raise ValueError("QA products requires a private API key and read-only SQL identity")
+        elif self.source_environment == "dev":
+            if (self.db_name, self.redis_db, self.cache_namespace) != ("ConcordDb_V5", 2, "products"):
+                raise ValueError("DEV products source configuration must not use another environment")
+        return self
 
     db_host: str = "127.0.0.1"
     db_port: int = 1433

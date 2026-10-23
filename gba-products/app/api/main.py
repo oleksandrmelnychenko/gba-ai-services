@@ -18,6 +18,7 @@ from app.core.config import get_settings
 from app.core.history import combined_history_metadata, day_history_window
 from app.core.logging import get_logger
 from app.core.metrics import METRICS
+from app.core.source import validate_source_database
 from app.data import cache
 from app.data import signals_repository as sig
 from app.data.db import dispose, get_engine
@@ -63,16 +64,20 @@ async def _portfolio_refresh_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    get_engine()
+    await asyncio.to_thread(validate_source_database, settings)
     if not settings.internal_api_key:
         log.warning("internal_api_key_not_set", note="gba-products running OPEN — set INTERNAL_API_KEY")
     log.info("synthetic_product_resolved", product_id=await asyncio.to_thread(sig.synthetic_product_id))
-    refresh_task = asyncio.create_task(_portfolio_refresh_loop())
+    refresh_task = asyncio.create_task(_portfolio_refresh_loop()) if settings.warmers_enabled else None
     log.info("service_starting", service="gba-products")
-    yield
-    refresh_task.cancel()
-    dispose()
-    log.info("service_stopped")
+    try:
+        yield
+    finally:
+        if refresh_task is not None:
+            refresh_task.cancel()
+            await asyncio.gather(refresh_task, return_exceptions=True)
+        dispose()
+        log.info("service_stopped")
 
 
 app = FastAPI(title="GBA Product Intelligence Service", version="0.1.0", lifespan=lifespan)
@@ -86,7 +91,27 @@ async def require_internal_key(request: Request, call_next):
         provided = request.headers.get("X-Internal-Api-Key", "")
         if not hmac.compare_digest(provided, settings.internal_api_key):
             return JSONResponse(status_code=401, content={"detail": "unauthorized"})
-    return await call_next(request)
+    expected = request.headers.get("X-GBA-Source-Environment", "")
+    if (expected and expected != settings.source_environment) or (
+        request.url.path not in _OPEN_PATHS and settings.source_environment == "qa" and expected != "qa"
+    ):
+        return JSONResponse(status_code=409, content={"detail": "source_environment_mismatch"})
+    response = await call_next(request)
+    response.headers["X-GBA-Source-Environment"] = settings.source_environment
+    return response
+
+
+@app.get("/source")
+def source_identity() -> dict:
+    return {
+        "sourceEnvironment": settings.source_environment,
+        "database": validate_source_database(settings),
+        "cacheNamespace": settings.cache_namespace,
+        "redisDb": settings.redis_db,
+        "warmersEnabled": settings.warmers_enabled,
+        "sourceHistoryStart": settings.source_history_start_date.isoformat(),
+        "modelVersion": settings.model_version,
+    }
 
 
 @app.middleware("http")
