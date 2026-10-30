@@ -75,16 +75,25 @@
     {
       "service": "gba-reco",
       "deployment_working_directory": "/root/projects/gba-reco",
-      "standalone_source_commit": "217838fd3bdf0232f854e6f432f846780f14a1be",
-      "standalone_source_tree": "0be2ef2f745229bfcb024e19a06828daaa324be2",
+      "standalone_source_commit": "ad9220936acc33ec95bed0d9dd5e5d6696b64899",
+      "standalone_source_tree": "bdc93cdc34ed9c1e04e0bedb813ffd4d5dac05fb",
       "standalone_worktree_clean_at_review": true,
       "published_subdirectory": "gba-reco",
-      "integrated_subtree_tree": "0be2ef2f745229bfcb024e19a06828daaa324be2",
-      "byte_identical_tracked_files": 54,
-      "standalone_tracked_files": 54,
+      "integrated_subtree_tree": "bdc93cdc34ed9c1e04e0bedb813ffd4d5dac05fb",
+      "byte_identical_tracked_files": 55,
+      "standalone_tracked_files": 55,
       "files_different_from_deployment_snapshot": [],
       "files_only_in_publication_tree": [],
-      "status": "running deployment snapshot; tracked tree exactly matches published subtree"
+      "status": "running deployment snapshot; tracked tree exactly matches published subtree",
+      "deployment_review_date": "2026-10-30",
+      "published_content_commit": "c51f8094ba39042199dbe88b39e0185a14be6147",
+      "web_deployment": {
+        "service": "gba-reco.service",
+        "scope": "Existing shared DEV/QA; PROD endpoint unconfigured",
+        "health_http_status": 200,
+        "normal_gba_inactive_and_active_agreement_cases": "DEV and QA passed",
+        "redis_workers_schedulers_restarted": false
+      }
     },
     {
       "service": "gba-solvency",
@@ -103,7 +112,7 @@
   ],
   "content_source_commit": "2d2368e3a648775a3063778630069389af0118a7",
   "alignment": {
-    "all_six_tracked_trees_match_published_subtrees": true,
+    "all_six_tracked_trees_match_published_subtrees": false,
     "all_six_primary_services_active_running": true,
     "ignored_runtime_configuration_preserved": true,
     "restarted_services": [
@@ -119,6 +128,46 @@
       "business_ready": true
     },
     "other_service_processes_restarted": false,
-    "standalone_git_mapping": "gba.sourceRepository + gba.sourceSubdirectory + gba.sourceCommit, not origin/main tracking"
+    "standalone_git_mapping": "gba.sourceRepository + gba.sourceSubdirectory + gba.sourceCommit, not origin/main tracking",
+    "last_observation": {
+      "date": "2026-10-30",
+      "tracked_tree_checks": {
+        "gba-forecast": {
+          "trackedTreeMatches": true,
+          "worktreeClean": false
+        },
+        "gba-pricing": {
+          "trackedTreeMatches": false,
+          "worktreeClean": false
+        },
+        "gba-procure": {
+          "trackedTreeMatches": false,
+          "worktreeClean": false
+        },
+        "gba-products": {
+          "trackedTreeMatches": false,
+          "worktreeClean": false
+        },
+        "gba-reco": {
+          "trackedTreeMatches": true,
+          "worktreeClean": true
+        },
+        "gba-solvency": {
+          "trackedTreeMatches": false,
+          "worktreeClean": false
+        }
+      },
+      "runtime_restarted_in_this_review": [
+        "gba-reco.service"
+      ]
+    }
+  },
+  "latest_service_review": {
+    "date": "2026-10-30",
+    "updated_services": [
+      "gba-reco"
+    ],
+    "published_content_commit": "c51f8094ba39042199dbe88b39e0185a14be6147",
+    "publication_is_not_runtime_deployment": true
   }
 }
