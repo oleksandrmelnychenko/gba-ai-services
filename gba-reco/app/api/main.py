@@ -222,7 +222,9 @@ def recommend(req: RecommendRequest) -> RecommendationResult:
             **({"client_agreement_net_id": str(req.client_agreement_net_id)}
                if req.client_agreement_net_id else {}),
         )
-    except (service.UnknownCustomerError, service.UnknownAgreementError) as exc:
+    except service.UnknownAgreementError as exc:
+        raise HTTPException(status_code=404, detail={"code": "client_agreement_unavailable"}) from exc
+    except service.UnknownCustomerError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         error_id = uuid.uuid4().hex
@@ -242,7 +244,7 @@ def recommend_copurchase(req: RecommendRequest) -> RecommendationResult:
             req.customer_id, str(req.client_agreement_net_id) if req.client_agreement_net_id else None,
         )
     except service.UnknownAgreementError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail={"code": "client_agreement_unavailable"}) from exc
     scope = {"client_agreement_net_id": agreement_uid} if agreement_uid else {}
     seeds = sorted(set(req.product_ids)) if req.product_ids else None
     if seeds:

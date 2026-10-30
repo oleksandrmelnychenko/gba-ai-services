@@ -27,7 +27,7 @@ To reach the dev DB by container name, run the api on the DB's network:
 ```bash
 docker run -d --name gba-reco-api --network gba-dev_default \
   -e DB_HOST=gba-dev-gba-mssql-1 -e DB_USER=gba_reco_ro -e DB_PASSWORD=... \
-  -e REDIS_HOST=gba-reco-redis -p 8000:8000 gba-reco:latest
+  -e REDIS_HOST=gba-reco-redis -p 127.0.0.1:8000:8000 gba-reco:latest
 ```
 
 ## 2b. Run locally

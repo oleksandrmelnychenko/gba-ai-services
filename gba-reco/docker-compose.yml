@@ -4,7 +4,7 @@ services:
     image: redis:7-alpine
     container_name: gba-reco-redis
     command: redis-server --appendonly yes --maxmemory 1gb --maxmemory-policy allkeys-lru
-    ports: ["6379:6379"]
+    ports: ["127.0.0.1:6379:6379"]
     volumes: ["redis_data:/data"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -20,7 +20,9 @@ services:
     environment:
       REDIS_HOST: redis
       SOURCE_HISTORY_START_DATE: "${SOURCE_HISTORY_START_DATE:-2025-01-01}"
-    ports: ["8000:8000"]
+    ports:
+      - "127.0.0.1:8000:8000"
+      - "172.17.0.1:8000:8000"
     depends_on:
       redis:
         condition: service_healthy

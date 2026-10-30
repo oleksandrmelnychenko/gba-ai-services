@@ -90,6 +90,7 @@ def test_foreign_or_inactive_agreement_fails_even_if_customer_exists(scoped_data
     response = TestClient(app).post(endpoint, json={"customer_id": 8, "client_agreement_net_id": A},
                                     headers={"X-Internal-Api-Key": get_settings().internal_api_key})
     assert response.status_code == 404
+    assert response.json() == {"detail": {"code": "client_agreement_unavailable"}}
 
 
 def test_copurchase_uses_selected_agreement_history_and_ownership(scoped_data, monkeypatch):

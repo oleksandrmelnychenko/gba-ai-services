@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     feedback_store_path: str = ""
 
     # API
-    api_host: str = "0.0.0.0"
+    api_host: str = "127.0.0.1"
     api_port: int = 8000
     log_level: str = "INFO"
     # Shared secret the trusted gba-server proxy must present (X-Internal-Api-Key).

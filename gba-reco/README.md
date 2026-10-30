@@ -21,7 +21,7 @@ Read-only over ConcordDb_V5: `ClientAgreement → Order → OrderItem`, groups v
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 cp .env.example .env   # fill DB_PASSWORD with the read-only login
-.venv/bin/uvicorn app.api.main:app --host 0.0.0.0 --port 8000
+.venv/bin/uvicorn app.api.main:app --host 127.0.0.1 --port 8000
 # smoke test:
 .venv/bin/python scripts/smoke_test.py
 # offline regression gate:
