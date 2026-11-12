@@ -53,19 +53,29 @@ def build_portfolio(as_of: str) -> dict:
         cfg.source_history_start_date,
     )
     month_days = cl.month_observed_days(labels, as_of, cfg.source_history_start_date)
+    history_months = max(cfg.classify_months, cfg.lifecycle_first_sale_months)
+    history_labels = cl.month_labels(as_of, history_months, cfg.source_history_start_date)
+    history_index = {label: index for index, label in enumerate(history_labels)}
+    classification_labels = set(labels)
     monthly: dict[int, dict[str, Decimal]] = {}
-    for r in sig.monthly_units(as_of, cfg.classify_months):
+    first_sale_index: dict[int, int] = {}
+    seen_months: set[tuple[int, str]] = set()
+    for r in sig.monthly_units(as_of, history_months):
         pid = exact.positive_int(r.get("product_id"), "monthly_units.product_id")
         label = str(r.get("ym") or "")
-        if label not in labels:
+        if label not in history_index:
             raise ValueError(f"monthly_units returned unexpected month {label!r}")
-        product_months = monthly.setdefault(pid, {})
-        if label in product_months:
+        if (pid, label) in seen_months:
             raise ValueError(f"monthly_units returned duplicate ({pid}, {label})")
-        product_months[label] = exact.decimal_value(
+        seen_months.add((pid, label))
+        units = exact.decimal_value(
             r.get("units") or 0,
             "monthly_units.units",
         )
+        if units > 0:
+            first_sale_index[pid] = min(first_sale_index.get(pid, history_index[label]), history_index[label])
+        if label in classification_labels:
+            monthly.setdefault(pid, {})[label] = units
 
     universe = set(stock) | set(monthly) | set(vel) | set(prices) | set(net_returns) | set(rets)
     rows: list[dict] = []
@@ -117,8 +127,12 @@ def build_portfolio(as_of: str) -> dict:
             Decimal("0"),
         )
         xyz = cl.xyz_classify(cl.demand_variability(series, cfg), cfg)
-        nonzero = [i for i, u in enumerate(series) if u > 0]
-        days_since_first = ((len(series) - 1 - nonzero[0]) * 30 + 15) if nonzero else None
+        first_index = first_sale_index.get(pid)
+        days_since_first = (
+            (len(history_labels) - 1 - first_index) * 30 + 15
+            if first_index is not None
+            else None
+        )
         lifecycle = cl.lifecycle_from_series(
             series, days_since_first, pid in sold_recently, cfg, month_days=month_days)
 

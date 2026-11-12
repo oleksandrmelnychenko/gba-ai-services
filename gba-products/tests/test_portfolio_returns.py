@@ -86,3 +86,51 @@ def test_public_units_and_return_rate_share_their_own_sales_window(monkeypatch):
     assert row["classification_units"] == 4
     assert row["return_rate"] == 0.2
     assert row["net_revenue_eur"] == 95
+
+
+def _lifecycle_portfolio(monkeypatch, monthly_rows):
+    captured = {}
+
+    def monthly_units(_as_of, months):
+        captured["months"] = months
+        return monthly_rows
+
+    monkeypatch.setattr(portfolio.sig, "on_hand_stock", lambda: [])
+    monkeypatch.setattr(portfolio.sig, "sales_velocity", lambda *_: [{"product_id": 42, "sold_qty": 3}])
+    monkeypatch.setattr(portfolio.sig, "sold_product_ids", lambda *_: {42})
+    monkeypatch.setattr(portfolio.sig, "avg_sale_price_eur", lambda *_: [{"product_id": 42, "sold_qty": 3, "revenue_eur": 30, "avg_price_eur": 10}])
+    monkeypatch.setattr(portfolio.sig, "returns_for_products", lambda *_: [])
+    monkeypatch.setattr(portfolio.sig, "monthly_units", monthly_units)
+    result = portfolio.build_portfolio("2026-07-25")
+    return result, captured
+
+
+def test_first_sale_this_quarter_is_new(monkeypatch):
+    result, captured = _lifecycle_portfolio(
+        monkeypatch, [{"product_id": 42, "ym": "2026-07", "units": 3}])
+    assert captured["months"] >= 60
+    assert result["rows"][0]["lifecycle"] == "new"
+
+
+def test_returning_product_sold_before_the_classification_window_is_not_new(monkeypatch):
+    result, _ = _lifecycle_portfolio(monkeypatch, [
+        {"product_id": 42, "ym": "2025-03", "units": 2},
+        {"product_id": 42, "ym": "2026-07", "units": 3},
+    ])
+    row = result["rows"][0]
+    assert row["lifecycle"] == "mature"
+    assert row["classification_units"] == 3
+
+
+def test_history_only_products_do_not_join_the_portfolio(monkeypatch):
+    result, _ = _lifecycle_portfolio(monkeypatch, [
+        {"product_id": 42, "ym": "2026-07", "units": 3},
+        {"product_id": 77, "ym": "2025-02", "units": 9},
+    ])
+    assert [row["product_id"] for row in result["rows"]] == [42]
+
+
+def test_months_before_the_source_floor_are_still_rejected(monkeypatch):
+    import pytest
+    with pytest.raises(ValueError, match="unexpected month"):
+        _lifecycle_portfolio(monkeypatch, [{"product_id": 42, "ym": "2024-12", "units": 3}])

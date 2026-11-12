@@ -73,7 +73,8 @@ class Settings(BaseSettings):
     # v5 adds the factual source-history floor and invalidates every pre-floor dense/cache outcome.
     # v7 adds the minimum-volume rule to growing/declining lifecycle labels.
     # v8 compares the lifecycle halves as daily rates (the as-of month is partial).
-    model_version: str = "products-v8-confirmed-sales-kyiv"
+    # v9 dates the first sale over the whole factual history, so returning SKUs are not "new".
+    model_version: str = "products-v9-confirmed-sales-kyiv"
 
     # Earliest factually available historical source date. All rolling SQL, dense grids,
     # denominators, producer lookups, API metadata, and cache epochs are clamped to this floor.
@@ -106,6 +107,10 @@ class Settings(BaseSettings):
     abc_a_share: float = 0.80            # cumulative trailing revenue share boundary for A
     abc_b_share: float = 0.95            # ...and for B (rest = C)
     lifecycle_new_days: int = 90         # younger than this since first sale => new
+    # The first sale is looked up over this many months (clamped to the source-history floor),
+    # not over the classification window: a SKU that sold more than a year ago and sells again
+    # is a returning product, not a new one.
+    lifecycle_first_sale_months: int = 60
     # Lifecycle trend window: recent N months vs the preceding N. Longer than the generic
     # trend split so a single quiet quarter does not read as decline; calibrated to 6.
     lifecycle_trend_months: int = 6
