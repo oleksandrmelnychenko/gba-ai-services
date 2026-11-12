@@ -72,7 +72,8 @@ class Settings(BaseSettings):
     # ProductAvailability, and v4 makes all currency/quantity boundaries Decimal + HALF_UP.
     # v5 adds the factual source-history floor and invalidates every pre-floor dense/cache outcome.
     # v7 adds the minimum-volume rule to growing/declining lifecycle labels.
-    model_version: str = "products-v7-confirmed-sales-kyiv"
+    # v8 compares the lifecycle halves as daily rates (the as-of month is partial).
+    model_version: str = "products-v8-confirmed-sales-kyiv"
 
     # Earliest factually available historical source date. All rolling SQL, dense grids,
     # denominators, producer lookups, API metadata, and cache epochs are clamped to this floor.

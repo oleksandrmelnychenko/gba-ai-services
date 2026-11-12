@@ -52,6 +52,7 @@ def build_portfolio(as_of: str) -> dict:
         cfg.classify_months,
         cfg.source_history_start_date,
     )
+    month_days = cl.month_observed_days(labels, as_of, cfg.source_history_start_date)
     monthly: dict[int, dict[str, Decimal]] = {}
     for r in sig.monthly_units(as_of, cfg.classify_months):
         pid = exact.positive_int(r.get("product_id"), "monthly_units.product_id")
@@ -118,7 +119,8 @@ def build_portfolio(as_of: str) -> dict:
         xyz = cl.xyz_classify(cl.demand_variability(series, cfg), cfg)
         nonzero = [i for i, u in enumerate(series) if u > 0]
         days_since_first = ((len(series) - 1 - nonzero[0]) * 30 + 15) if nonzero else None
-        lifecycle = cl.lifecycle_from_series(series, days_since_first, pid in sold_recently, cfg)
+        lifecycle = cl.lifecycle_from_series(
+            series, days_since_first, pid in sold_recently, cfg, month_days=month_days)
 
         price_row = prices.get(pid)
         revenue_eur = exact.decimal_value(

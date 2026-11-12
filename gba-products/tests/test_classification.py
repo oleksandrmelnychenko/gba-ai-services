@@ -164,3 +164,34 @@ def test_months_since_last_sale():
 
 def test_split_recent_prior():
     assert cl.split_recent_prior([1, 2, 3, 4, 5, 6], 3) == (15, 6)
+
+
+def test_month_observed_days_counts_partial_as_of_month_and_source_floor():
+    labels = cl.month_labels("2026-11-12", 3, date(2025, 1, 1))
+    assert cl.month_observed_days(labels, "2026-11-12", date(2025, 1, 1)) == [30, 31, 11]
+    assert cl.month_observed_days(["2026-10", "2026-11"], "2026-11-01") == [31, 0]
+    assert cl.month_observed_days(["2025-01", "2025-02"], "2025-02-10", date(2025, 1, 15)) == [17, 9]
+
+
+def test_lifecycle_trend_compares_daily_rates_when_exposure_is_known():
+    assert cl.lifecycle_classify(400, 10, 20, True, CFG) is LifecycleStage.DECLINING
+    assert cl.lifecycle_classify(400, 10, 20, True, CFG,
+                                 recent_days=92, prior_days=184) is LifecycleStage.MATURE
+    assert cl.lifecycle_classify(400, 21, 20, True, CFG) is LifecycleStage.MATURE
+    assert cl.lifecycle_classify(400, 21, 20, True, CFG,
+                                 recent_days=150, prior_days=181) is LifecycleStage.GROWING
+    assert cl.lifecycle_classify(400, 5, 20, True, CFG,
+                                 recent_days=150, prior_days=181) is LifecycleStage.DECLINING
+    assert cl.lifecycle_classify(400, 10, 20, True, CFG,
+                                 recent_days=0, prior_days=181) is LifecycleStage.MATURE
+
+
+def test_lifecycle_from_series_ignores_the_missing_days_of_the_as_of_month():
+    steady = [10.0] * 11 + [0.0]
+    full_months = [31, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 0]
+    assert cl.lifecycle_from_series(steady, 350, True, CFG, month_days=full_months) is LifecycleStage.MATURE
+    half = [20.0] * 6 + [12.0] * 5 + [0.0]
+    assert cl.lifecycle_from_series(half, 350, True, CFG) is LifecycleStage.DECLINING
+    assert cl.lifecycle_from_series(half, 350, True, CFG, month_days=full_months) is LifecycleStage.MATURE
+    with pytest.raises(ValueError, match="month_days"):
+        cl.lifecycle_from_series(steady, 350, True, CFG, month_days=[30])

@@ -37,6 +37,28 @@ def month_labels(
     return out
 
 
+def month_observed_days(
+    labels: list[str],
+    as_of: str,
+    source_history_start: date | None = None,
+) -> list[int]:
+    """Observed days per label inside ``[source_history_start, as_of)``.
+
+    The as-of month is partial and the first label can be cut by the source floor, so equal
+    month counts do not mean equal exposure.
+    """
+    end = datetime.strptime(as_of, "%Y-%m-%d").date()
+    out: list[int] = []
+    for label in labels:
+        year, month = int(label[:4]), int(label[5:7])
+        start = date(year, month, 1)
+        following = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+        if source_history_start is not None:
+            start = max(start, source_history_start)
+        out.append(max(0, (min(following, end) - start).days))
+    return out
+
+
 def series_from(units_by_ym: dict[str, float], labels: list[str]) -> list[float]:
     """Dense monthly series over labels; missing months are 0 (intermittent demand counts)."""
     return [float(units_by_ym.get(lbl, 0.0)) for lbl in labels]
@@ -93,7 +115,9 @@ def xyz_classify(variability: float, cfg: Settings) -> XyzClass:
 
 def lifecycle_classify(days_since_first: int | None, recent_units: float, prior_units: float,
                        sold_in_dead_window: bool, cfg: Settings,
-                       months_since_last: int | None = None) -> LifecycleStage:
+                       months_since_last: int | None = None,
+                       recent_days: int | None = None,
+                       prior_days: int | None = None) -> LifecycleStage:
     """Lifecycle stage from a recent-vs-prior demand split.
 
     DECLINING is reserved for genuine decline: either a downward trend with demand still in the
@@ -104,6 +128,9 @@ def lifecycle_classify(days_since_first: int | None, recent_units: float, prior_
 
     `months_since_last` is months since the most recent sale (0 = current month). When omitted
     the dormancy split cannot be made and the function falls back to the legacy recent/prior rule.
+
+    `recent_days` / `prior_days` are the observed days behind the two totals. When both are given
+    the trend compares daily rates, so a partial as-of month is not read as a drop in demand.
     """
     if not sold_in_dead_window:
         return LifecycleStage.DEAD
@@ -122,9 +149,14 @@ def lifecycle_classify(days_since_first: int | None, recent_units: float, prior_
         return LifecycleStage.MATURE
     if prior_units <= 0:
         return LifecycleStage.GROWING
-    if recent_units >= prior_units * cfg.lifecycle_growing_factor:
+    expected_units = prior_units
+    if recent_days is not None and prior_days is not None:
+        if recent_days <= 0 or prior_days <= 0:
+            return LifecycleStage.MATURE
+        expected_units = prior_units * recent_days / prior_days
+    if recent_units >= expected_units * cfg.lifecycle_growing_factor:
         return LifecycleStage.GROWING
-    if recent_units <= prior_units * cfg.lifecycle_declining_factor:
+    if recent_units <= expected_units * cfg.lifecycle_declining_factor:
         return LifecycleStage.DECLINING
     return LifecycleStage.MATURE
 
@@ -136,13 +168,25 @@ def months_since_last_sale(series: list[float]) -> int | None:
 
 
 def lifecycle_from_series(series: list[float], days_since_first: int | None,
-                          sold_in_dead_window: bool, cfg: Settings) -> LifecycleStage:
+                          sold_in_dead_window: bool, cfg: Settings,
+                          month_days: list[int] | None = None) -> LifecycleStage:
     """Series-first lifecycle: splits recent/prior over cfg.lifecycle_trend_months and supplies
     the dormancy signal. This is the entry point callers should use (computes the split for you).
+
+    `month_days` (observed days per series month, see `month_observed_days`) makes the trend
+    exposure-aware; without it the two halves are compared as raw totals.
     """
     recent, prior = split_recent_prior(series, cfg.lifecycle_trend_months)
+    recent_days = prior_days = None
+    if month_days is not None:
+        if len(month_days) != len(series):
+            raise ValueError("month_days must match the series length")
+        recent_days, prior_days = (
+            int(value) for value in split_recent_prior(month_days, cfg.lifecycle_trend_months)
+        )
     return lifecycle_classify(days_since_first, recent, prior, sold_in_dead_window, cfg,
-                              months_since_last=months_since_last_sale(series))
+                              months_since_last=months_since_last_sale(series),
+                              recent_days=recent_days, prior_days=prior_days)
 
 
 def abc_classify(cumulative_share: float, cfg: Settings) -> AbcClass:
