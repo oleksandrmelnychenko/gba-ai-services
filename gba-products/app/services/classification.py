@@ -104,6 +104,36 @@ def demand_variability(series: list[float], cfg: Settings) -> float:
     return demand_cv(series)
 
 
+def demand_frequency(series: list[float], month_days: list[int] | None = None) -> float:
+    """Share of observed months with demand (0..1); months with no observed day are skipped."""
+    if month_days is not None:
+        if len(month_days) != len(series):
+            raise ValueError("month_days must match the series length")
+        observed = [units for units, days in zip(series, month_days, strict=True) if days > 0]
+    else:
+        observed = list(series)
+    if not observed:
+        return 0.0
+    return sum(1 for units in observed if units > 0) / len(observed)
+
+
+def xyz_from_series(series: list[float], cfg: Settings,
+                    month_days: list[int] | None = None) -> XyzClass:
+    """X/Y/Z for a dense monthly series by `cfg.xyz_method`.
+
+    'frequency' ranks by how often the SKU sells: X in at least `xyz_x_min_share` of the observed
+    months, Y in at least `xyz_y_min_share`, else Z. 'cv' and 'interval' keep the variability cuts.
+    """
+    if cfg.xyz_method == "frequency":
+        share = demand_frequency(series, month_days)
+        if share >= cfg.xyz_x_min_share:
+            return XyzClass.X
+        if share >= cfg.xyz_y_min_share:
+            return XyzClass.Y
+        return XyzClass.Z
+    return xyz_classify(demand_variability(series, cfg), cfg)
+
+
 def xyz_classify(variability: float, cfg: Settings) -> XyzClass:
     """Map a variability statistic (from `demand_variability`) to X/Y/Z via the configured cuts."""
     if variability < cfg.xyz_x_cut:

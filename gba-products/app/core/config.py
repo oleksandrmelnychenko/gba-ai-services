@@ -74,7 +74,8 @@ class Settings(BaseSettings):
     # v7 adds the minimum-volume rule to growing/declining lifecycle labels.
     # v8 compares the lifecycle halves as daily rates (the as-of month is partial).
     # v9 dates the first sale over the whole factual history, so returning SKUs are not "new".
-    model_version: str = "products-v9-confirmed-sales-kyiv"
+    # v10 grades XYZ by demand frequency instead of the inter-demand interval CV.
+    model_version: str = "products-v10-confirmed-sales-kyiv"
 
     # Earliest factually available historical source date. All rolling SQL, dense grids,
     # denominators, producer lookups, API metadata, and cache epochs are clamped to this floor.
@@ -98,10 +99,14 @@ class Settings(BaseSettings):
     # Classification + health-score (Lens 1) — env-tunable, calibrate on real data.
     classify_months: int = 12            # monthly demand window for XYZ / trend / lifecycle
     trend_recent_months: int = 3         # recent vs prior split (kept for callers/back-compat)
-    # XYZ variability method. "cv" = classic CV over the dense monthly grid (collapses to ~87% Z
-    # under intermittent B2B demand); "interval" = CV of inter-demand intervals (Croston-style),
-    # which measures cadence-regularity and discriminates far better on real data. Default interval.
-    xyz_method: str = "interval"         # "cv" | "interval"
+    # XYZ method. "frequency" (default) = share of observed months with demand: on 8 rolling
+    # origins it orders SKUs by the chance of a sale in the next 90 days (X 94%, Y 72%, Z 36%).
+    # "interval" = CV of inter-demand intervals: a SKU sold in exactly two months has one gap,
+    # CV 0, and was graded X (half of the old X class). "cv" = classic CV over the dense grid
+    # (about 88% Z under intermittent demand). The two cuts below serve "interval" and "cv" only.
+    xyz_method: Literal["frequency", "interval", "cv"] = "frequency"
+    xyz_x_min_share: float = 0.75        # demand in at least this share of months => X
+    xyz_y_min_share: float = 0.33        # ...at least this share => Y, else Z
     xyz_x_cut: float = 0.3               # variability below this => X (regular/stable)
     xyz_y_cut: float = 0.6               # below this => Y, else Z (erratic/intermittent)
     abc_a_share: float = 0.80            # cumulative trailing revenue share boundary for A

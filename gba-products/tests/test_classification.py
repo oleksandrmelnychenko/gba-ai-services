@@ -195,3 +195,37 @@ def test_lifecycle_from_series_ignores_the_missing_days_of_the_as_of_month():
     assert cl.lifecycle_from_series(half, 350, True, CFG, month_days=full_months) is LifecycleStage.MATURE
     with pytest.raises(ValueError, match="month_days"):
         cl.lifecycle_from_series(steady, 350, True, CFG, month_days=[30])
+
+
+def test_demand_frequency_skips_months_without_observed_days():
+    assert cl.demand_frequency([1, 0, 2, 0]) == 0.5
+    assert cl.demand_frequency([1, 1, 1, 0], [30, 31, 30, 0]) == 1.0
+    assert cl.demand_frequency([], []) == 0.0
+    with pytest.raises(ValueError, match="month_days"):
+        cl.demand_frequency([1, 0], [30])
+
+
+def test_xyz_default_grades_by_selling_frequency():
+    assert CFG.xyz_method == "frequency"
+    nine_of_twelve = [3, 1, 0, 2, 5, 1, 0, 1, 1, 0, 2, 4]
+    four_of_twelve = [0, 0, 7, 0, 0, 1, 0, 0, 2, 0, 0, 3]
+    three_of_twelve = [0, 0, 7, 0, 0, 1, 0, 0, 2, 0, 0, 0]
+    assert cl.xyz_from_series(nine_of_twelve, CFG) is XyzClass.X
+    assert cl.xyz_from_series(four_of_twelve, CFG) is XyzClass.Y
+    assert cl.xyz_from_series(three_of_twelve, CFG) is XyzClass.Z
+    assert cl.xyz_from_series([0] * 12, CFG) is XyzClass.Z
+
+
+def test_two_sales_a_year_are_no_longer_the_most_stable_class():
+    two_sales = [0, 0, 4, 0, 0, 0, 0, 0, 6, 0, 0, 0]
+    interval_cfg = CFG.model_copy(update={"xyz_method": "interval"})
+    assert cl.xyz_from_series(two_sales, interval_cfg) is XyzClass.X
+    assert cl.xyz_from_series(two_sales, CFG) is XyzClass.Z
+
+
+def test_xyz_frequency_ignores_an_as_of_month_with_no_observed_day():
+    eight_of_eleven = [1, 1, 1, 0, 1, 1, 0, 1, 1, 0, 1, 0]
+    on_the_first = [31, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 0]
+    assert cl.xyz_from_series(eight_of_eleven, CFG) is XyzClass.Y
+    nine_of_eleven = [1, 1, 1, 1, 1, 1, 0, 1, 1, 0, 1, 0]
+    assert cl.xyz_from_series(nine_of_eleven, CFG, on_the_first) is XyzClass.X

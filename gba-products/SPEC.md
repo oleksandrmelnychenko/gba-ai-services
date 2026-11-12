@@ -88,8 +88,10 @@ Catalog 373,741 (Deleted=0) · sold last 12mo 12,935 · **on-hand stock 4,634 SK
 - **ABC** by cumulative trailing revenue contribution (A=top 80%, B=next 15%, C=last 5%). This is
   deliberately revenue-based: purchase cost only exists for stocked SKUs, so a margin-ABC would drop
   every order-to-demand SKU.
-- **XYZ** by demand cadence variability over the trailing monthly grid.
-- **Lifecycle**: new (<90d since first sale) / growing / mature / declining / dead — from trend + recency + age.
+- **XYZ** by demand frequency over the trailing monthly grid: X sells in at least 75% of the
+  observed months, Y in at least a third, Z less often (`xyz_method=frequency`).
+- **Lifecycle**: new (<90d since the first sale in the whole factual history) / growing / mature /
+  declining / dead — from trend (daily rates of the two six-month halves) + recency + age.
 - **Health-score** = weighted triage blend (weights env-tunable, A/B-versioned like the siblings):
   stock-balance + lifecycle trend + margin + demand-stability + return-rate penalty + ABC/trailing
   revenue. `products-v2-abc` adds the ABC component because 2025-06/09/12 real-data snapshots showed

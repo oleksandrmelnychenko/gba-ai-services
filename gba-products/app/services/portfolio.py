@@ -126,7 +126,7 @@ def build_portfolio(as_of: str) -> dict:
             (monthly_values.get(label, Decimal("0")) for label in labels),
             Decimal("0"),
         )
-        xyz = cl.xyz_classify(cl.demand_variability(series, cfg), cfg)
+        xyz = cl.xyz_from_series(series, cfg, month_days)
         first_index = first_sale_index.get(pid)
         days_since_first = (
             (len(history_labels) - 1 - first_index) * 30 + 15
