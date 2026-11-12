@@ -46,6 +46,12 @@ class Settings(BaseSettings):
     # rebuild cold every hour).
     cache_ttl: int = 90000
 
+    # The product-page facts (product x month, product x region) cover closed days only, so they
+    # change during a day only through backdated or late-imported documents. They are built once
+    # per cache generation and rebuilt when older than this, which bounds that staleness without
+    # repeating the two catalog-wide passes (about 36 s of SQL together) every hour.
+    product_facts_refresh_seconds: int = 21600
+
     api_host: str = "0.0.0.0"
     api_port: int = 8005
     log_level: str = "INFO"
@@ -65,7 +71,8 @@ class Settings(BaseSettings):
     # Stock semantics changed from the now-empty ReSaleAvailability cost layer to operational
     # ProductAvailability, and v4 makes all currency/quantity boundaries Decimal + HALF_UP.
     # v5 adds the factual source-history floor and invalidates every pre-floor dense/cache outcome.
-    model_version: str = "products-v6-confirmed-sales-kyiv"
+    # v7 adds the minimum-volume rule to growing/declining lifecycle labels.
+    model_version: str = "products-v7-confirmed-sales-kyiv"
 
     # Earliest factually available historical source date. All rolling SQL, dense grids,
     # denominators, producer lookups, API metadata, and cache epochs are clamped to this floor.
@@ -103,6 +110,11 @@ class Settings(BaseSettings):
     lifecycle_trend_months: int = 6
     lifecycle_growing_factor: float = 1.2  # recent rate >= prior * this => growing
     lifecycle_declining_factor: float = 0.5  # recent rate <= prior * this => declining
+    # Growing/declining are trend claims and need volume behind them: recent + prior units over
+    # the two compared windows must reach this floor, otherwise a selling SKU is MATURE. Under
+    # "no trend" each unit lands in either half with p=0.5, so all of 6 units falling into the
+    # recent half has probability 1.6% (5 units: 3.1%, 2 units: 25% — the old "growing" noise).
+    lifecycle_min_trend_units: float = 6.0
     # A SKU with NO demand in the trend window but sales earlier in the year is dormant, not
     # automatically declining. It only counts as DECLINING once its last sale is at least this
     # many months back (a genuine long fade); a shorter lull reads as MATURE.

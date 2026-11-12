@@ -119,7 +119,25 @@ def test_lifecycle_dormant_split_not_blanket_declining():
 def test_lifecycle_legacy_fallback_without_dormancy():
     # When months_since_last is omitted, the legacy recent/prior rule applies (back-compat).
     assert cl.lifecycle_classify(400, 0, 0, sold_in_dead_window=True, cfg=CFG) is LifecycleStage.DECLINING
-    assert cl.lifecycle_classify(400, 3, 0, sold_in_dead_window=True, cfg=CFG) is LifecycleStage.GROWING
+    assert cl.lifecycle_classify(400, 8, 0, sold_in_dead_window=True, cfg=CFG) is LifecycleStage.GROWING
+
+
+def test_trend_labels_need_minimum_volume():
+    assert CFG.lifecycle_min_trend_units == 6.0
+    assert cl.lifecycle_classify(400, 2, 0, sold_in_dead_window=True, cfg=CFG) is LifecycleStage.MATURE
+    assert cl.lifecycle_classify(400, 4, 1, sold_in_dead_window=True, cfg=CFG) is LifecycleStage.MATURE
+    assert cl.lifecycle_classify(400, 1, 4, sold_in_dead_window=True, cfg=CFG) is LifecycleStage.MATURE
+    assert cl.lifecycle_classify(400, 6, 0, sold_in_dead_window=True, cfg=CFG) is LifecycleStage.GROWING
+    assert cl.lifecycle_classify(400, 1, 5, sold_in_dead_window=True, cfg=CFG) is LifecycleStage.DECLINING
+
+
+def test_minimum_volume_rule_keeps_new_dead_and_dormancy_labels():
+    assert cl.lifecycle_classify(30, 1, 0, sold_in_dead_window=True, cfg=CFG) is LifecycleStage.NEW
+    assert cl.lifecycle_classify(400, 1, 0, sold_in_dead_window=False, cfg=CFG) is LifecycleStage.DEAD
+    assert cl.lifecycle_classify(400, 0, 2, sold_in_dead_window=True, cfg=CFG,
+                                 months_since_last=10) is LifecycleStage.DECLINING
+    two_units_a_year = [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0]
+    assert cl.lifecycle_from_series(two_units_a_year, 350, True, CFG) is LifecycleStage.MATURE
 
 
 def test_lifecycle_from_series():

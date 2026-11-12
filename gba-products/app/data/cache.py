@@ -79,6 +79,36 @@ def set(key: str, value: dict[str, Any], ttl: int | None = None) -> None:
         log.warning("cache_set_failed", error=str(exc))
 
 
+def hash_fields(key: str, fields: list[str]) -> list[str | None] | None:
+    client = _get_client()
+    if client is None:
+        return None
+    try:
+        return client.hmget(key, fields)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("cache_hash_get_failed", error=str(exc))
+        return None
+
+
+def replace_hash(key: str, mapping: dict[str, str], ttl: int | None = None) -> bool:
+    client = _get_client()
+    if client is None or not mapping:
+        return False
+    ttl = ttl or get_settings().cache_ttl
+    staging = f"{key}:staging"
+    items = list(mapping.items())
+    try:
+        client.delete(staging)
+        for offset in range(0, len(items), 2000):
+            client.hset(staging, mapping=dict(items[offset:offset + 2000]))
+        client.expire(staging, ttl)
+        client.rename(staging, key)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("cache_hash_set_failed", error=str(exc))
+        return False
+    return True
+
+
 def health() -> bool:
     client = _get_client()
     if client is None:

@@ -170,7 +170,7 @@ def test_route_validates_date_product_id_and_month_bounds_before_query(monkeypat
 
 
 def test_route_does_not_zero_fill_months_before_source_history(monkeypatch):
-    _stub_profile(monkeypatch)
+    _stub_profile(monkeypatch, meta={42: {"product_id": 42, "name": "Catalog only product"}})
     monkeypatch.setattr(main.sig, "monthly_product_sales", lambda *args: [])
 
     response = client.get(
@@ -190,7 +190,7 @@ def test_route_does_not_zero_fill_months_before_source_history(monkeypatch):
 
 
 def test_malformed_repository_bucket_is_reported_as_generic_endpoint_failure(monkeypatch):
-    _stub_profile(monkeypatch)
+    _stub_profile(monkeypatch, meta={42: {"product_id": 42, "name": "Catalog only product"}})
     monkeypatch.setattr(
         main.sig,
         "monthly_product_sales",

@@ -413,12 +413,11 @@ def _region_filter(region_id: int | None, params: dict) -> str:
     return ""
 
 
-def regional_product_sales(as_of: str, window_days: int, product_ids: Sequence[int] | None = None,
-                           region_id: int | None = None) -> list[dict]:
-    """Current client region over canonical gross/net facts; null region is retained once."""
+def _regional_product_sales_raw(as_of: str, window_days: int, product_ids: Sequence[int] | None = None,
+                                region_id: int | None = None) -> list[dict]:
     _, params = _day_history_params(as_of, window_days)
     flt = _in_filter("product_id", "p", product_ids, params) + _region_filter(region_id, params)
-    rows = canonical.financial_rows(query(canonical.facts_cte(returns=True) + f"""
+    return query(canonical.facts_cte(returns=True) + f"""
         SELECT product_id, region_id, MAX(region_name) AS region_name,
                SUM(sold_qty) AS regional_units, SUM(returned_qty) AS returned_units,
                COUNT(DISTINCT CASE WHEN is_return=0 THEN sale_id END) AS regional_order_count,
@@ -426,10 +425,38 @@ def regional_product_sales(as_of: str, window_days: int, product_ids: Sequence[i
                {canonical.FINANCIAL_SELECT}
         FROM financialFacts WHERE 1=1{flt}
         GROUP BY product_id, region_id
-        """, params))
+        """, params)
+
+
+def finalize_regional_rows(rows: list[dict]) -> list[dict]:
     return [{**row, "regional_revenue_eur": row["revenue_eur"],
              "regional_net_revenue_eur": row["net_revenue_eur"],
-             "regional_known_net_revenue_eur": row["known_net_revenue_eur"]} for row in rows]
+             "regional_known_net_revenue_eur": row["known_net_revenue_eur"]}
+            for row in canonical.financial_rows(rows)]
+
+
+def regional_product_sales(as_of: str, window_days: int, product_ids: Sequence[int] | None = None,
+                           region_id: int | None = None) -> list[dict]:
+    """Current client region over canonical gross/net facts; null region is retained once."""
+    return finalize_regional_rows(_regional_product_sales_raw(as_of, window_days, product_ids, region_id))
+
+
+def regional_sales_all_products(as_of: str, window_days: int) -> list[dict]:
+    """Unvalidated product x region aggregates for the whole catalog in one pass."""
+    return _regional_product_sales_raw(as_of, window_days)
+
+
+def monthly_sales_all_products(as_of: str, months: int) -> list[dict]:
+    """Unvalidated product x Kyiv month aggregates for the whole catalog in one pass."""
+    _, params = _month_history_params(as_of, months)
+    return query(canonical.facts_cte(returns=True) + f"""
+        SELECT product_id, CONVERT(char(7), event_local, 126) AS ym,
+               SUM(sold_qty) AS units, SUM(returned_qty) AS returned_units,
+               COUNT(DISTINCT CASE WHEN is_return=0 THEN sale_id END) AS order_count,
+               {canonical.FINANCIAL_SELECT}
+        FROM financialFacts
+        GROUP BY product_id, CONVERT(char(7), event_local, 126)
+        """, params)
 
 
 def regional_demand_summary(as_of: str, window_days: int) -> list[dict]:

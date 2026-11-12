@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.core import exact_numbers as exact
+from app.core import memory
 from app.core.config import get_settings
 from app.core.history import combined_history_metadata, day_history_window
 from app.core.logging import get_logger
@@ -35,6 +36,7 @@ from app.services import (
     margin_returns,
     portfolio,
     product_analytics,
+    product_facts,
     stock_health,
     substitution,
 )
@@ -48,6 +50,9 @@ _OPEN_PATHS = {"/health"}
 # The day's portfolio snapshot lives ~25h in Redis (see settings.cache_ttl); this in-process
 # loop keeps it FRESH by rebuilding it hourly, so no dashboard request ever pays the cold build.
 _PORTFOLIO_REFRESH_SECONDS = 3600
+_MAX_LIMIT = 1000
+_FACTS_RETRY_SECONDS = 60.0
+Limit = Annotated[int, Query(ge=1, le=_MAX_LIMIT)]
 
 
 async def _portfolio_refresh_loop() -> None:
@@ -60,6 +65,12 @@ async def _portfolio_refresh_loop() -> None:
             await asyncio.to_thread(_build_and_cache_stock, as_of)
         except Exception as exc:  # noqa: BLE001
             log.warning("portfolio_refresh_failed", error=str(exc))
+        try:
+            if await asyncio.to_thread(product_facts.due, as_of, _region_window(None),
+                                       settings.product_facts_refresh_seconds):
+                await asyncio.to_thread(_build_and_cache_product_facts, as_of)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("product_facts_refresh_failed", error=str(exc))
         await asyncio.sleep(_PORTFOLIO_REFRESH_SECONDS)
 
 
@@ -237,7 +248,7 @@ def metrics() -> dict:
 
 
 @app.get("/assortment/stock")
-def assortment_stock(as_of_date: date | None = None, limit: int = 100) -> dict:
+def assortment_stock(as_of_date: date | None = None, limit: Limit = 100) -> dict:
     """Portfolio inventory-health snapshot: on-hand stock bucketed into days-of-cover bands,
     with EUR value per band and the top SKUs by frozen capital. Internal-key gated."""
     started = time.time()
@@ -266,7 +277,10 @@ _portfolio_memo: tuple[str, dict] | None = None
 
 def _memoize_portfolio(key: str, as_of: str, build: dict) -> dict:
     # Only the current day's build is pinned in memory (historical as_of queries must not evict
-    # the hot snapshot the dashboard serves all day).
+    # the hot snapshot the dashboard serves all day). Every caller hands over a build that was
+    # validated already (fresh from the builder, or checked after the Redis read), and the key
+    # carries model version, history contract, as-of date and refresh generation, so a memo hit
+    # on the same key needs no second validation pass over all rows.
     if as_of == _today():
         global _portfolio_memo
         _portfolio_memo = (key, build)
@@ -275,7 +289,7 @@ def _memoize_portfolio(key: str, as_of: str, build: dict) -> dict:
 
 def _memoized_portfolio(key: str) -> dict | None:
     memo = _portfolio_memo
-    if memo is not None and memo[0] == key and _portfolio_cache_compatible(memo[1]):
+    if memo is not None and memo[0] == key:
         return memo[1]
     return None
 
@@ -287,7 +301,76 @@ def _build_and_cache_portfolio(key: str, as_of: str) -> dict:
     _memoize_portfolio(key, as_of, build)
     log.info("portfolio_built", as_of=as_of, count=build.get("count"),
              elapsed_ms=round((time.time() - started) * 1000, 1))
+    memory.release_free_memory()
     return build
+
+
+def _build_and_cache_product_facts(as_of: str, window_days: int | None = None) -> dict:
+    """Catalog-wide month and region facts behind the product page, one pass per artefact."""
+    started = time.time()
+    monthly = product_facts.build_monthly(as_of)
+    regional = product_facts.build_regional(as_of, _region_window(window_days))
+    log.info("product_facts_built", as_of=as_of, monthly_rows=monthly["rows"],
+             regional_rows=regional["rows"], stored=monthly["stored"] and regional["stored"],
+             elapsed_ms=round((time.time() - started) * 1000, 1))
+    return {"monthly": monthly, "regional": regional}
+
+
+_facts_failed_at: dict[str, float] = {}
+
+
+async def _product_fact_rows(key: str, product_id: int, as_of: str, build) -> list[dict] | None:
+    """Rows of one product from the precomputed artefact, building it once when it is missing.
+
+    None means the artefact cannot be used (Redis down or the build failed); the caller then
+    runs the live per-product query, which is the behaviour the artefact replaces.
+    """
+    rows = await asyncio.to_thread(product_facts.read, key, product_id, as_of)
+    if rows is not None:
+        return rows
+    if not await asyncio.to_thread(cache.health):
+        return None
+    if time.monotonic() - _facts_failed_at.get(key, float("-inf")) < _FACTS_RETRY_SECONDS:
+        return None
+    async with _build_locks.setdefault(key, asyncio.Lock()):
+        rows = await asyncio.to_thread(product_facts.read, key, product_id, as_of)
+        if rows is not None:
+            return rows
+        if time.monotonic() - _facts_failed_at.get(key, float("-inf")) < _FACTS_RETRY_SECONDS:
+            return None
+        try:
+            await asyncio.to_thread(build)
+        except Exception as exc:  # noqa: BLE001
+            _facts_failed_at[key] = time.monotonic()
+            log.warning("product_facts_build_failed", key=key, error=str(exc))
+            return None
+        rows = await asyncio.to_thread(product_facts.read, key, product_id, as_of)
+        if rows is None:
+            _facts_failed_at[key] = time.monotonic()
+        return rows
+
+
+async def _monthly_product_rows(product_id: int, as_of: str, window_start: date) -> list[dict]:
+    rows = await _product_fact_rows(
+        product_facts.monthly_key(as_of), product_id, as_of,
+        lambda: product_facts.build_monthly(as_of),
+    )
+    if rows is None:
+        return await asyncio.to_thread(sig.monthly_product_sales, product_id, window_start.isoformat(), as_of)
+    first_month = window_start.isoformat()[:7]
+    return canonical.financial_rows(
+        sorted((row for row in rows if str(row["ym"]) >= first_month), key=lambda row: str(row["ym"]))
+    )
+
+
+async def _regional_product_rows(product_id: int, as_of: str, window_days: int) -> list[dict]:
+    rows = await _product_fact_rows(
+        product_facts.regional_key(as_of, window_days), product_id, as_of,
+        lambda: product_facts.build_regional(as_of, window_days),
+    )
+    if rows is None:
+        return await asyncio.to_thread(sig.regional_product_sales, as_of, window_days, [product_id])
+    return sig.finalize_regional_rows(rows)
 
 
 def _build_and_cache_stock(as_of: str) -> dict:
@@ -579,7 +662,7 @@ async def assortment_overview(as_of_date: date | None = None) -> dict:
 @app.get("/assortment/health")
 async def assortment_health(as_of_date: date | None = None, band: str | None = None, abc: str | None = None,
                       xyz: str | None = None, lifecycle: str | None = None,
-                      sort: str = "health_asc", limit: int = 100, stocked_only: bool = True,
+                      sort: str = "health_asc", limit: Limit = 100, stocked_only: bool = True,
                       region_id: int | None = None, region_window_days: int | None = None) -> dict:
     """Ranked, filterable assortment action list (the purchasing dashboard). Defaults to the
     on-hand-stocked subset (the actual inventory-health decisions); stocked_only=false includes the
@@ -636,7 +719,7 @@ async def assortment_health(as_of_date: date | None = None, band: str | None = N
 
 @app.get("/assortment/regions")
 def assortment_regions(as_of_date: date | None = None, window_days: int | None = None,
-                       limit: int = 50) -> dict:
+                       limit: Limit = 50) -> dict:
     """Regional portfolio demand summary by Client.RegionID. Internal-key gated."""
     started = time.time()
     as_of = _resolve_as_of(as_of_date)
@@ -685,6 +768,9 @@ async def product_profile(
             **_history_response_fields(build),
             **snapshot,
         }
+    except HTTPException:
+        METRICS.record_request((time.time() - started) * 1000)
+        raise
     except Exception as exc:  # noqa: BLE001
         METRICS.record_request((time.time() - started) * 1000, error=True)
         log.error("product_profile_failed", product_id=product_id, error=str(exc))
@@ -696,6 +782,8 @@ def _product_snapshot(build: dict, product_id: int, as_of: str) -> dict:
     product_id = exact.positive_int(product_id, "product_id")
     row = next((r for r in build["rows"] if int(r["product_id"]) == product_id), None)
     meta = sig.product_meta([product_id], as_of).get(product_id, {})
+    if row is None and not meta:
+        raise HTTPException(status_code=404, detail="product_not_found")
     if meta and exact.positive_int(
         meta.get("product_id"),
         "product_meta.product_id",
@@ -731,12 +819,7 @@ async def product_sales_analytics(
             months,
             settings.source_history_start_date,
         )
-        monthly_rows = await asyncio.to_thread(
-            sig.monthly_product_sales,
-            product_id,
-            window.requested_start.isoformat(),
-            as_of,
-        )
+        monthly_rows = await _monthly_product_rows(product_id, as_of, window.requested_start)
         response = product_analytics.build_product_analytics(
             product_id=product_id,
             as_of=as_of,
@@ -748,6 +831,9 @@ async def product_sales_analytics(
         )
         METRICS.record_request((time.time() - started) * 1000)
         return response
+    except HTTPException:
+        METRICS.record_request((time.time() - started) * 1000)
+        raise
     except Exception as exc:  # noqa: BLE001
         METRICS.record_request((time.time() - started) * 1000, error=True)
         log.error("product_analytics_failed", product_id=product_id, error=str(exc))
@@ -755,11 +841,11 @@ async def product_sales_analytics(
 
 
 @app.get("/product/{product_id}/regions")
-def product_regions(
+async def product_regions(
     product_id: Annotated[int, Path(gt=0)],
     as_of_date: date | None = None,
     window_days: int | None = None,
-    limit: int = 20,
+    limit: Limit = 20,
 ) -> dict:
     """Per-product demand split by Client.RegionID. Internal-key gated."""
     started = time.time()
@@ -767,9 +853,7 @@ def product_regions(
     win = _region_window(window_days)
     history_metadata = _day_history_metadata(as_of, win, "regional")
     try:
-        rows = _normalize_product_region_rows(
-            sig.regional_product_sales(as_of, win, product_ids=[product_id])
-        )
+        rows = _normalize_product_region_rows(await _regional_product_rows(product_id, as_of, win))
         if any(row["product_id"] != product_id for row in rows):
             raise ValueError(f"regional response identity mismatch for product {product_id}")
         rows = sorted(
@@ -799,7 +883,7 @@ def product_regions(
 async def product_substitutes(
     product_id: Annotated[int, Path(gt=0)],
     as_of_date: date | None = None,
-    limit: int = 20,
+    limit: Limit = 20,
 ) -> dict:
     """Ranked interchangeable replacements (ProductAnalogue + OE fallback), in-stock + healthy first."""
     started = time.time()
@@ -821,7 +905,7 @@ async def product_substitutes(
 
 
 @app.get("/assortment/margin")
-async def assortment_margin(as_of_date: date | None = None, limit: int = 20) -> dict:
+async def assortment_margin(as_of_date: date | None = None, limit: Limit = 20) -> dict:
     """Margin leaders / laggards / below-cost alerts + portfolio margin summary. Internal-key gated."""
     started = time.time()
     as_of = _resolve_as_of(as_of_date)
@@ -844,7 +928,7 @@ async def assortment_margin(as_of_date: date | None = None, limit: int = 20) -> 
 
 @app.get("/assortment/returns")
 async def assortment_returns(as_of_date: date | None = None, min_rate: float | None = None,
-                             limit: int = 20) -> dict:
+                             limit: Limit = 20) -> dict:
     """High-return SKUs + returns summary. Internal-key gated."""
     started = time.time()
     as_of = _resolve_as_of(as_of_date)

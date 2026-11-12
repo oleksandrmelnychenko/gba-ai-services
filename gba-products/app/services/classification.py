@@ -116,6 +116,10 @@ def lifecycle_classify(days_since_first: int | None, recent_units: float, prior_
         return (LifecycleStage.DECLINING
                 if months_since_last >= cfg.lifecycle_dormant_decline_months
                 else LifecycleStage.MATURE)
+    if recent_units + max(prior_units, 0.0) < cfg.lifecycle_min_trend_units:
+        # Too few units across the two compared halves to tell a trend from chance: with fewer
+        # than six units even the most lopsided split happens by coincidence too often.
+        return LifecycleStage.MATURE
     if prior_units <= 0:
         return LifecycleStage.GROWING
     if recent_units >= prior_units * cfg.lifecycle_growing_factor:
