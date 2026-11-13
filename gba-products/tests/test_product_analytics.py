@@ -142,12 +142,12 @@ def test_route_returns_zero_months_for_product_without_sales(monkeypatch):
     body = response.json()
     assert body["snapshot"]["found"] is False
     assert body["snapshot"]["name"] == "Catalog only product"
-    assert [point["month"] for point in body["sales_series"]] == ["2025-12", "2026-01"]
+    assert [point["month"] for point in body["sales_series"]] == ["2025-12"]
     assert all(point["units"] == 0 and point["order_count"] == 0 for point in body["sales_series"])
     assert all(point["revenue_eur"] == 0 and point["avg_price_eur"] is None
                for point in body["sales_series"])
-    assert body["sales_series"][-1]["period_start"] == body["sales_series"][-1]["period_end_exclusive"]
-    assert body["sales_series"][-1]["is_complete"] is False
+    assert body["sales_series"][-1]["period_end_exclusive"] == "2026-01-01"
+    assert body["sales_series"][-1]["is_complete"] is True
 
 
 def test_route_validates_date_product_id_and_month_bounds_before_query(monkeypatch):
@@ -298,3 +298,45 @@ def test_snapshot_sales_aggregates_follow_the_response_window():
     # Series and snapshot agree.
     assert sum(point.units for point in response.sales_series) == aligned["annual_units"]
     assert sum(point.revenue_eur for point in response.sales_series) == aligned["revenue_eur"]
+
+
+def test_as_of_on_the_first_of_a_month_has_no_empty_current_month():
+    response = product_analytics.build_product_analytics(
+        product_id=42,
+        as_of="2026-11-01",
+        months=12,
+        model_version="products-test-v1",
+        snapshot={"product_id": 42, "found": False},
+        monthly_rows=[{"ym": "2026-10", "units": 517, "order_count": 3, "revenue_eur": 1034}],
+        source_history_start=date(2020, 1, 1),
+    )
+
+    series = response.sales_series
+    assert [point.month for point in series] == [
+        "2025-12", "2026-01", "2026-02", "2026-03", "2026-04", "2026-05",
+        "2026-06", "2026-07", "2026-08", "2026-09", "2026-10",
+    ]
+    assert all(point.is_complete for point in series)
+    assert all(point.period_start < point.period_end_exclusive for point in series)
+    assert series[-1].period_end_exclusive == date(2026, 11, 1)
+    assert response.window.start == date(2025, 12, 1)
+    assert response.window.end_exclusive == date(2026, 11, 1)
+    assert response.window.effective_days == 335
+
+
+def test_as_of_inside_a_month_keeps_the_partial_current_month():
+    response = product_analytics.build_product_analytics(
+        product_id=42,
+        as_of="2026-11-02",
+        months=12,
+        model_version="products-test-v1",
+        snapshot={"product_id": 42, "found": False},
+        monthly_rows=[],
+        source_history_start=date(2020, 1, 1),
+    )
+
+    last = response.sales_series[-1]
+    assert len(response.sales_series) == 12
+    assert (last.month, last.period_start, last.period_end_exclusive, last.is_complete) == (
+        "2026-11", date(2026, 11, 1), date(2026, 11, 2), False,
+    )

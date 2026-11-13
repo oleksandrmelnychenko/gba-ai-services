@@ -126,6 +126,8 @@ def build_product_analytics(
         period_start = _first_of_month(label)
         is_complete = label != current_label
         period_end = _next_month(period_start) if is_complete else as_of_date
+        if max(period_start, window.effective_start) >= period_end:
+            continue
         bucket = buckets[label]
         units = bucket["units"]
         revenue = bucket["revenue_eur"]
