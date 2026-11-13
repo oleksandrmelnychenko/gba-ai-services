@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 from app.core.config import Settings
 from app.core.history import (
     HistoryWindow,
@@ -35,3 +38,13 @@ def portfolio_metadata(as_of: str, cfg: Settings) -> dict:
 
 def stock_metadata(as_of: str, cfg: Settings) -> dict:
     return combined_history_metadata(stock_windows(as_of, cfg))
+
+
+def stock_observation(as_of: str) -> dict:
+    """Stock and unit cost are always the current state; only sales follow as_of."""
+    today = datetime.now(ZoneInfo("Europe/Kyiv")).date().isoformat()
+    return {
+        "stock_as_of": today,
+        "stock_basis": "current",
+        "stock_matches_as_of": as_of >= today,
+    }

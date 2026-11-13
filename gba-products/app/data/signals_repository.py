@@ -26,6 +26,21 @@ LOAD-BEARING DATA RULES (verified on ConcordDb_V5):
     only for positively identified type-1 docs, and NULL <> 1 evaluates to NULL in SQL — the predicate
     must spell out IS NULL or the untyped historical lot layer silently vanishes from every stock signal.
     gba-pricing (pricing_repository.unit_cost_eur) and gba-procure deliberately exclude these too.
+  - VAT BASIS (verified on ConcordDb_V5, 2026-11-13). A 1С-synced lot's AccountingPrice is
+    net price + duty + VAT wherever its packing-list line records VatPercent > 0: on 11,573
+    open lots of the VAT-paying organisation with VatPercent 20, AccountingPrice / 1.2 equals
+    NetPrice * (1 + duty) within 2% for 92%, duty-free lots sit at exactly 1.20, and the
+    non-payer's VatPercent 20 lots sit at 1.2 and above. Lots with VatPercent 0 or without a
+    packing-list line carry no recorded VAT. unit_cost_ex_vat_eur divides the recorded VAT out;
+    unit_cost_eur keeps AccountingPrice as booked.
+    OrderItem.PricePerItemWithoutVat is populated on every confirmed line of the last 12
+    months (133,209 lines: x1.20 below PricePerItem on VAT sales, equal to it otherwise, 58
+    lines of non-VAT sales carry VAT too), so revenue_ex_vat_eur reads that column and falls
+    back to PricePerItem only on a sale without VAT; a VAT line without it leaves the
+    product's margin unknown.
+    The seller of a VAT line recovers the VAT inside the cost, the seller of a line without
+    VAT does not: margin sets VAT lines against unit_cost_ex_vat_eur and the other lines
+    against unit_cost_eur. Stock value stays at AccountingPrice.
   - Sellable warehouses: Storage.Deleted=0 AND ForDefective=0 AND (AvailableForReSale=1 OR IsResale=1).
   - Sales use the native report fact set: confirmed active Sale, active OrderItem, the sale's
     own ClientAgreement, and Sale.EffectiveDate. Accounting-owned balance carriers are excluded
@@ -66,6 +81,10 @@ _SELLABLE_STORAGE = (
 _PA_QTY = "CAST(pa.Amount AS decimal(18, 8))"
 _COST_QTY = "CAST(ci.RemainingQty AS decimal(18, 8))"
 _COST_PRICE = "CAST(ci.AccountingPrice AS decimal(28, 14))"
+_COST_PRICE_EX_VAT = (
+    "CAST(ci.AccountingPrice / CASE WHEN pack.VatPercent > 0 "
+    "THEN 1 + pack.VatPercent / 100.0 ELSE 1 END AS decimal(28, 14))"
+)
 # Legacy synthetic-product identity is retained for startup diagnostics only.
 # Financial population comes from native confirmed-sale ownership rules, never a
 # mutable product name/ID exclusion. The resolver does not filter these aggregates.
@@ -179,11 +198,15 @@ def on_hand_stock(product_ids: Sequence[int] | None = None) -> list[dict]:
         CostLots AS (
             SELECT ci.ProductID AS product_id,
                    SUM({_COST_QTY} * {_COST_PRICE}) AS cost_value_eur,
+                   SUM({_COST_QTY} * {_COST_PRICE_EX_VAT}) AS cost_value_ex_vat_eur,
                    SUM({_COST_QTY}) AS cost_qty
             FROM dbo.ConsignmentItem ci
             JOIN OperationalStock stock ON stock.product_id = ci.ProductID
             LEFT JOIN dbo.Consignment c ON c.ID = ci.ConsignmentID
             LEFT JOIN dbo.ProductIncome pi ON pi.ID = c.ProductIncomeID
+            LEFT JOIN dbo.ProductIncomeItem income_item ON income_item.ID = ci.ProductIncomeItemID
+            LEFT JOIN dbo.PackingListPackageOrderItem pack
+                ON pack.ID = income_item.PackingListPackageOrderItemID
             WHERE ci.Deleted = 0
                   AND ci.RemainingQty > 0
                   AND ci.AccountingPrice > 0
@@ -199,12 +222,17 @@ def on_hand_stock(product_ids: Sequence[int] | None = None) -> list[dict]:
                    CAST(
                        cost_value_eur / NULLIF(cost_qty, 0)
                        AS decimal(28, 8)
-                   ) AS unit_cost_eur
+                   ) AS unit_cost_eur,
+                   CAST(
+                       cost_value_ex_vat_eur / NULLIF(cost_qty, 0)
+                       AS decimal(28, 8)
+                   ) AS unit_cost_ex_vat_eur
             FROM CostLots
         )
         SELECT stock.product_id,
                stock.qty_on_hand,
                cost.unit_cost_eur,
+               cost.unit_cost_ex_vat_eur,
                CASE
                    WHEN cost.unit_cost_eur IS NULL THEN NULL
                    ELSE CAST(
@@ -351,6 +379,9 @@ def avg_sale_price_eur(as_of: str, window_days: int,
     return _confirmed_query(canonical.facts_cte() + f"""
         SELECT product_id, SUM(revenue_eur) AS revenue_eur, SUM(sold_qty) AS sold_qty,
                CAST(SUM(revenue_eur) / NULLIF(SUM(sold_qty), 0) AS decimal(28,8)) AS avg_price_eur,
+               SUM(revenue_ex_vat_eur) AS revenue_ex_vat_eur,
+               SUM(ex_vat_unknown_lines) AS ex_vat_unknown_lines,
+               SUM(vat_sold_qty) AS vat_sold_qty,
                SUM(arithmetic_failures) AS arithmetic_failures
         FROM salesFacts WHERE 1=1{flt}
         GROUP BY product_id

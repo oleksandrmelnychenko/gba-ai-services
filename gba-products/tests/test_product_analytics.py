@@ -267,7 +267,9 @@ def test_snapshot_sales_aggregates_follow_the_response_window():
         "annual_units": 99.0,
         "revenue_eur": 9999.0,
         "avg_price_eur": 101.0,
-        "unit_cost_eur": 16.0,
+        "unit_cost_eur": 19.2,
+        "margin_unit_cost_eur": 16.0,
+        "financial_basis": {"revenue_eur": "9999", "revenue_ex_vat_eur": "8332.5"},
     }
 
     response = product_analytics.build_product_analytics(
@@ -290,7 +292,9 @@ def test_snapshot_sales_aggregates_follow_the_response_window():
         aligned["avg_price_eur"], abs=0.01
     )
     # Margin follows the corrected average price rather than the stale snapshot one.
-    assert aligned["margin_pct"] == pytest.approx((320 / 15 - 16) / (320 / 15), abs=1e-4)
+    price_ex_vat = 320 / 15 * 8332.5 / 9999
+    assert aligned["avg_price_ex_vat_eur"] == pytest.approx(price_ex_vat, abs=1e-4)
+    assert aligned["margin_pct"] == pytest.approx((price_ex_vat - 16) / price_ex_vat, abs=1e-4)
     # Series and snapshot agree.
     assert sum(point.units for point in response.sales_series) == aligned["annual_units"]
     assert sum(point.revenue_eur for point in response.sales_series) == aligned["revenue_eur"]

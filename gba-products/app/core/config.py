@@ -75,7 +75,7 @@ class Settings(BaseSettings):
     # v8 compares the lifecycle halves as daily rates (the as-of month is partial).
     # v9 dates the first sale over the whole factual history, so returning SKUs are not "new".
     # v10 grades XYZ by demand frequency instead of the inter-demand interval CV.
-    model_version: str = "products-v10-confirmed-sales-kyiv"
+    model_version: str = "products-v11-net-margin-stock-basis"
 
     # Earliest factually available historical source date. All rolling SQL, dense grids,
     # denominators, producer lookups, API metadata, and cache epochs are clamped to this floor.

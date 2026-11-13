@@ -8,6 +8,7 @@ def _stock_row() -> dict:
         "product_id": 42,
         "qty_on_hand": 100,
         "unit_cost_eur": 1,
+        "unit_cost_ex_vat_eur": 1,
         "eur_value": 100,
     }
 

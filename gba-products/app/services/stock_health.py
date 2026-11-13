@@ -127,6 +127,7 @@ def snapshot(as_of: str) -> dict:
         "bands": bands,
         "model_version": cfg.model_version,
         **history_policy.stock_metadata(as_of, cfg),
+        **history_policy.stock_observation(as_of),
         "rows": rows,
     }
     _validate_snapshot(result)

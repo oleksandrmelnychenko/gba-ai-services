@@ -24,8 +24,17 @@ def fragment(name: str) -> str:
     return content.strip()
 
 
+EX_VAT_UNIT_PRICE = (
+    "CASE WHEN oi.PricePerItemWithoutVat <> 0 "
+    "AND ABS(oi.PricePerItemWithoutVat) <= ABS(oi.PricePerItem) "
+    "AND SIGN(oi.PricePerItemWithoutVat) = SIGN(oi.PricePerItem) THEN oi.PricePerItemWithoutVat "
+    "WHEN oi.PricePerItem = 0 OR s.IsVatSale = 0 THEN oi.PricePerItem END"
+)
+
+
 def facts_cte(*, returns: bool = False) -> str:
     amount = fragment("decimal_product.sql").format(price="oi.PricePerItem", quantity="oi.Qty")
+    ex_vat = fragment("decimal_product.sql").format(price=EX_VAT_UNIT_PRICE, quantity="oi.Qty")
     gross = f"""WITH regionCodes AS (
         SELECT ID, CASE WHEN UPPER(NULLIF(LTRIM(RTRIM(Name)), N''))=N'200' THEN N'KR'
                         ELSE UPPER(NULLIF(LTRIM(RTRIM(Name)), N'')) END AS Name
@@ -40,6 +49,11 @@ def facts_cte(*, returns: bool = False) -> str:
                CAST(s.EffectiveDate AT TIME ZONE 'UTC' AT TIME ZONE 'FLE Standard Time' AS datetime2) AS event_local,
                CAST(oi.Qty AS decimal(30,14)) AS sold_qty,
                {amount} AS revenue_eur,
+               {ex_vat} AS revenue_ex_vat_eur,
+               CAST(CASE WHEN {amount} IS NOT NULL AND {ex_vat} IS NULL THEN 1 ELSE 0 END AS bigint)
+                   AS ex_vat_unknown_lines,
+               CASE WHEN ABS({EX_VAT_UNIT_PRICE}) < ABS(oi.PricePerItem)
+                    THEN CAST(oi.Qty AS decimal(30,14)) ELSE 0 END AS vat_sold_qty,
                CAST(CASE WHEN {amount} IS NULL THEN 1 ELSE 0 END AS bigint) AS arithmetic_failures
         {fragment('sales_from.sql')}
         LEFT JOIN dbo.Client cl ON cl.ID = ca.ClientID

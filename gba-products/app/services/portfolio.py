@@ -3,7 +3,11 @@
 One heavy build per as_of (cached); the /assortment/* and /product/{id} endpoints slice it.
 ABC is ranked by REVENUE-€ contribution (the standard, universally-computable basis — purchase cost
 exists only for on-hand stock, so a margin-ABC would silently drop every non-stocked SKU). Margin% is
-still computed per-SKU (where cost is known) and feeds the health-score.
+still computed per-SKU (where cost is known) and feeds the health-score. Margin compares revenue
+and cost on one basis, both excluding recoverable VAT: units sold with VAT are set against the
+lot cost without its recorded VAT, units sold without VAT against the cost as booked.
+revenue_eur and unit_cost_eur keep their own bases (invoice gross with VAT, lot AccountingPrice)
+for turnover and stock value.
 """
 from __future__ import annotations
 
@@ -92,6 +96,14 @@ def build_portfolio(as_of: str) -> dict:
             if unit_cost_raw is not None
             else None
         )
+        unit_cost_ex_vat_raw = st.get("unit_cost_ex_vat_eur") if st else None
+        unit_cost_ex_vat = (
+            exact.decimal_value(unit_cost_ex_vat_raw, "unit_cost_ex_vat_eur", non_negative=True)
+            if unit_cost_ex_vat_raw is not None
+            else None
+        )
+        if (unit_cost is None) != (unit_cost_ex_vat is None):
+            raise ValueError(f"stock product {pid} has one cost basis without the other")
         eur_value_raw = st.get("eur_value") if st else None
         if unit_cost is None and eur_value_raw is not None:
             raise ValueError(f"stock product {pid} has value without unit cost")
@@ -150,9 +162,26 @@ def build_portfolio(as_of: str) -> dict:
             reported_avg = exact.unit_price(price_row["avg_price_eur"], "repository avg_price_eur", non_negative=False)
             if priced_qty != 0 and reported_avg != exact.unit_price(revenue_eur / priced_qty, "derived avg_price_eur", non_negative=False):
                 raise ValueError(f"price aggregate mismatch for product {pid}")
+        revenue_ex_vat = None
+        if (price_row is not None and price_row.get("revenue_ex_vat_eur") is not None
+                and not exact.non_negative_int(
+                    price_row.get("ex_vat_unknown_lines") or 0, "ex-VAT unknown lines")):
+            revenue_ex_vat = exact.decimal_value(
+                price_row["revenue_ex_vat_eur"], "revenue_ex_vat_eur")
+        avg_price_ex_vat = (
+            revenue_ex_vat / priced_qty if revenue_ex_vat is not None and priced_qty > 0 else None
+        )
         margin_pct = None
-        if unit_cost is not None and avg_price > 0:
-            margin_pct = (avg_price - unit_cost) / avg_price
+        margin_ex_vat = None
+        margin_unit_cost = None
+        if unit_cost_ex_vat is not None and avg_price_ex_vat is not None and avg_price_ex_vat > 0:
+            vat_qty = exact.decimal_value(price_row.get("vat_sold_qty") or 0, "vat_sold_qty")
+            with localcontext() as context:
+                context.prec = 50
+                cost = unit_cost_ex_vat * vat_qty + unit_cost * (priced_qty - vat_qty)
+                margin_ex_vat = revenue_ex_vat - cost
+                margin_unit_cost = cost / priced_qty
+                margin_pct = margin_ex_vat / revenue_ex_vat
         returned_qty = exact.decimal_value(
             rets[pid].get("returned_qty") if pid in rets else 0,
             "returned_qty",
@@ -170,12 +199,21 @@ def build_portfolio(as_of: str) -> dict:
         financial_basis = {"revenue_eur": format(revenue_eur, "f"),
                            "units": format(priced_qty, "f"),
                            "unit_cost_eur": None if unit_cost is None else format(unit_cost, "f"),
+                           "revenue_ex_vat_eur": (
+                               None if revenue_ex_vat is None else format(revenue_ex_vat, "f")),
+                           "margin_ex_vat_eur": (
+                               None if margin_ex_vat is None else format(margin_ex_vat, "f")),
                            "known_returned_value_eur": format(known_returned, "f"),
                            "unresolved_amount_count": unresolved}
         rows.append({
             "product_id": pid,
             "qty_on_hand": exact.quantity(qty, "qty_on_hand"),
             "eur_value": exact.money(eur_value, "eur_value"),
+            "stock_value_eur": (
+                exact.money(eur_value, "stock_value_eur")
+                if unit_cost is not None or qty == 0
+                else None
+            ),
             "unit_cost_eur": (
                 exact.unit_price(unit_cost, "unit_cost_eur")
                 if unit_cost is not None
@@ -189,6 +227,32 @@ def build_portfolio(as_of: str) -> dict:
             "margin_pct": (
                 exact.ratio(margin_pct, "margin_pct")
                 if margin_pct is not None
+                else None
+            ),
+            "margin_vat_basis": "ex-vat",
+            "unit_cost_ex_vat_eur": (
+                exact.unit_price(unit_cost_ex_vat, "unit_cost_ex_vat_eur")
+                if unit_cost_ex_vat is not None
+                else None
+            ),
+            "margin_unit_cost_eur": (
+                exact.unit_price(margin_unit_cost, "margin_unit_cost_eur")
+                if margin_unit_cost is not None
+                else None
+            ),
+            "avg_price_ex_vat_eur": (
+                exact.unit_price(avg_price_ex_vat, "avg_price_ex_vat_eur", non_negative=False)
+                if avg_price_ex_vat is not None and avg_price_ex_vat > 0
+                else None
+            ),
+            "revenue_ex_vat_eur": (
+                exact.money(revenue_ex_vat, "revenue_ex_vat_eur", non_negative=False)
+                if revenue_ex_vat is not None
+                else None
+            ),
+            "margin_ex_vat_eur": (
+                exact.money(margin_ex_vat, "margin_ex_vat_eur", non_negative=False)
+                if margin_ex_vat is not None
                 else None
             ),
             "annual_units": exact.quantity(priced_qty, "annual_units", non_negative=False),
@@ -265,7 +329,7 @@ def build_portfolio(as_of: str) -> dict:
         "model_version": cfg.model_version,
         **history_policy.portfolio_metadata(as_of, cfg),
         "count": len(rows),
-        "overview": _overview(rows),
+        "overview": {**_overview(rows), **history_policy.stock_observation(as_of)},
         "financial_window": window_metadata(windows["dead"]),
         "rows": rows,
     }
@@ -320,6 +384,7 @@ def _overview(rows: list[dict]) -> dict:
             ),
             "total_eur_value",
         ),
+        **_stock_value_summary(rows),
         **canonical.money_summary([row["financial_basis"] for row in rows]),
         "by_band": tally("band"),
         "by_lifecycle": tally("lifecycle"),
@@ -327,6 +392,34 @@ def _overview(rows: list[dict]) -> dict:
         "by_abc": tally("abc"),
         "by_xyz": tally("xyz"),
         "avg_health": round(sum(r["health"] for r in rows) / len(rows), 1) if rows else 0.0,
+    }
+
+
+def _stock_value_summary(rows: list[dict]) -> dict:
+    stocked = [row for row in rows if exact.decimal_value(row["qty_on_hand"], "qty_on_hand") > 0]
+    unvalued = [row for row in stocked if row.get("stock_value_eur") is None]
+    valued = len(stocked) - len(unvalued)
+    return {
+        "stock_skus": len(stocked),
+        "stock_valued_skus": valued,
+        "stock_unvalued_skus": len(unvalued),
+        "stock_unvalued_qty": exact.quantity(
+            exact.decimal_sum([row["qty_on_hand"] for row in unvalued], "unvalued stock"),
+            "stock_unvalued_qty",
+        ),
+        "stock_value_eur": (
+            None
+            if stocked and not valued
+            else exact.money(
+                exact.decimal_sum(
+                    [row["stock_value_eur"] for row in stocked if row["stock_value_eur"] is not None],
+                    "stock value",
+                    non_negative=True,
+                ),
+                "stock_value_eur",
+            )
+        ),
+        "stock_value_complete": not unvalued,
     }
 
 

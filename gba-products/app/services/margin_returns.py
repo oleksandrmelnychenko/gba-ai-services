@@ -4,6 +4,8 @@ Every function takes the portfolio rows (see portfolio.build_portfolio) and smal
 returns a ranked list / summary. margin_pct is a fraction (0.30 = 30%) or None when unit cost is
 unknown (no on-hand stock => no purchase cost) — those rows are excluded from margin stats, never
 crash. revenue_eur / unit_cost_eur / avg_price_eur / eur_value are already EUR; no conversion here.
+Margin and profit are ex-VAT on both sides (financial_basis.margin_ex_vat_eur). The row field
+margin_eur stays margin_pct * revenue_eur, the identity gba-server validates.
 """
 from __future__ import annotations
 
@@ -13,8 +15,10 @@ from app.core import exact_numbers as exact
 
 
 def _margin_eur(row: dict) -> Decimal:
-    """Margin-€ contribution = margin_pct * revenue_eur. Caller guards margin_pct is not None."""
+    """Ex-VAT profit of a row whose margin is known. Caller guards margin_pct is not None."""
     basis = row.get("financial_basis", {})
+    if basis.get("margin_ex_vat_eur") is not None:
+        return exact.decimal_value(basis["margin_ex_vat_eur"], "ex-VAT margin")
     if basis.get("unit_cost_eur") is not None and "units" in basis:
         with localcontext() as context:
             context.prec = 50
@@ -28,6 +32,13 @@ def _margin_eur(row: dict) -> Decimal:
         row["revenue_eur"] or 0,
         "revenue_eur",
     )
+
+
+def _margin_revenue(row: dict) -> Decimal:
+    basis = row.get("financial_basis", {})
+    if basis.get("revenue_ex_vat_eur") is not None:
+        return exact.decimal_value(basis["revenue_ex_vat_eur"], "ex-VAT revenue")
+    return exact.decimal_value(basis.get("revenue_eur", row["revenue_eur"]), "revenue_eur")
 
 
 def _enrich(row: dict) -> dict:
@@ -68,6 +79,12 @@ def _enrich(row: dict) -> dict:
         ),
         "revenue_eur": exact.money(revenue_basis, "revenue_eur", non_negative=False),
         "financial_basis": {"revenue_eur": format(revenue_basis, "f")},
+        "margin_vat_basis": row.get("margin_vat_basis"),
+        "margin_ex_vat_eur": row.get("margin_ex_vat_eur"),
+        "revenue_ex_vat_eur": row.get("revenue_ex_vat_eur"),
+        "unit_cost_ex_vat_eur": row.get("unit_cost_ex_vat_eur"),
+        "margin_unit_cost_eur": row.get("margin_unit_cost_eur"),
+        "avg_price_ex_vat_eur": row.get("avg_price_ex_vat_eur"),
         "unit_cost_eur": row.get("unit_cost_eur"),
         "avg_price_eur": row.get("avg_price_eur"),
         "annual_units": exact.quantity(annual, "annual_units", non_negative=False),
@@ -118,7 +135,8 @@ def margin_returns_summary(rows: list[dict]) -> dict:
         "known revenue_eur",
     )
     wsum = exact.decimal_sum([_margin_eur(row) for row in known], "estimated margin")
-    weighted_margin = (wsum / rev_known) if rev_known > 0 else None
+    margin_base = exact.decimal_sum([_margin_revenue(row) for row in known], "margin revenue")
+    weighted_margin = (wsum / margin_base) if margin_base > 0 else None
 
     neg = [r for r in known if r["margin_pct"] < 0]
     eur_at_negative_margin = exact.decimal_sum(
@@ -158,6 +176,9 @@ def margin_returns_summary(rows: list[dict]) -> dict:
     return {
         "total_skus": len(rows),
         "estimated_profit_eur": exact.money(wsum, "estimated profit", non_negative=False),
+        "margin_vat_basis": "ex-vat",
+        "revenue_ex_vat_eur_known_margin": exact.money(
+            margin_base, "revenue_ex_vat_eur_known_margin", non_negative=False),
         "skus_with_known_margin": len(known),
         "skus_unknown_margin": len(rows) - len(known),
         "weighted_avg_margin_pct": (

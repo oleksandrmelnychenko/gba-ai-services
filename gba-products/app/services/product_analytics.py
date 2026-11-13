@@ -231,13 +231,24 @@ def _align_snapshot_to_window(
     )
 
     aligned["margin_pct"] = None
-    unit_cost = snapshot.get("unit_cost_eur")
-    if avg_price is not None and avg_price > 0 and unit_cost is not None:
-        cost = exact.decimal_value(unit_cost, "unit_cost_eur", non_negative=True)
-        aligned["margin_pct"] = exact.ratio(
-            (avg_price - cost) / avg_price,
-            "margin_pct",
-        )
+    aligned["avg_price_ex_vat_eur"] = None
+    unit_cost = snapshot.get("margin_unit_cost_eur")
+    basis = snapshot.get("financial_basis") or {}
+    if (avg_price is not None and avg_price > 0 and unit_cost is not None
+            and basis.get("revenue_ex_vat_eur") is not None):
+        snapshot_gross = exact.decimal_value(basis["revenue_eur"], "snapshot gross revenue")
+        snapshot_ex_vat = exact.decimal_value(basis["revenue_ex_vat_eur"], "snapshot ex-VAT revenue")
+        if snapshot_gross > 0 and snapshot_ex_vat > 0:
+            with localcontext() as context:
+                context.prec = 50
+                price_ex_vat = avg_price * snapshot_ex_vat / snapshot_gross
+            cost = exact.decimal_value(unit_cost, "margin_unit_cost_eur", non_negative=True)
+            aligned["avg_price_ex_vat_eur"] = exact.unit_price(
+                price_ex_vat, "avg_price_ex_vat_eur", non_negative=False)
+            aligned["margin_pct"] = exact.ratio(
+                (price_ex_vat - cost) / price_ex_vat,
+                "margin_pct",
+            )
 
     return aligned
 
