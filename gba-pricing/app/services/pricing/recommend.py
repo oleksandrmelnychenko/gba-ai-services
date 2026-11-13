@@ -33,18 +33,39 @@ R_NO_ANCHOR = "no-anchor"
 R_NO_BASELINE = "no-baseline"
 R_CONSTRAINTS_CONFLICT = "constraints-conflict"
 
+CONFLICT_DISCOUNT_ABOVE_PEER_CAP = "current-discount-above-peer-cap"
+CONFLICT_PRICE_AT_MARGIN_FLOOR = "current-price-at-margin-floor"
+CONFLICT_FLOOR_ABOVE_LIST = "margin-floor-above-list-price"
+
 
 def _round2(value: MoneyValue) -> float:
     """Serialize a monetary/percentage value at two decimals using accounting rounding."""
     return float(as_decimal(value).quantize(CENT, rounding=ROUND_HALF_UP))
 
 
+FLOOR_BASIS_MARKUP_ON_COST = "markup_on_cost"
+
+
+def floor_terms(target_margin_pct: MoneyValue) -> dict:
+    """The floor rule stated both ways: a markup on cost and the margin of price it yields.
+
+    The floor is unit_cost*(1+markup/100), so the margin of the floor price is
+    markup/(100+markup)*100 — 12 % on cost is 10.71 % of price."""
+    markup = as_decimal(target_margin_pct)
+    return {
+        "floor_markup_pct": _round2(markup),
+        "floor_margin_pct": _round2(markup / (HUNDRED + markup) * HUNDRED),
+        "floor_basis": FLOOR_BASIS_MARKUP_ON_COST,
+    }
+
+
 def price_floor(
     unit_cost_eur: MoneyValue | None,
     target_margin_pct: MoneyValue,
 ) -> Decimal | None:
-    """Hard margin floor: unit_cost_eur*(1+target_margin_pct/100). None when no cost lot
-    exists (peer-band-only path, floor skipped)."""
+    """Hard price floor: unit_cost_eur*(1+target_margin_pct/100) — target_margin_pct is a
+    markup on cost, see floor_terms for the equivalent margin of price. None when no cost
+    lot exists (peer-band-only path, floor skipped)."""
     if unit_cost_eur is None:
         return None
     unit_cost = as_decimal(unit_cost_eur)
@@ -248,6 +269,10 @@ def build_recommendation(
     discount_band = None
     was_capped = False
     conflict = False
+    conflict_reason = None
+    conflict_explanation = None
+    discount_cap = None
+    price_at_cap = None
     if rec.value is not None and marked_up_value is not None and marked_up_value > ZERO:
         lo = ZERO
         if baseline_value is not None and rec.rationale != R_BELOW_MARGIN:
@@ -260,10 +285,50 @@ def build_recommendation(
         hi = hi.quantize(CENT, rounding=ROUND_FLOOR)
         if lo > hi:
             conflict = True
-            # Keep the explicit margin-loss target as advisory; it cannot be
-            # applied through DiscountRate when it exceeds the undiscounted list.
-            if rec.rationale != R_BELOW_MARGIN:
-                rec = RecommendedPrice(None, R_CONSTRAINTS_CONFLICT)
+            segment_caps = [
+                as_decimal(limit).quantize(CENT, rounding=ROUND_FLOOR)
+                for limit in (segment.get("p75"), segment.get("p90"))
+                if limit is not None
+            ]
+            segment_cap = min(segment_caps) if segment_caps else None
+            if hi >= ZERO:
+                discount_cap = hi
+                price_at_cap = marked_up_value * (Decimal(1) - hi / HUNDRED)
+            if rec.rationale == R_BELOW_MARGIN:
+                conflict_reason = CONFLICT_FLOOR_ABOVE_LIST
+                conflict_explanation = (
+                    f"margin floor {_round2(floor):.2f} is above the undiscounted list price "
+                    f"{_round2(marked_up_value):.2f}; no discount rate can reach it, the floor "
+                    "is returned as an advisory price"
+                )
+            else:
+                hold_discount = max(
+                    ZERO, discount_from_price(baseline_value, marked_up_value)
+                ).quantize(CENT, rounding=ROUND_HALF_UP)
+                hold_price = marked_up_value * (Decimal(1) - hold_discount / HUNDRED)
+                if segment_cap is not None and segment_cap < lo:
+                    conflict_reason = CONFLICT_DISCOUNT_ABOVE_PEER_CAP
+                    conflict_explanation = (
+                        f"current agreement discount {_round2(hold_discount):.2f}% exceeds the "
+                        f"peer discount cap {_round2(segment_cap):.2f}%; the current agreement "
+                        "price is held and no further discount is recommended"
+                    )
+                else:
+                    conflict_reason = CONFLICT_PRICE_AT_MARGIN_FLOOR
+                    conflict_explanation = (
+                        f"current agreement price leaves no discount room above the margin "
+                        f"floor {_round2(floor):.2f}; the current agreement price is held"
+                    )
+                if floor is None or _round2(hold_price) >= _round2(floor):
+                    rec = RecommendedPrice(hold_price, R_CONSTRAINTS_CONFLICT)
+                    suggested_discount = hold_discount
+                    discount_band = DiscountBand(
+                        min_pct=float(hold_discount),
+                        target_pct=float(hold_discount),
+                        max_pct=float(hold_discount),
+                    )
+                else:
+                    rec = RecommendedPrice(None, R_CONSTRAINTS_CONFLICT)
         else:
             raw_discount = discount_from_price(rec.value, marked_up_value)
             quantized = raw_discount.quantize(CENT, rounding=ROUND_HALF_UP)
@@ -292,6 +357,7 @@ def build_recommendation(
         baseline_source=baseline_source if baseline is not None else None,
         recommended_price=_round2(rec.value) if rec.value is not None else None,
         price_floor=_round2(floor) if floor is not None else None,
+        **floor_terms(target_margin_pct),
         unit_cost_eur=_round2(unit_cost) if unit_cost is not None else None,
         suggested_discount_pct=(
             _round2(suggested_discount) if suggested_discount is not None else None
@@ -307,6 +373,11 @@ def build_recommendation(
         confidence=confidence,
         margin_pct_at_recommended=_round2(margin_pct) if margin_pct is not None else None,
         rationale=rationale,
+        constraints_conflict=conflict,
+        conflict_reason=conflict_reason,
+        conflict_explanation=conflict_explanation,
+        discount_cap_pct=_round2(discount_cap) if discount_cap is not None else None,
+        price_at_discount_cap=_round2(price_at_cap) if price_at_cap is not None else None,
         elasticity=round(elasticity_val, 3) if elasticity_val is not None else None,
         elasticity_source=elasticity_src,
         elastic_optimal_price=_round2(elastic_price) if elastic_price is not None else None,

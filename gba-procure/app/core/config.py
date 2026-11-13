@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     override_factor_min: float = 0.5
     override_factor_max: float = 1.5
 
-    api_host: str = "0.0.0.0"
+    api_host: str = "127.0.0.1"
     api_port: int = 8001
     # Web-only maintenance deployments may preserve caches without starting work.
     warm_on_startup: bool = True
@@ -79,8 +79,17 @@ class Settings(BaseSettings):
     default_lead_time_days: int = 30
     lead_time_min_days: int = 1
     lead_time_max_days: int = 120
-    lead_time_min_samples: int = 3
+    lead_time_min_samples: int = 5
     lead_time_cv: float = 0.5
+    lead_time_robust_cv: float = Field(default=0.5, gt=0.0, le=5.0)
+    lead_time_trim_fraction: float = Field(default=0.2, ge=0.0, lt=0.5)
+    lead_time_cap_noisy_spread: bool = True
+    lead_time_order_processing_days: float = Field(default=3.0, ge=0.0, le=60.0)
+
+    derived_moq_enabled: bool = True
+    derived_moq_min_documents: int = Field(default=3, ge=2, le=50)
+    derived_moq_source_max_age_months: int = Field(default=18, ge=1, le=120)
+    derived_moq_sales_window_days: int = Field(default=365, ge=30, le=730)
 
     economic_service_level: bool = True
     min_margin_eur: float = 0.1

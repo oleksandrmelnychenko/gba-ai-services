@@ -233,6 +233,29 @@ def test_override_loader_preserves_selected_valid_and_dirty_values(monkeypatch):
     assert overrides == {(501, 101): 4.1255, (502, 103): 0}
 
 
+def test_reserved_stock_still_lies_in_its_lot_and_is_not_drift():
+    facts = _facts()
+    facts.availability_by_key[(101, 11)] = Decimal("0")
+    facts.reservation_by_key[(101, 11)] = Decimal("7")
+
+    issues, metrics = validate_canonical_plan(_payload(), facts, AS_OF)
+
+    assert not [issue for issue in issues if issue.code == "Q005"]
+    assert metrics["consignment_drift_keys"] == 0
+
+
+def test_reservation_without_a_lot_behind_it_is_drift():
+    facts = _facts()
+    facts.reservation_by_key[(101, 11)] = Decimal("2")
+
+    issues, metrics = validate_canonical_plan(_payload(), facts, AS_OF)
+
+    drift = [issue for issue in issues if issue.code == "Q005"]
+    assert [issue.key for issue in drift] == [{"product_id": 101, "storage_id": 11}]
+    assert Decimal(str(drift[0].delta)) == Decimal("2")
+    assert metrics["consignment_drift_keys"] == 1
+
+
 def test_inventory_gate_reports_product_field_and_storage_drift():
     payload = _payload()
     payload["items"][0]["inventory"]["available"] = 6.5

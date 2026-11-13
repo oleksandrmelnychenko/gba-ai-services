@@ -8,6 +8,7 @@ from __future__ import annotations
 import hmac
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import date
 
@@ -34,6 +35,7 @@ log = get_logger("api")
 _EXPECTED_SOURCE_HISTORY_START = "2025-01-01"
 
 _OPEN_PATHS = {"/health", "/ready"}
+_BATCH_MAX_WORKERS = 8
 
 
 def _is_valid_uid(value: str | None) -> bool:
@@ -223,26 +225,22 @@ def price_batch(req: BatchPriceRequest) -> dict:
     _validate_as_of_date(req.as_of_date)
     svc = _service()
     as_of = req.as_of_date.isoformat() if req.as_of_date else None
-    results, errors = [], []
-    for item in req.items:
+
+    def _error(item, message: str) -> dict:
+        return {
+            "product_id": item.product_id,
+            "product_net_uid": item.product_net_uid,
+            "client_agreement_net_uid": item.client_agreement_net_uid,
+            "error": message,
+        }
+
+    def _one(item) -> tuple[PriceRecommendation | None, dict | None]:
         if not _is_valid_uid(item.client_agreement_net_uid):
-            errors.append({
-                "product_id": item.product_id,
-                "product_net_uid": item.product_net_uid,
-                "client_agreement_net_uid": item.client_agreement_net_uid,
-                "error": "malformed client_agreement_net_uid",
-            })
-            continue
+            return None, _error(item, "malformed client_agreement_net_uid")
         if not _is_valid_uid(item.product_net_uid):
-            errors.append({
-                "product_id": item.product_id,
-                "product_net_uid": item.product_net_uid,
-                "client_agreement_net_uid": item.client_agreement_net_uid,
-                "error": "malformed product_net_uid",
-            })
-            continue
+            return None, _error(item, "malformed product_net_uid")
         try:
-            results.append(svc.recommend_price(
+            return svc.recommend_price(
                 product_id=item.product_id,
                 product_net_uid=item.product_net_uid,
                 client_agreement_net_uid=item.client_agreement_net_uid,
@@ -251,25 +249,24 @@ def price_batch(req: BatchPriceRequest) -> dict:
                 target_margin_pct=req.target_margin_pct,
                 as_of_date=as_of,
                 use_cache=req.use_cache,
-            ))
+            ), None
         except LookupError as exc:
-            errors.append({
-                "product_id": item.product_id,
-                "product_net_uid": item.product_net_uid,
-                "client_agreement_net_uid": item.client_agreement_net_uid,
-                "error": str(exc),
-            })
+            return None, _error(item, str(exc))
         except Exception as exc:  # noqa: BLE001
             eid = uuid.uuid4().hex
             log.error("price_batch_item_failed", error_id=eid,
                       product_id=item.product_id, product_net_uid=item.product_net_uid,
                       client_agreement_net_uid=item.client_agreement_net_uid, error=str(exc))
-            errors.append({
-                "product_id": item.product_id,
-                "product_net_uid": item.product_net_uid,
-                "client_agreement_net_uid": item.client_agreement_net_uid,
-                "error": f"internal error (ref {eid})",
-            })
+            return None, _error(item, f"internal error (ref {eid})")
+
+    workers = max(1, min(_BATCH_MAX_WORKERS, len(req.items)))
+    if workers == 1:
+        outcomes = [_one(item) for item in req.items]
+    else:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="price-batch") as pool:
+            outcomes = list(pool.map(_one, req.items))
+    results = [result for result, _ in outcomes if result is not None]
+    errors = [error for _, error in outcomes if error is not None]
     return {"results": results, "errors": errors, "count": len(results), "failed": len(errors)}
 
 
@@ -281,7 +278,7 @@ class CompetitorSearchRequest(BaseModel):
 
 
 @app.post("/competitors/search")
-def competitors_search(req: CompetitorSearchRequest) -> dict:
+async def competitors_search(req: CompetitorSearchRequest) -> dict:
     """AI competitor price scan. Request/response contract mirrors gba-server's
     CompetitorPriceSearchRequestDto/ResultDto validators exactly."""
     from app.services import competitor_search as comp
@@ -301,7 +298,9 @@ def competitors_search(req: CompetitorSearchRequest) -> dict:
         raise HTTPException(status_code=422, detail="sources_invalid")
 
     try:
-        return comp.search_competitors(query, list(req.sources), req.product_net_uid)
+        return await comp.search_competitors_bounded(
+            query, list(req.sources), req.product_net_uid
+        )
     except comp.CompetitorSearchError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     except Exception as exc:  # noqa: BLE001

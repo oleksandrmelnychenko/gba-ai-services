@@ -4,19 +4,44 @@ Contract mirrors gba-server ClientPricingService.ValidateCompetitorResponse exac
 market=UA, currency=UAH, query echoed trimmed, searched_at ISO, sources_scanned set-equals
 the requested sources, offers<=30 with cent-precision prices and similarity in [0.8, 1].
 Everything the model returns is sanitized here so an invalid offer is dropped, never proxied.
+
+Prices are public shelf prices in UAH exactly as the marketplace page shows them. Whether a
+shelf price includes VAT is not established by the scan, so the envelope and every offer say
+price_basis="shelf", vat_basis="unknown"; nothing here is comparable to GBA EUR prices as is.
 """
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import json
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from functools import partial
 from typing import Any
 from urllib.parse import urlsplit
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
+from app.data import cache
 from app.services.competitor_prompt import COMPETITOR_SEARCH_PROMPT
 
 log = get_logger("competitor_search")
+
+RESULT_CACHE_TTL_S = 24 * 3600
+EMPTY_RESULT_CACHE_TTL_S = 3600
+MAX_CONCURRENT_SCANS = 2
+_USAGE_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+)
+_SERVER_TOOL_FIELDS = ("web_search_requests", "web_fetch_requests")
+_scan_executor = ThreadPoolExecutor(
+    max_workers=MAX_CONCURRENT_SCANS, thread_name_prefix="competitor-scan"
+)
 
 SOURCE_DOMAINS: dict[str, str] = {
     "strans": "strans-shop.com.ua",
@@ -40,6 +65,10 @@ SOURCE_PRIORITY: dict[str, int] = {
     "tir_market": 5,
 }
 AVAILABILITIES = frozenset({"in_stock", "limited", "out_of_stock", "unknown"})
+MARKET = "UA"
+CURRENCY = "UAH"
+PRICE_BASIS = "shelf"
+VAT_BASIS = "unknown"
 
 RETURN_TOOL_NAME = "return_competitor_prices"
 
@@ -122,8 +151,71 @@ def _extract_tool_input(response: Any) -> dict[str, Any] | None:
     return None
 
 
-def _run_agent(query: str, sources: list[str], max_offers: int) -> dict[str, Any]:
+def _raise_if_refused(response: Any) -> None:
+    if response is not None and getattr(response, "stop_reason", None) == "refusal":
+        details = getattr(response, "stop_details", None)
+        log.warning(
+            "competitor_search_refused",
+            category=getattr(details, "category", None),
+        )
+        raise CompetitorSearchError(502, "competitor_scanner_refused")
+
+
+def _timeout_error() -> CompetitorSearchError:
+    return CompetitorSearchError(504, "competitor_search_timeout")
+
+
+def _record_usage(response: Any, call: int, usage: dict[str, int] | None) -> None:
+    raw = getattr(response, "usage", None)
+    counts = {field: int(getattr(raw, field, 0) or 0) for field in _USAGE_FIELDS}
+    server_tools = getattr(raw, "server_tool_use", None)
+    counts.update(
+        {field: int(getattr(server_tools, field, 0) or 0) for field in _SERVER_TOOL_FIELDS}
+    )
+    log.info(
+        "competitor_search_usage",
+        call=call,
+        model=getattr(response, "model", None),
+        stop_reason=getattr(response, "stop_reason", None),
+        **counts,
+    )
+    if usage is not None:
+        usage["api_calls"] = usage.get("api_calls", 0) + 1
+        for field, value in counts.items():
+            usage[field] = usage.get(field, 0) + value
+
+
+def _stream_message(
+    client: Any,
+    deadline: float,
+    cancel: threading.Event | None,
+    **kwargs: Any,
+) -> Any:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or (cancel is not None and cancel.is_set()):
+        raise _timeout_error()
+    timeout = min(float(get_settings().competitor_request_timeout), max(remaining, 1.0))
+    with client.messages.stream(timeout=timeout, **kwargs) as stream:
+        for _event in stream:
+            if time.monotonic() > deadline or (cancel is not None and cancel.is_set()):
+                raise _timeout_error()
+        return stream.get_final_message()
+
+
+def _run_agent(
+    query: str,
+    sources: list[str],
+    max_offers: int,
+    *,
+    deadline: float | None = None,
+    cancel: threading.Event | None = None,
+    usage: dict[str, int] | None = None,
+) -> dict[str, Any]:
     settings = get_settings()
+    if deadline is None:
+        deadline = time.monotonic() + settings.competitor_total_budget_seconds
+    if time.monotonic() > deadline or (cancel is not None and cancel.is_set()):
+        raise _timeout_error()
     anthropic, client = _client()
     allowed_domains = [SOURCE_DOMAINS[s] for s in sources]
     tools = [
@@ -134,8 +226,6 @@ def _run_agent(query: str, sources: list[str], max_offers: int) -> dict[str, Any
             "allowed_domains": allowed_domains,
         },
         {
-            # Search snippets rarely carry prices on these shops — the agent must open
-            # the product card to confirm a price, per the доказовість rules.
             "type": "web_fetch_20260209",
             "name": "web_fetch",
             "max_uses": settings.competitor_web_fetch_max_uses,
@@ -147,51 +237,42 @@ def _run_agent(query: str, sources: list[str], max_offers: int) -> dict[str, Any
     messages: list[dict[str, Any]] = [
         {"role": "user", "content": _user_prompt(query, sources, max_offers)}
     ]
-    deadline = time.monotonic() + settings.competitor_total_budget_seconds
-
-    def _remaining() -> None:
-        if time.monotonic() > deadline:
-            raise CompetitorSearchError(504, "competitor_search_timeout")
+    request: dict[str, Any] = {
+        "model": settings.anthropic_model,
+        "max_tokens": settings.competitor_max_tokens,
+        "system": COMPETITOR_SEARCH_PROMPT,
+        "tools": tools,
+        "output_config": {"effort": settings.competitor_effort},
+    }
+    calls = 0
 
     try:
         response = None
         for _ in range(5):
-            _remaining()
-            # Streaming: a web-search agentic turn can run for minutes; a non-streaming
-            # call trips the SDK read timeout even though the server is still working.
-            with client.messages.stream(
-                model=settings.anthropic_model,
-                max_tokens=8000,
-                system=COMPETITOR_SEARCH_PROMPT,
-                tools=tools,
-                messages=messages,
-            ) as stream:
-                response = stream.get_final_message()
+            calls += 1
+            response = _stream_message(client, deadline, cancel, messages=messages, **request)
+            _record_usage(response, calls, usage)
             if response.stop_reason == "pause_turn":
                 messages.append({"role": "assistant", "content": response.content})
                 continue
             break
 
+        _raise_if_refused(response)
         payload = _extract_tool_input(response) if response is not None else None
-        if payload is None and response is not None:
-            # The model answered in text instead of calling the tool — force the call once.
-            _remaining()
+        if payload is None and response is not None and response.content:
             messages.append({"role": "assistant", "content": response.content})
             messages.append({
                 "role": "user",
-                "content": f"Тепер виклич {RETURN_TOOL_NAME} рівно один раз із фінальним результатом.",
+                "content": (
+                    "Пошук завершено, більше нічого не шукай. "
+                    f"Тепер виклич {RETURN_TOOL_NAME} рівно один раз із фінальним результатом."
+                ),
             })
-            with client.messages.stream(
-                model=settings.anthropic_model,
-                max_tokens=4000,
-                system=COMPETITOR_SEARCH_PROMPT,
-                thinking={"type": "disabled"},
-                tools=[RETURN_TOOL],
-                tool_choice={"type": "tool", "name": RETURN_TOOL_NAME},
-                messages=messages,
-            ) as stream:
-                forced = stream.get_final_message()
-            payload = _extract_tool_input(forced)
+            calls += 1
+            reminded = _stream_message(client, deadline, cancel, messages=messages, **request)
+            _record_usage(reminded, calls, usage)
+            _raise_if_refused(reminded)
+            payload = _extract_tool_input(reminded)
     except CompetitorSearchError:
         raise
     except anthropic.AuthenticationError as exc:
@@ -202,6 +283,9 @@ def _run_agent(query: str, sources: list[str], max_offers: int) -> dict[str, Any
     except anthropic.APIStatusError as exc:
         log.error("competitor_search_api_error", status=exc.status_code, error=str(exc))
         raise CompetitorSearchError(502, "competitor_scanner_upstream_error") from exc
+    except anthropic.APITimeoutError as exc:
+        log.error("competitor_search_api_timeout", error=str(exc))
+        raise _timeout_error() from exc
     except anthropic.APIConnectionError as exc:
         log.error("competitor_search_connection_error", error=str(exc))
         raise CompetitorSearchError(502, "competitor_scanner_unreachable") from exc
@@ -294,15 +378,102 @@ def sanitize_offers(raw_offers: Any, sources: list[str], max_offers: int) -> lis
     return offers[: min(max_offers, 30)]
 
 
+def _cache_key(query: str, sources: list[str]) -> str:
+    settings = get_settings()
+    identity = json.dumps(
+        [
+            " ".join(query.split()).casefold(),
+            sorted(sources),
+            settings.anthropic_model,
+            settings.competitor_max_offers,
+        ],
+        ensure_ascii=False,
+    )
+    return "competitors:v1:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _cache_get(key: str) -> dict[str, Any] | None:
+    return cache.get(key)
+
+
+def _cache_set(key: str, value: dict[str, Any], ttl: int) -> None:
+    cache.set(key, value, ttl)
+
+
+def _envelope(
+    query: str,
+    sources: list[str],
+    searched_at: str,
+    ai_summary: str | None,
+    offers: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "market": MARKET,
+        "currency": CURRENCY,
+        "price_basis": PRICE_BASIS,
+        "vat_basis": VAT_BASIS,
+        "query": query,
+        "searched_at": searched_at,
+        "sources_scanned": sources,
+        "ai_summary": ai_summary,
+        "offers": [
+            {**offer, "currency": CURRENCY, "price_basis": PRICE_BASIS, "vat_basis": VAT_BASIS}
+            for offer in offers
+        ],
+    }
+
+
+def cached_result(query: str, sources: list[str]) -> dict[str, Any] | None:
+    query = query.strip()
+    stored = _cache_get(_cache_key(query, sources))
+    if (
+        not isinstance(stored, dict)
+        or not isinstance(stored.get("searched_at"), str)
+        or not isinstance(stored.get("offers"), list)
+    ):
+        return None
+    allowed = set(sources)
+    offers = [
+        o for o in stored["offers"] if isinstance(o, dict) and o.get("source") in allowed
+    ]
+    log.info("competitor_search_cache_hit", query=query, sources=sources, offers=len(offers))
+    return _envelope(query, sources, stored["searched_at"], stored.get("ai_summary"), offers)
+
+
 def search_competitors(
     query: str,
     sources: list[str],
     product_net_uid: str | None = None,
+    *,
+    deadline: float | None = None,
+    cancel: threading.Event | None = None,
 ) -> dict[str, Any]:
     settings = get_settings()
     query = query.strip()
+    hit = cached_result(query, sources)
+    if hit is not None:
+        return hit
     started = time.monotonic()
-    payload = _run_agent(query, sources, settings.competitor_max_offers)
+    usage: dict[str, int] = {}
+    try:
+        payload = _run_agent(
+            query,
+            sources,
+            settings.competitor_max_offers,
+            deadline=deadline,
+            cancel=cancel,
+            usage=usage,
+        )
+    except CompetitorSearchError as exc:
+        log.warning(
+            "competitor_search_failed",
+            query=query,
+            sources=sources,
+            detail=exc.detail,
+            elapsed_s=round(time.monotonic() - started, 1),
+            **usage,
+        )
+        raise
     offers = sanitize_offers(payload.get("offers"), sources, settings.competitor_max_offers)
     ai_summary = _clean_text(payload.get("ai_summary"), 400)
     log.info(
@@ -313,13 +484,44 @@ def search_competitors(
         offers_raw=len(payload.get("offers") or []) if isinstance(payload.get("offers"), list) else 0,
         offers_kept=len(offers),
         elapsed_s=round(time.monotonic() - started, 1),
+        **usage,
     )
-    return {
-        "market": "UA",
-        "currency": "UAH",
-        "query": query,
-        "searched_at": datetime.now(timezone.utc).isoformat(),
-        "sources_scanned": sources,
-        "ai_summary": ai_summary,
-        "offers": offers,
-    }
+    result = _envelope(
+        query, sources, datetime.now(timezone.utc).isoformat(), ai_summary, offers
+    )
+    _cache_set(
+        _cache_key(query, sources),
+        {"searched_at": result["searched_at"], "ai_summary": ai_summary, "offers": offers},
+        RESULT_CACHE_TTL_S if offers else EMPTY_RESULT_CACHE_TTL_S,
+    )
+    return result
+
+
+async def search_competitors_bounded(
+    query: str,
+    sources: list[str],
+    product_net_uid: str | None = None,
+) -> dict[str, Any]:
+    loop = asyncio.get_running_loop()
+    hit = await loop.run_in_executor(None, cached_result, query, sources)
+    if hit is not None:
+        return hit
+    budget = float(get_settings().competitor_total_budget_seconds)
+    cancel = threading.Event()
+    future = loop.run_in_executor(
+        _scan_executor,
+        partial(
+            search_competitors,
+            query,
+            sources,
+            product_net_uid,
+            deadline=time.monotonic() + budget,
+            cancel=cancel,
+        ),
+    )
+    try:
+        return await asyncio.wait_for(future, timeout=budget)
+    except asyncio.TimeoutError as exc:
+        cancel.set()
+        log.warning("competitor_search_budget_exceeded", query=query, budget_s=budget)
+        raise _timeout_error() from exc

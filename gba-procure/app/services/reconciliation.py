@@ -24,6 +24,7 @@ from typing import Any
 from app.core.config import get_settings
 from app.core.history import history_start_iso, rolling_coverage
 from app.data import masters
+from app.data import source_rules as rules
 from app.data import supply_repository as repo
 from app.data.db import in_clause, query
 from app.data.native_purchase_costs import (
@@ -104,6 +105,15 @@ class SourceFacts:
     unit_cost_overrides_by_pair: dict[tuple[int, int], Any] = field(default_factory=dict)
     cost_observations: tuple[PurchaseCostObservation, ...] | None = None
     cost_manifest_matches: bool = True
+    reservation_by_key: dict[tuple[int, int], Decimal] = field(default_factory=dict)
+
+    def physical_by_key(self) -> dict[tuple[int, int], Decimal]:
+        keys = set(self.availability_by_key) | set(self.reservation_by_key)
+        return {
+            key: self.availability_by_key.get(key, Decimal())
+            + self.reservation_by_key.get(key, Decimal())
+            for key in keys
+        }
 
 
 @dataclass
@@ -265,29 +275,22 @@ def collect_source_epoch(as_of: str, history_days: int) -> str:
         },
     )
     demand = query(
-        """
+        f"""
         SELECT COUNT_BIG(*) AS row_count,
-               MAX(oi.ID) AS max_item_id,
-               MAX(oi.Updated) AS max_updated_at,
-               SUM(TRY_CONVERT(decimal(38,6), oi.Qty)) AS qty_sum,
-               SUM(TRY_CONVERT(decimal(38,6), oi.PricePerItem)) AS price_sum,
+               MAX(d.line_id) AS max_item_id,
+               MAX(d.line_updated) AS max_updated_at,
+               SUM(d.units) AS qty_sum,
+               SUM(TRY_CONVERT(decimal(38,6), d.price)) AS price_sum,
                CHECKSUM_AGG(BINARY_CHECKSUM(
-                   oi.ID, oi.ProductID, oi.Qty, oi.PricePerItem,
-                   oi.IsValidForCurrentSale, oi.Updated
+                   d.line_id, d.product_id, d.units, d.price,
+                   d.sold_at, d.line_updated, d.return_updated
                )) AS row_checksum
-        FROM dbo.[Order] o
-        JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-        WHERE oi.IsValidForCurrentSale = 1
-              AND oi.ProductID <> :syn
-              AND o.Created >= DATEADD(day, -:days, :asof)
-              AND o.Created >= :history_start
-              AND o.Created < :asof
+        FROM {rules.demand_lines()}
+        WHERE d.product_id <> :syn
         """,
         {
-            "asof": as_of,
-            "days": history_days,
-            "history_start": history_start_iso(),
             "syn": syn,
+            **rules.trailing_window(as_of, history_days),
         },
     )
     inventory = query(
@@ -485,6 +488,38 @@ def _collect_on_order(product_ids: list[int], as_of: str) -> dict[int, Decimal]:
                       AND sou.FromDate >= :history_start
                       AND sou.FromDate < :asof
                 GROUP BY soui.ProductID
+
+                UNION ALL
+
+                SELECT line.product_id, SUM(line.open_qty) AS qty
+                FROM (
+                    SELECT soi.ID,
+                           soi.ProductID AS product_id,
+                           TRY_CONVERT(decimal(38,6), soi.Qty) - ISNULL((
+                               SELECT SUM(TRY_CONVERT(decimal(38,6), plpoi.Qty))
+                               FROM dbo.SupplyInvoiceOrderItem sioi
+                               JOIN dbo.SupplyInvoice si
+                                 ON si.ID = sioi.SupplyInvoiceID AND si.Deleted = 0
+                               JOIN dbo.PackingListPackageOrderItem plpoi
+                                 ON plpoi.SupplyInvoiceOrderItemID = sioi.ID AND plpoi.Deleted = 0
+                               JOIN dbo.PackingList pl
+                                 ON pl.ID = plpoi.PackingListID AND pl.Deleted = 0
+                               WHERE sioi.SupplyOrderItemID = soi.ID
+                                     AND sioi.Deleted = 0
+                                     AND si.DateFrom >= :history_start
+                                     AND si.DateFrom < :asof
+                           ), 0) AS open_qty
+                    FROM dbo.SupplyOrderItem soi
+                    JOIN dbo.SupplyOrder so
+                      ON so.ID = soi.SupplyOrderID AND so.Deleted = 0 AND so.IsOrderArrived = 0
+                    WHERE soi.Deleted = 0
+                          AND soi.ProductID <> :syn
+                          AND soi.ProductID IN {placeholders}
+                          AND so.DateFrom >= :history_start
+                          AND so.DateFrom < :asof
+                ) line
+                WHERE line.open_qty > 0
+                GROUP BY line.product_id
             ),
             ReceivedQty AS (
                 SELECT sioi.ProductID AS product_id,
@@ -668,6 +703,7 @@ def collect_source_facts(payload: Mapping[str, Any], as_of: str) -> SourceFacts:
         unit_cost_overrides_by_pair=unit_cost_overrides,
         cost_observations=cost_observations,
         cost_manifest_matches=cost_manifest_matches,
+        reservation_by_key=reservations,
     )
 
 
@@ -1304,22 +1340,23 @@ def validate_canonical_plan(
             actual=duplicate_products,
         )
 
-    for storage_key in sorted(set(facts.availability_by_key) | set(facts.consignment_by_key)):
-        available = facts.availability_by_key.get(storage_key, Decimal())
+    physical_by_key = facts.physical_by_key()
+    for storage_key in sorted(set(physical_by_key) | set(facts.consignment_by_key)):
+        physical = physical_by_key.get(storage_key, Decimal())
         remaining = facts.consignment_by_key.get(storage_key, Decimal())
-        if abs(available - remaining) > _QTY_TOLERANCE:
+        if abs(physical - remaining) > _QTY_TOLERANCE:
             _issue(
                 issues,
                 "Q005",
                 "quantity",
-                "ProductAvailability differs from ConsignmentItem.RemainingQty",
+                "ProductAvailability plus active reservations differs from ConsignmentItem.RemainingQty",
                 key={
                     "product_id": storage_key[0],
                     "storage_id": storage_key[1],
                 },
                 expected=remaining,
-                actual=available,
-                delta=available - remaining,
+                actual=physical,
+                delta=physical - remaining,
             )
 
     expected_total_qty = _fraction_decimal(total_qty)
@@ -1400,9 +1437,9 @@ def validate_canonical_plan(
         "invalid_unit_cost_overrides": invalid_unit_cost_overrides,
         "consignment_drift_keys": sum(
             1
-            for storage_key in set(facts.availability_by_key) | set(facts.consignment_by_key)
+            for storage_key in set(physical_by_key) | set(facts.consignment_by_key)
             if abs(
-                facts.availability_by_key.get(storage_key, Decimal())
+                physical_by_key.get(storage_key, Decimal())
                 - facts.consignment_by_key.get(storage_key, Decimal())
             )
             > _QTY_TOLERANCE

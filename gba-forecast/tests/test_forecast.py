@@ -200,16 +200,29 @@ def test_eur_boundary_uses_decimal_half_up_and_rejects_non_finite():
             fc.eur_cents(invalid)
 
 
-def test_forecast_points_auto_picks_sba_for_intermittent_series():
-    # An intermittent series under auto mode is forecast with SBA (bias-corrected), which yields
-    # a strictly lower flat value than the window-mean (moving_avg) on a sporadic series.
+def test_forecast_points_auto_uses_tsb_for_intermittent_client_series():
     hist = {"2025-12": 100.0, "2026-01": 100.0, "2026-04": 100.0}
     auto_cfg = CFG.model_copy(update={"forecast_method": "auto", "min_history_months": 3})
-    fixed_cfg = CFG.model_copy(update={"forecast_method": "moving_avg", "min_history_months": 3})
-    auto_pts = fc.forecast_points(hist, date(2026, 6, 24), auto_cfg, horizon=3)
-    fixed_pts = fc.forecast_points(hist, date(2026, 6, 24), fixed_cfg, horizon=3)
-    assert auto_pts and fixed_pts
-    assert auto_pts[0]["SaleAmount"] < fixed_pts[0]["SaleAmount"]
+    sba_cfg = CFG.model_copy(update={"forecast_method": "sba", "min_history_months": 3})
+    as_of = date(2026, 6, 24)
+    points, method = fc.forecast_points_with_method(hist, as_of, auto_cfg, horizon=3)
+    series = fc.series_from(hist, fc.training_labels(as_of, auto_cfg))
+    assert method == {"method": "tsb_a0.5_b0.5", "segment": "intermittent"}
+    assert points[0]["SaleAmount"] == fc.eur_cents(demand.tsb_rate(series, 0.5, 0.5))
+    assert len({point["SaleAmount"] for point in points}) == 1
+    pair_points, pair_method = fc.forecast_points_with_method(hist, as_of, auto_cfg, 3, "pair")
+    assert pair_method == {"method": "ewma_a0.4", "segment": "intermittent"}
+    assert pair_points[0]["SaleAmount"] == fc.eur_cents(demand.ewma_rate(series, 0.4))
+    assert points == fc.forecast_points(hist, as_of, auto_cfg, horizon=3)
+    assert points != fc.forecast_points(hist, as_of, sba_cfg, horizon=3)
+    keys = {"SaleAmount", "MonthNameUK", "SaleAmountLow", "SaleAmountHigh"}
+    assert [set(point) for point in points] == [keys] * 3
+
+
+def test_forecast_points_with_method_reports_nothing_for_refused_series():
+    hist = {"2026-01": 100.0, "2026-04": 100.0}
+    cfg = CFG.model_copy(update={"forecast_method": "auto", "min_history_months": 3})
+    assert fc.forecast_points_with_method(hist, date(2026, 6, 24), cfg, horizon=3) == ([], None)
 
 
 def test_forecast_points_auto_matches_ewma_for_smooth_series():
@@ -250,8 +263,78 @@ def test_partial_month_cannot_make_history_status_sufficient(monkeypatch):
     settings = Settings(min_history_months=3, history_months=12)
     monkeypatch.setattr(main, "settings", settings)
     rows = [{"ym": month, "eur": 300.0} for month in ("2026-07", "2026-08", "2026-09")]
-    points, history = main._forecast_with_history(rows, date(2026, 9, 7), 3)
+    points, history, method = main._forecast_with_history(rows, date(2026, 9, 7), 3)
     assert points == []
+    assert method is None
     assert history["sufficient"] is False
     assert history["status"] == "insufficient_history"
     assert history["month_count"] == 2
+
+
+def test_forecast_points_use_the_scope_alpha():
+    values = [100, 120, 90, 110, 130, 95, 105, 115, 125, 100, 300, 320]
+    hist = {f"2025-{month:02d}": float(value) for month, value in enumerate(values, start=1)}
+    cfg = CFG.model_copy(update={"forecast_method": "auto"})
+    as_of = date(2026, 1, 15)
+    series = fc.series_from(hist, fc.training_labels(as_of, cfg))
+    for scope, alpha in (("client", 0.3), ("product", 0.15), ("pair", 0.1)):
+        points, method = fc.forecast_points_with_method(hist, as_of, cfg, 2, scope)
+        assert method == {"method": f"ewma_a{alpha:g}", "segment": "smooth"}
+        assert points[0]["SaleAmount"] == fc.eur_cents(demand.ewma_rate(series, alpha))
+
+
+def _history_then_silence(active: int, silent: int, amount: float = 1000.0) -> tuple[dict, date]:
+    labels = fc.history_labels(date(2026, 11, 13), active + silent + 1, date(2025, 1, 1))[:-1]
+    return {label: amount for label in labels[:active]}, date(2026, 11, 13)
+
+
+@pytest.mark.parametrize(
+    ("scope", "silent", "ceiling"),
+    [
+        ("client", 6, 20.0),
+        ("client", 12, 0.5),
+        ("product", 6, 130.0),
+        ("product", 12, 20.0),
+        ("pair", 12, 5.0),
+    ],
+)
+def test_a_series_that_stopped_selling_fades_to_zero(scope, silent, ceiling):
+    hist, as_of = _history_then_silence(22 - silent, silent)
+    cfg = CFG.model_copy(update={"forecast_method": "auto", "history_months": 24})
+    points, method = fc.forecast_points_with_method(hist, as_of, cfg, 6, scope)
+    assert method["segment"] == "intermittent"
+    assert len(points) == 6
+    assert all(0.0 <= point["SaleAmount"] <= ceiling for point in points)
+    assert all(point["SaleAmountLow"] <= point["SaleAmount"] <= point["SaleAmountHigh"] for point in points)
+
+
+def test_recent_silence_lowers_the_forecast_month_by_month():
+    cfg = CFG.model_copy(update={"forecast_method": "auto", "history_months": 24})
+    amounts = []
+    for silent in range(0, 8):
+        hist, as_of = _history_then_silence(22 - silent, silent)
+        amounts.append(fc.forecast_points(hist, as_of, cfg, 1, "client")[0]["SaleAmount"])
+    assert amounts[0] == 1000.0
+    assert all(later < earlier for earlier, later in zip(amounts, amounts[1:], strict=False))
+
+
+def test_new_entity_with_two_months_gets_no_forecast_and_three_gets_one():
+    cfg = CFG.model_copy(update={"forecast_method": "auto", "history_months": 24})
+    as_of = date(2026, 11, 13)
+    two = {"2026-09": 500.0, "2026-10": 700.0, "2026-11": 900.0}
+    assert fc.forecast_points_with_method(two, as_of, cfg, 6, "client") == ([], None)
+    three = {"2026-08": 400.0, **two}
+    points, method = fc.forecast_points_with_method(three, as_of, cfg, 6, "client")
+    assert len(points) == 6 and method["segment"] == "smooth"
+    series = fc.series_from(three, fc.training_labels(as_of, cfg))
+    assert series[:19] == [0.0] * 19
+    assert points[0]["SaleAmount"] == fc.eur_cents(demand.ewma_rate(series, 0.3)) == 373.8
+    assert points[0]["SaleAmount"] < demand.ewma_rate(series[19:], 0.3)
+
+
+def test_tsb_rate_is_never_negative_and_handles_degenerate_input():
+    assert demand.tsb_rate([], 0.5, 0.5) == 0.0
+    assert demand.tsb_rate([0.0, 0.0, 0.0], 0.5, 0.5) == 0.0
+    assert demand.tsb_rate([0.0, 0.0, 300.0], 0.5, 0.5) == 150.0
+    assert demand.tsb_rate([200.0] * 6, 0.2, 0.3) == pytest.approx(200.0)
+    assert demand.tsb_rate([200.0, 0.0, 0.0, 0.0], 0.5, 0.5) == pytest.approx(25.0)

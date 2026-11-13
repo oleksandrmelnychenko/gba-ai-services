@@ -29,10 +29,30 @@ def test_synthetic_product_status_fails_closed_when_lookup_fails(monkeypatch):
     )
 
     assert sig.synthetic_product_status() == {
-        "product_id": sig._SYNTHETIC_FALLBACK_ID,
+        "product_id": None,
         "resolved": False,
-        "source": "unverified_fallback",
+        "source": "unresolved",
     }
+    assert not hasattr(sig, "_SYNTHETIC_FALLBACK_ID")
+    with pytest.raises(RuntimeError, match="synthetic_product_unresolved"):
+        sig.synthetic_product_id()
+
+
+def test_synthetic_product_status_keeps_last_verified_id_but_marks_it_unresolved(monkeypatch):
+    monkeypatch.setattr(sig, "_synthetic_cached", (321, -10_000.0, True, "verified_database"))
+    monkeypatch.setattr(
+        sig,
+        "query",
+        lambda sql, params=None: (_ for _ in ()).throw(RuntimeError("db unavailable")),
+    )
+
+    assert sig.synthetic_product_status() == {
+        "product_id": 321,
+        "resolved": False,
+        "source": "unresolved",
+    }
+    with pytest.raises(RuntimeError, match="synthetic_product_unresolved"):
+        sig.synthetic_product_id()
 
 
 def test_sales_source_status_fails_closed_when_schema_is_missing(monkeypatch):
@@ -103,9 +123,9 @@ def test_sales_source_status_uses_same_floor_and_effective_window_params(monkeyp
 
     assert captured == [
         {
-            "asof": as_of,
-            "source_history_start": "2025-01-01",
-            "history_start": "2025-01-01",
+            "asof": datetime(2026, 7, 24, 21, 0),
+            "source_history_start": datetime(2024, 12, 31, 22, 0),
+            "history_start": datetime(2024, 12, 31, 22, 0),
             "synth": 999,
         }
     ]
@@ -148,10 +168,14 @@ def test_history_summary_rejects_rows_beyond_calendar_window():
 
 
 def test_calendar_window_enforces_source_and_effective_parameter_boundaries():
-    assert "o.Created >= :source_history_start" in sig._WINDOW
-    assert "o.Created >= :history_start" in sig._WINDOW
-    assert "o.Created < :asof" in sig._WINDOW
+    assert "f.fact_at >= :source_history_start" in sig._WINDOW
+    assert "f.fact_at >= :history_start" in sig._WINDOW
+    assert "f.fact_at < :asof" in sig._WINDOW
     assert "DATEADD" not in sig._WINDOW
+    assert "s.ChangedToInvoice >= :source_history_start" in sig._FACTS
+    assert "s.ChangedToInvoice >= :history_start" in sig._FACTS
+    assert "s.ChangedToInvoice < :asof" in sig._FACTS
+    assert "sr.FromDate < :asof" in sig._FACTS
 
 
 def test_monthly_query_clamps_sql_params_to_source_floor(monkeypatch):
@@ -166,11 +190,14 @@ def test_monthly_query_clamps_sql_params_to_source_floor(monkeypatch):
     sig.monthly_sales_by_client(11, "2026-07-25", 24)
 
     assert captured[0][1] == {
-        "asof": "2026-07-25",
-        "source_history_start": "2025-01-01",
-        "history_start": "2025-01-01",
+        "asof": datetime(2026, 7, 24, 21, 0),
+        "source_history_start": datetime(2024, 12, 31, 22, 0),
+        "history_start": datetime(2024, 12, 31, 22, 0),
         "cid": 11,
         "synth": 999,
+        "zone_change_0": datetime(2025, 3, 30, 1, 0),
+        "zone_change_1": datetime(2025, 10, 26, 1, 0),
+        "zone_change_2": datetime(2026, 3, 29, 1, 0),
     }
 
 
@@ -184,8 +211,8 @@ def test_monthly_query_uses_requested_start_once_full_window_is_available(monkey
 
     sig.monthly_sales_by_product(22, "2027-07-25", 24)
 
-    assert captured[0]["source_history_start"] == "2025-01-01"
-    assert captured[0]["history_start"] == "2025-08-01"
+    assert captured[0]["source_history_start"] == datetime(2024, 12, 31, 22, 0)
+    assert captured[0]["history_start"] == datetime(2025, 7, 31, 21, 0)
 
 
 def test_forecast_source_fingerprint_is_scoped_and_money_sensitive(monkeypatch):
@@ -216,11 +243,14 @@ def test_forecast_source_fingerprint_is_scoped_and_money_sensitive(monkeypatch):
 
     assert first != second
     assert len(first) == len(second) == 24
-    assert "ca.ClientID = :cid OR oi.ProductID = :pid" in captured[0][0]
+    sql = " ".join(captured[0][0].split())
+    assert "WHERE f.client_id = :cid UNION ALL SELECT * FROM" in sql
+    assert "WHERE f.product_id = :pid AND f.client_id <> :cid) f" in sql
+    assert " OR " not in sql.replace("dbo.[Order]", "")
     assert captured[0][1] == {
-        "asof": "2026-07-25",
-        "source_history_start": "2025-01-01",
-        "history_start": "2025-01-01",
+        "asof": datetime(2026, 7, 24, 21, 0),
+        "source_history_start": datetime(2024, 12, 31, 22, 0),
+        "history_start": datetime(2024, 12, 31, 22, 0),
         "synth": 999,
         "cid": 11,
         "pid": 22,

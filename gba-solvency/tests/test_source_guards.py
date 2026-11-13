@@ -10,7 +10,7 @@ Guarded regressions:
     turnover wrongly divided by the FX rate -- PricePerItem is already EUR).
   - overdue_amount_eur MUST still EUR-convert Debt.Total (that conversion is correct and stays).
   - client_exists guard must exist (no fabricated score for a phantom client).
-  - overdue_amount_eur / open_unpaid_stats / open_unpaid_aging_buckets must anchor on :asof,
+  - overdue_amount_eur / open_unpaid_stats must anchor on :asof,
     never the non-deterministic GETDATE()/GETUTCDATE() (those appear only in docstrings).
 """
 from __future__ import annotations
@@ -25,20 +25,20 @@ from app.risk import dataset
 _TURNOVER_FNS = (
     repo.turnover_eur,
     repo.turnover_eur_by_currency,
+    repo.turnover_eur_by_currency_many,
     repo.monthly_turnover_series,
 )
 _ASOF_FNS = (
     repo.overdue_amount_eur,
     repo.open_unpaid_stats,
-    repo.open_unpaid_aging_buckets,
 )
 _TRANSACTION_HISTORY_FNS = (
     repo.payment_status_counts,
     repo.open_unpaid_stats,
-    repo.open_unpaid_aging_buckets,
     repo.total_sales_count,
     repo.turnover_eur,
     repo.turnover_eur_by_currency,
+    repo.turnover_eur_by_currency_many,
     repo.activity_stats,
     repo.return_qty_rate,
     repo.monthly_turnover_series,

@@ -34,7 +34,15 @@ def _history(status: str = "not_requested") -> dict:
 
 def _cached_client_payload(client_net_id: str, as_of: str, horizon: int) -> dict:
     return {
-        "ByClient": [{"SaleAmount": 10.0, "MonthNameUK": f"month-{index}"} for index in range(horizon)],
+        "ByClient": [
+            {
+                "SaleAmount": 10.0,
+                "MonthNameUK": f"month-{index}",
+                "SaleAmountLow": 4.0,
+                "SaleAmountHigh": 21.0,
+            }
+            for index in range(horizon)
+        ],
         "ByProduct": [],
         "ByClientAndProduct": [],
         "meta": {
@@ -42,6 +50,7 @@ def _cached_client_payload(client_net_id: str, as_of: str, horizon: int) -> dict
             "as_of": as_of,
             "requested_as_of": None,
             "horizon_months": horizon,
+            "horizon_shape": "flat_run_rate",
             "currency": "EUR",
             "model_version": main.settings.model_version,
             "source_fingerprint": "source-epoch",
@@ -64,6 +73,7 @@ def _cached_client_payload(client_net_id: str, as_of: str, horizon: int) -> dict
                 "ByProduct": _history(),
                 "ByClientAndProduct": _history(),
             },
+            "interval": main.intervals.metadata(),
         },
     }
 
@@ -215,6 +225,73 @@ def test_use_cache_false_bypasses_read_and_write(monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["meta"]["resolved"]["client_id"] == 123
+
+
+def _stub_client_history(monkeypatch, rows):
+    monkeypatch.setattr(main.settings, "internal_api_key", "")
+    monkeypatch.setattr(main, "_today", lambda: "2026-07-25")
+    monkeypatch.setattr(main.sig, "client_id_for_netuid", lambda net_uid: 123)
+    monkeypatch.setattr(main.sig, "synthetic_product_id", lambda: 999)
+    monkeypatch.setattr(main.sig, "forecast_source_fingerprint", lambda *args: "source-epoch")
+    monkeypatch.setattr(main.sig, "monthly_sales_by_client", lambda *args: rows)
+    return TestClient(main.app).get(
+        "/forecast/sales",
+        params={"client_net_id": "7845841E-0678-4364-A346-2CE21C7378AB", "use_cache": "false"},
+    )
+
+
+def test_empty_history_reports_the_requested_horizon_and_no_points(monkeypatch):
+    response = _stub_client_history(monkeypatch, [])
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ByClient"] == []
+    assert body["meta"]["status"] == "insufficient_history"
+    assert body["meta"]["horizon_months"] == main.settings.forecast_horizon_months
+    assert body["meta"]["horizon_shape"] == "flat_run_rate"
+    assert body["meta"]["history"]["ByClient"] == {
+        "status": "insufficient_history",
+        "month_count": 0,
+        "non_zero_month_count": 0,
+        "total_eur": 0.0,
+        "sufficient": False,
+    }
+    assert body["meta"]["method"]["ByClient"] is None
+
+
+def test_sporadic_client_gets_a_flat_non_negative_tsb_run_rate(monkeypatch):
+    rows = [{"ym": month, "eur": 900.0} for month in ("2025-03", "2025-08", "2025-12", "2026-05")]
+    response = _stub_client_history(monkeypatch, rows)
+
+    assert response.status_code == 200
+    body = response.json()
+    points = body["ByClient"]
+    assert len(points) == body["meta"]["horizon_months"] == main.settings.forecast_horizon_months
+    assert body["meta"]["horizon_shape"] == "flat_run_rate"
+    assert body["meta"]["method"]["ByClient"] == {
+        "method": "tsb_a0.5_b0.5",
+        "segment": "intermittent",
+    }
+    assert len({point["SaleAmount"] for point in points}) == 1
+    assert 0.0 < points[0]["SaleAmount"] < 900.0
+    assert all(0.0 <= p["SaleAmountLow"] <= p["SaleAmount"] <= p["SaleAmountHigh"] for p in points)
+    assert points[-1]["SaleAmountHigh"] >= points[0]["SaleAmountHigh"]
+
+
+def test_cached_response_without_the_horizon_shape_is_not_served(monkeypatch):
+    client_net_id = "7845841E-0678-4364-A346-2CE21C7378AB"
+    horizon = main.settings.forecast_horizon_months
+    payload = _cached_client_payload(client_net_id, "2026-07-25", horizon)
+    payload["meta"]["requested_as_of"] = None
+    assert main._is_valid_cached_response(
+        payload, main.UUID(client_net_id), None, 123, None, False, "source-epoch", horizon,
+        "2026-07-25", None,
+    )
+    del payload["meta"]["horizon_shape"]
+    assert not main._is_valid_cached_response(
+        payload, main.UUID(client_net_id), None, 123, None, False, "source-epoch", horizon,
+        "2026-07-25", None,
+    )
 
 
 def test_cache_identity_mismatch_is_rebuilt_from_canonical_source(monkeypatch):

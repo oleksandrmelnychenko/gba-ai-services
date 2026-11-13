@@ -74,7 +74,7 @@ def model_contract_fingerprint(
 ) -> str:
     """Stable serving-model namespace including its factual-history contract."""
     history_fingerprint = history_contract_fingerprint(source_history_start)
-    payload = f"pricing-model-v1|{model_version}|{history_fingerprint}|{trailing_window_months}"
+    payload = f"pricing-model-v2|{model_version}|{history_fingerprint}|{trailing_window_months}"
     digest = hashlib.sha256(payload.encode()).hexdigest()[:16]
     return f"{model_version}-{digest}"
 

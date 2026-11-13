@@ -38,6 +38,8 @@ unit_cost_eur  = robust per-product cost = MEDIAN of ConsignmentItem.AccountingP
                  fallback = latest-lot TOP 1 AccountingPrice ORDER BY ID DESC. AccountingPrice is
                  EUR-base. No cost lot -> unit_cost_eur=null, confidence low, skip the floor.
 price_floor    = unit_cost_eur * (1 + target_margin_pct/100)   # config default 12; never below
+floor_markup_pct = target_margin_pct                           # a markup ON COST (12.0)
+floor_margin_pct = floor_markup_pct/(100+floor_markup_pct)*100  # same rule as margin OF PRICE (10.71)
 peer_band      = P25/P50/P75 + n of realized EUR unit price over distinct client-agreements for p
                  in the trailing window (OrderItem.PricePerItem is already EUR; UoM outliers are
                  rejected with a per-product median/MAD filter).
@@ -109,13 +111,16 @@ model/history fingerprint and hydration rejects entries with missing or mismatch
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 cp .env.example .env   # fill DB_PASSWORD with the read-only login
-.venv/bin/uvicorn app.api.main:app --host 0.0.0.0 --port 8004
+.venv/bin/uvicorn app.api.main:app --host 127.0.0.1 --port 8004
 ```
 
 ## API
 
 - `POST /price` — `{product_id | product_net_uid, client_agreement_net_uid, culture?='uk',
-  with_vat?=true, target_margin_pct?}` → `PriceRecommendation`.
+  with_vat?=true, target_margin_pct?}` → `PriceRecommendation`. `with_vat` is accepted and
+  **ignored**: `dbo.GetCalculatedProductPriceWithSharesAndVat` never reads `@WithVat`, so all
+  prices are "as invoiced" on the agreement's own VAT basis (gross on a VAT agreement, net on a
+  non-VAT one). The flag does not convert anything and is not part of the cache key.
 - `POST /price/batch` — `{items:[{product_net_uid, client_agreement_net_uid}], ...}` → list of
   `PriceRecommendation` (errors isolated).
 - `GET /health`, `GET /ready`, `GET /metrics`.

@@ -5,7 +5,7 @@ implicit client×product purchase matrix. Confidence weighting c = 1 + alpha·co
 more-purchased pairs pull harder; unobserved pairs are weak-negative (preference 0).
 
 Pure numpy (matrix is ~604×6166, 15.7k nnz, 0.4% dense — trivial to factor). No scipy/
-implicit dependency, keeping the stack clean. Trained point-in-time (Created < as_of) so
+implicit dependency, keeping the stack clean. Trained point-in-time (source_rules.window) so
 it's eval-safe through the same harness. Model is cached per as_of (training is the cost).
 
 Scoring: score(u, i) = x_u · y_i. Recommend top-N unseen-or-seen by score.
@@ -21,6 +21,7 @@ from app.core.history import (
     require_supported_as_of,
     source_history_start_iso,
 )
+from app.data import source_rules as rules
 from app.data.db import query
 from app.domain.models import (
     ProductRec,
@@ -63,17 +64,13 @@ class ALSModel:
 def _load_interactions(as_of: str):
     require_supported_as_of(as_of)
     rows = query(
-        """
+        f"""
         SELECT ca.ClientID AS cid, oi.ProductID AS pid, COUNT(DISTINCT o.ID) AS cnt
-        FROM dbo.ClientAgreement ca
-        JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
-        JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-        WHERE oi.IsValidForCurrentSale = 1
-              AND o.Created < :asof AND o.Created >= :history_start
-              AND oi.ProductID IS NOT NULL
+        FROM {rules.SPINE}
+        WHERE {rules.PURCHASED}
         GROUP BY ca.ClientID, oi.ProductID
         """,
-        {"asof": as_of, "history_start": source_history_start_iso()},
+        rules.window(as_of),
     )
     return rows
 

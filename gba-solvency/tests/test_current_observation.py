@@ -35,9 +35,10 @@ def fail_io(*_args, **_kwargs):
 
 @pytest.fixture
 def no_io(monkeypatch):
-    for method in ("client_exists", "resolve_client_id", "has_buyer_role"):
+    for method in ("client_exists", "resolve_client_id", "has_buyer_role",
+                   "has_hopeless_debt_role", "client_gates"):
         monkeypatch.setattr(service.repo, method, fail_io)
-    for method in ("get", "set", "make_key", "make_charts_key"):
+    for method in ("get", "get_many", "set", "set_many", "make_key", "make_charts_key"):
         monkeypatch.setattr(service.cache, method, fail_io)
     monkeypatch.setattr(service.risk_dataset, "features_one", fail_io)
     monkeypatch.setattr(service.risk_dataset, "features_many", fail_io)
@@ -93,9 +94,17 @@ def test_business_day_uses_kyiv_timezone_including_dst(monkeypatch, instant, exp
 def empty_native_reads(monkeypatch):
     monkeypatch.setattr(service.repo, "client_exists", lambda _cid: True)
     monkeypatch.setattr(service.repo, "has_buyer_role", lambda _cid: True)
+    monkeypatch.setattr(service.repo, "has_hopeless_debt_role", lambda _cid: False)
+    monkeypatch.setattr(
+        service.repo, "client_gates",
+        lambda ids: {cid: service.repo.ClientGate(True, False) for cid in ids},
+    )
     monkeypatch.setattr(service.cache, "get", lambda *_a: None)
+    monkeypatch.setattr(service.cache, "get_many", lambda keys: [service.cache.get(k) for k in keys])
     monkeypatch.setattr(service.cache, "set", lambda *_a: None)
-    for method in ("credit_limit_utilization", "debt_aging_buckets_truth", "monthly_turnover_series"):
+    monkeypatch.setattr(service.cache, "set_many", lambda *_a: None)
+    monkeypatch.setattr(service, "_currency_breakdowns", lambda ids, *_a: dict.fromkeys(ids))
+    for method in ("limit_utilization_basis", "debt_aging_buckets_truth", "monthly_turnover_series"):
         monkeypatch.setattr(service.repo, method, lambda *_a: [])
     monkeypatch.setattr(service.repo, "debt_exposure_donut_truth", lambda *_a: {})
     monkeypatch.setattr(service.repo, "debt_sync_is_live", lambda: False)

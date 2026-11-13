@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from decimal import Decimal
 from datetime import datetime, timezone
 from app.core import serving_context
 from app.core.serving_context import observation_fields
@@ -51,6 +52,8 @@ def _fixed_serving_day(monkeypatch):
 def _no_cache(monkeypatch):
     monkeypatch.setattr(service.cache, "get", lambda *a, **k: None)
     monkeypatch.setattr(service.cache, "set", lambda *a, **k: None)
+    monkeypatch.setattr(service.cache, "get_many", lambda keys: [None] * len(keys))
+    monkeypatch.setattr(service.cache, "set_many", lambda *a, **k: None)
 
 
 @pytest.fixture(autouse=True)
@@ -61,6 +64,7 @@ def _client_exists(monkeypatch):
 @pytest.fixture(autouse=True)
 def _has_buyer_role(monkeypatch):
     monkeypatch.setattr(service.repo, "has_buyer_role", lambda cid: True)
+    monkeypatch.setattr(service.repo, "has_hopeless_debt_role", lambda cid: False)
 
 
 def _wire_v3(monkeypatch, *, current=None, currency=None, features=None):
@@ -331,6 +335,9 @@ def test_score_client_cache_hit_hydrates(monkeypatch):
             band=Risk90dBand.MEDIUM,
             exposure_eur=250.25,
             reason_code=Risk90dReason.CURRENT_DEBT,
+            overdue_91_plus_eur=0.0,
+            overdue_1_90_eur=0.0,
+            total_debt_eur=250.25,
         ),
         forward_risk_status=ForwardRiskStatus.NOT_APPLICABLE,
         forward_risk_reason="replaced_by_operational_90d",
@@ -416,6 +423,9 @@ def test_score_client_rejects_internally_inconsistent_risk_cache(monkeypatch):
             band=Risk90dBand.MEDIUM,
             exposure_eur=0.01,
             reason_code=Risk90dReason.CURRENT_DEBT,
+            overdue_91_plus_eur=0.0,
+            overdue_1_90_eur=0.0,
+            total_debt_eur=0.01,
         ),
         forward_risk_status=ForwardRiskStatus.NOT_APPLICABLE,
         forward_risk_reason="replaced_by_operational_90d",
@@ -449,6 +459,9 @@ def test_score_client_ignores_cache_entry_for_another_client(monkeypatch):
             band=Risk90dBand.MEDIUM,
             exposure_eur=250.25,
             reason_code=Risk90dReason.CURRENT_DEBT,
+            overdue_91_plus_eur=0.0,
+            overdue_1_90_eur=0.0,
+            total_debt_eur=250.25,
         ),
         forward_risk_status=ForwardRiskStatus.NOT_APPLICABLE,
         forward_risk_reason="replaced_by_operational_90d",
@@ -470,8 +483,9 @@ def test_build_charts_assembles_from_repo(monkeypatch):
     # BaseSalePaymentStatus.NotPaid enum (which read ~93% unpaid for nearly every client).
     monkeypatch.setattr(service.repo, "debt_exposure_donut_truth", lambda *a, **k: {
         "settled": 7, "current": 2, "overdue": 1, "current_eur": 50.0, "overdue_eur": 30.0})
-    monkeypatch.setattr(service.repo, "credit_limit_utilization", lambda *a, **k: [
-        {"is_control_amount": True, "amount_debt": 1000.0, "limit_utilization": 0.8}])
+    monkeypatch.setattr(service.repo, "limit_utilization_basis", lambda *a, **k: [
+        {"agreement_id": 5, "currency_id": 2, "limit_amount": Decimal("1000"),
+         "debt_amount": Decimal("800")}])
     monkeypatch.setattr(service.repo, "debt_aging_buckets_truth", lambda *a, **k: [
         {"bucket": "0-30", "count": 2, "amount_eur": 12.5},
         {"bucket": "90+", "count": 1, "amount_eur": 30.0}])
@@ -489,6 +503,7 @@ def test_build_charts_assembles_from_repo(monkeypatch):
 
     out = service.build_charts(11, "2026-06-01", 12)
     assert out.limit_utilization_gauge.value == 0.8
+    assert out.limit_utilization_gauge.status == "ok"
     labels = {d.label: d.count for d in out.payment_discipline_donut}
     assert labels == {"settled": 7, "current": 2, "overdue": 1}
     assert [b.bucket for b in out.open_invoice_aging_bars] == ["0-30", "31-60", "61-90", "90+"]

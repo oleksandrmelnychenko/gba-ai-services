@@ -24,11 +24,13 @@ from app.core.metrics import METRICS
 from app.data import cache
 from app.data.db import dispose, get_engine
 from app.domain.models import (
+    BatchMeta,
     BatchScoreRequest,
     ClientIdentityMismatchError,
     ScoreRequest,
     SolvencyCharts,
     SolvencyScore,
+    SolvencyScoreSlim,
 )
 
 settings = get_settings()
@@ -160,9 +162,13 @@ def _synthetic_drift_ok_cached() -> bool | None:
 
 def _model_readiness() -> dict:
     from app.risk.score_current import current_model_readiness
+    from app.risk.score_index import INDEX_MODEL_VERSION, index_model_readiness
 
+    served_index = settings.model_version == INDEX_MODEL_VERSION
     return {
-        "current_state": current_model_readiness(),
+        "current_state": index_model_readiness() if served_index else current_model_readiness(),
+        "served_engine": "payment_behaviour_index" if served_index else "current_state_scorecard",
+        "payment_index": index_model_readiness(),
         "operational_90d": {
             "ready": True,
             "kind": "deterministic_open_debt_control",
@@ -296,7 +302,7 @@ def score(req: ScoreRequest) -> SolvencyScore:
 
 
 @app.post("/score/batch")
-def score_batch(req: BatchScoreRequest) -> dict:
+def score_batch(req: BatchScoreRequest) -> JSONResponse:
     """Per-client errors are isolated so one bad id doesn't fail the batch.
 
     Uses the set-based score_batch (a handful of queries for the whole id-list) instead of an
@@ -317,7 +323,35 @@ def score_batch(req: BatchScoreRequest) -> dict:
         err_id = uuid.uuid4().hex
         log.error("score_batch_failed", clients=len(req.client_ids), error_id=err_id, error=str(exc))
         raise HTTPException(status_code=500, detail=f"internal error (ref {err_id})") from exc
-    return {"results": results, "errors": errors, "count": len(results), "failed": len(errors)}
+    if req.slim:
+        return _slim_batch(results, errors)
+    return JSONResponse(
+        content={
+            "results": [r.model_dump(mode="json") for r in results],
+            "errors": errors,
+            "count": len(results),
+            "failed": len(errors),
+        }
+    )
+
+
+_SLIM_FIELDS = frozenset(SolvencyScoreSlim.model_fields)
+_META_FIELDS = frozenset(BatchMeta.model_fields)
+
+
+def _slim_batch(results: list[SolvencyScore], errors: list[dict]) -> JSONResponse:
+    """List-view batch: slim rows plus the request-wide metadata once, not per row."""
+    meta = results[0].model_dump(mode="json", include=_META_FIELDS) if results else None
+    return JSONResponse(
+        content={
+            "results": [r.model_dump(mode="json", include=_SLIM_FIELDS) for r in results],
+            "errors": errors,
+            "count": len(results),
+            "failed": len(errors),
+            "slim": True,
+            "meta": meta,
+        }
+    )
 
 
 @app.get("/charts/{client_id}", response_model=SolvencyCharts)

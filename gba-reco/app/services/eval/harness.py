@@ -9,7 +9,7 @@ Why this design (verified against the dev DB):
 Protocol per client:
   1. Find the client's LAST order date (the held-out basket).
   2. Recommend with as_of_date = that date (strictly < last order → no leakage of the
-     held-out basket; the recommender's queries all use `o.Created < :asof`).
+     held-out basket; every history query ends at source_rules.window(as_of)).
   3. Ground truth = the set of ProductIDs in the held-out last order.
   4. Score the recommendation list vs that truth.
 
@@ -22,10 +22,12 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 
 from app.core.config import get_settings
-from app.core.history import require_supported_as_of, source_history_start_iso
+from app.core.history import require_supported_as_of
 from app.data import sales_repository
+from app.data import source_rules as rules
 from app.data.db import query
 from app.services.recommendations import recommender
 
@@ -77,22 +79,21 @@ class Metrics:
 def build_cases(min_orders: int = 2, limit: int | None = None) -> list[EvalCase]:
     """One case per eligible client. Held-out = the client's single LAST order (by ID),
     identified explicitly (not by timestamp equality, which can bundle multiple orders).
-    as_of = that order's exact timestamp, so the recommender's `Created < :asof` excludes
+    as_of = that sale's invoice timestamp, so the recommender's window excludes
     ONLY the held-out order while keeping same-day-earlier history visible (audit fix)."""
     lim = "" if limit is None else f"TOP ({limit})"
+    today = datetime.now(rules.BUSINESS_ZONE).date() + timedelta(days=1)
     # Pick each eligible client's last order by (Created desc, ID desc) — a single deterministic order.
     last_orders = query(
         f"""
         WITH client_orders AS (
-            SELECT ca.ClientID AS cid, o.ID AS order_id, o.Created AS dt,
-                   ROW_NUMBER() OVER (PARTITION BY ca.ClientID ORDER BY o.Created DESC, o.ID DESC) AS rn
-            FROM dbo.[Order] o
-            JOIN dbo.ClientAgreement ca ON ca.ID = o.ClientAgreementID
-            WHERE o.Created >= :history_start
-              AND EXISTS (
-                SELECT 1 FROM dbo.OrderItem oi
-                WHERE oi.OrderID = o.ID AND oi.IsValidForCurrentSale = 1
-            )
+            SELECT ca.ClientID AS cid, o.ID AS order_id, MAX({rules.SOLD_AT}) AS dt,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY ca.ClientID ORDER BY MAX({rules.SALE_INSTANT}) DESC, o.ID DESC
+                   ) AS rn
+            FROM {rules.SPINE}
+            WHERE {rules.PURCHASED}
+            GROUP BY ca.ClientID, o.ID
         ),
         counts AS (
             SELECT cid, COUNT(*) AS norders FROM client_orders GROUP BY cid
@@ -105,7 +106,7 @@ def build_cases(min_orders: int = 2, limit: int | None = None) -> list[EvalCase]
         """,
         {
             "minord": min_orders,
-            "history_start": source_history_start_iso(),
+            **rules.window(today),
         },
     )
     cases: list[EvalCase] = []
@@ -113,14 +114,13 @@ def build_cases(min_orders: int = 2, limit: int | None = None) -> list[EvalCase]
         cid = int(row["cid"])
         last_order_id = int(row["last_order_id"])
         last_dt = row["last_dt"]
-        # truth = valid product lines of THAT order (IsValidForCurrentSale=1 parity with rec population)
         truth_rows = query(
-            """
+            f"""
             SELECT DISTINCT oi.ProductID AS pid
-            FROM dbo.OrderItem oi
-            WHERE oi.OrderID = :oid AND oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
+            FROM {rules.SPINE}
+            WHERE o.ID = :oid AND {rules.PURCHASED}
             """,
-            {"oid": last_order_id},
+            {"oid": last_order_id, **rules.window(today)},
         )
         truth = {int(r["pid"]) for r in truth_rows} - _excluded()
         if not truth:

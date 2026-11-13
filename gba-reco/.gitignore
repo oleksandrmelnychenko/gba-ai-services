@@ -24,3 +24,4 @@ benchmarks/*.json
 
 # Runtime feedback journal (replayed into Redis on startup)
 data/negatives.jsonl
+.venv-*/

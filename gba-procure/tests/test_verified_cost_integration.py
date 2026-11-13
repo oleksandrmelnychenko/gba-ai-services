@@ -83,6 +83,16 @@ def test_cache_gate_keeps_carts_proven_by_current_v8_receipts(captured, version,
     assert worker.canonical_cart_payload_is_ready(raw) is ready
 
 
+def test_cache_gate_keeps_carts_priced_only_by_gba_receipts(captured):
+    plan, _ = captured
+    raw = plan.model_dump(mode="json")
+    for component in raw["cost_observation_manifest"]["components"]:
+        component["publications"] = []
+    assert any(item["cost_provenance"]["known_count"] for item in raw["items"])
+    assert worker.plan_cost_metadata_is_ready(raw)
+    assert worker.canonical_cart_payload_is_ready(raw)
+
+
 def test_queue_singleflight_bounds_failure_cooldown_and_shared_lifetime():
     queue = BoundedWarmQueue(capacity=2, cooldown_seconds=30)
     started, release = Event(), Event()
@@ -276,7 +286,7 @@ def test_worker_limit_still_reads_one_full_cart_cohort_and_reuses_for_every_plan
     monkeypatch.setattr(worker.cache, "clear_cart_not_ready", lambda *a: True)
     result = worker.run("2026-09-08", limit=1, warm_cart_key=True)
     assert reads == [[1, 2, 3, 4, 5]]
-    assert len(reused) == 3 and all(value is cohort for value in reused)
+    assert len(reused) == 2 and all(value is cohort for value in reused)
     assert result["failed"] == 0 and result["cart_items"] == 5
     assert result["cart"]["items"] == 5 and result["charts"]["top_items"] == 5
     cart = store[worker.cart_cache_key("2026-09-08")]

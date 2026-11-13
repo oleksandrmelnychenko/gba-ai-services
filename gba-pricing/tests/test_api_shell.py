@@ -276,3 +276,58 @@ def test_price_batch_rejects_shared_as_of_before_source_history_floor(monkeypatc
     )
     assert resp.status_code == 422
     assert resp.json()["detail"] == "as_of_date_before_source_history_start"
+
+
+def test_price_batch_runs_items_concurrently_and_keeps_order(monkeypatch):
+    import threading
+
+    barrier = threading.Barrier(4, timeout=5)
+    threads = set()
+    mod = types.ModuleType("app.services.pricing.service")
+
+    def recommend_price(product_id=None, **_):
+        threads.add(threading.get_ident())
+        barrier.wait()
+        if product_id == 3:
+            raise LookupError("product not found: id=3 net_uid=None")
+        return _fake_reco(product_id)
+
+    mod.recommend_price = recommend_price
+    monkeypatch.setitem(sys.modules, "app.services.pricing.service", mod)
+    client = TestClient(main.app)
+    resp = client.post(
+        "/price/batch",
+        headers=_headers(),
+        json={"items": [
+            {"product_id": pid, "client_agreement_net_uid": CA_UID} for pid in (1, 2, 3, 4)
+        ]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [r["product_id"] for r in body["results"]] == [1, 2, 4]
+    assert [e["product_id"] for e in body["errors"]] == [3]
+    assert body["count"] == 3 and body["failed"] == 1
+    assert len(threads) == 4
+
+
+def test_price_batch_single_item_stays_on_request_thread(monkeypatch):
+    import threading
+
+    seen = []
+    mod = types.ModuleType("app.services.pricing.service")
+
+    def recommend_price(product_id=None, **_):
+        seen.append(threading.current_thread().name)
+        return _fake_reco(product_id)
+
+    mod.recommend_price = recommend_price
+    monkeypatch.setitem(sys.modules, "app.services.pricing.service", mod)
+    client = TestClient(main.app)
+    resp = client.post(
+        "/price/batch",
+        headers=_headers(),
+        json={"items": [{"product_id": 7, "client_agreement_net_uid": CA_UID}]},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["count"] == 1
+    assert not seen[0].startswith("price-batch")

@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     cache_ttl: int = 3600
 
     # API — port 8003 (8000 reco, 8001 procure, 8002 nba, 8003 solvency)
-    api_host: str = "0.0.0.0"
+    api_host: str = "127.0.0.1"
     api_port: int = 8003
     log_level: str = "INFO"
 
@@ -55,6 +55,11 @@ class Settings(BaseSettings):
     source_history_start_date: date = date(2025, 1, 1)
     # A healthy service must see a current canonical sales spine, not just an open DB socket.
     max_source_lag_days: int = 31
+
+    # 1С client group whose members are classified as hopeless debtors. Their debt is not in
+    # the imported open-debt tables, so the scorecard cannot see it; the service returns a
+    # deterministic policy rating for them. Matched by ClientTypeRole.Name (IDs are re-minted).
+    hopeless_debt_role_name: str = "Безнадійна заборгованість"
 
     # FX snapshot date — GetExchangedToEuroValue revalues at call time, so a run MUST pin a
     # fixed date to stay deterministic. Empty => the engine uses the request's as_of_date.

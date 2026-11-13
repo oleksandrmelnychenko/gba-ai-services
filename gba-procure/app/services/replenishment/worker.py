@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import argparse
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 from zoneinfo import ZoneInfo
@@ -22,8 +22,9 @@ from app.data import cache, masters
 from app.data.native_purchase_costs import NativePurchaseCostError
 from app.data.purchase_cost_cohort import PurchaseCostCohort, read_purchase_cost_cohort
 from app.data.purchase_cost_metadata import stable_manifest, validate_item_metadata, validated_manifest
-from app.domain.models import MODEL_VERSION, CartReplenishmentPlan, PlanCharts
+from app.domain.models import MODEL_VERSION, CartReplenishmentPlan, PlanCharts, ProducerPurchasePlan
 from app.services.replenishment import policy
+from app.services.replenishment.inputs import PlanInputs, load_plan_inputs
 
 log = get_logger("procure_worker")
 
@@ -127,6 +128,17 @@ _CENT = Decimal("0.01")
 
 def _today() -> str:
     return datetime.now(ZoneInfo(get_settings().timezone)).strftime("%Y-%m-%d")
+
+
+LAST_GOOD_CART_TTL_S = 172800
+
+
+def utc_now_iso() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def last_good_cart_key(as_of: str) -> str:
+    return cache.make_key("cartlast", "all", as_of)
 
 
 def cart_cache_key(as_of: str, limit: int | None = CART_LIMIT) -> str:
@@ -372,6 +384,9 @@ def cache_canonical_cart_plan(
     key = cart_cache_key(as_of, cart_limit)
     payload = plan.model_dump(mode="json")
     payload["_source_fingerprint"] = source_snapshot.get("source_fingerprint")
+    payload["stale"] = False
+    payload["built_at"] = utc_now_iso()
+    payload["source_changed_at"] = None
     if not canonical_cart_payload_is_ready(
         payload,
         source_fingerprint=source_snapshot.get("source_fingerprint"),
@@ -407,7 +422,27 @@ def cache_canonical_cart_plan(
         )
         raise ProcurementBusinessReadinessError("canonical_cart_cache_readback_failed")
     cache.clear_cart_not_ready(as_of)
+    if cart_limit == CART_LIMIT:
+        cache.set(last_good_cart_key(as_of), payload, ttl=LAST_GOOD_CART_TTL_S)
     return candidate_count
+
+
+def last_good_canonical_cart(as_of: str) -> CartReplenishmentPlan | None:
+    """Latest reconciled cart of this as-of day, stamped stale; never proof of current source."""
+    for key in (cart_cache_key(as_of), last_good_cart_key(as_of)):
+        payload = cache.get(key)
+        if not canonical_cart_payload_is_ready(payload):
+            continue
+        marker_key = cache.make_key("cartstale", "all", as_of)
+        identity = [payload.get("_source_fingerprint"), payload.get("built_at")]
+        marker = cache.get(marker_key)
+        if not isinstance(marker, dict) or marker.get("cart") != identity:
+            marker = {"cart": identity, "noticed_at": utc_now_iso()}
+            cache.set(marker_key, marker, ttl=LAST_GOOD_CART_TTL_S)
+        return CartReplenishmentPlan.model_validate(payload).model_copy(
+            update={"stale": True, "source_changed_at": marker["noticed_at"]}
+        )
+    return None
 
 
 def warm_cart(
@@ -416,6 +451,8 @@ def warm_cart(
     *,
     cost_cohort: PurchaseCostCohort | None = None,
     products_by_producer: dict[int, list[int]] | None = None,
+    producer_plans: dict[int, ProducerPurchasePlan] | None = None,
+    source_snapshot: dict | None = None,
 ) -> dict:
     """Pre-compute the cart plan into the EXACT key /plan/cart reads on a cache miss.
 
@@ -425,8 +462,11 @@ def warm_cart(
     as_of = as_of or _today()
     started = time.time()
     log.info("procure_cart_warm_start", as_of=as_of, limit=cart_limit)
-    source_snapshot = require_source_readiness(as_of, force=True)
+    source_snapshot = source_snapshot or require_source_readiness(as_of, force=True)
     try:
+        inputs = None
+        if producer_plans is None:
+            products_by_producer, inputs = cart_inputs(as_of, products_by_producer=products_by_producer)
         plan = policy.build_cart_plan(
             as_of,
             only_needed=True,
@@ -434,6 +474,8 @@ def warm_cart(
             source_fingerprint=source_snapshot.get("source_fingerprint"),
             cost_cohort=cost_cohort,
             products_by_producer=products_by_producer,
+            producer_plans=producer_plans,
+            **({"inputs": inputs} if inputs is not None else {}),
         )
     except masters.MastersReadError as exc:
         _mark_canonical_cart_not_ready(
@@ -463,7 +505,9 @@ def warm_cart(
     return stats
 
 
-def warm_charts(as_of: str | None = None, top_n: int = CHARTS_TOP_N) -> dict:
+def warm_charts(
+    as_of: str | None = None, top_n: int = CHARTS_TOP_N, *, source_snapshot: dict | None = None
+) -> dict:
     """Pre-compute the cart-wide charts into the EXACT key /plan/charts reads on a cache miss.
 
     /plan/charts keys on make_key('charts', 'all:{top_n}', as_of) for producer_id=None,
@@ -472,7 +516,7 @@ def warm_charts(as_of: str | None = None, top_n: int = CHARTS_TOP_N) -> dict:
     as_of = as_of or _today()
     started = time.time()
     log.info("procure_charts_warm_start", as_of=as_of, top_n=top_n)
-    source_snapshot = require_source_readiness(as_of, force=True)
+    source_snapshot = source_snapshot or require_source_readiness(as_of, force=True)
     cart_key = cart_cache_key(as_of)
     cart_payload = cache.get(cart_key)
     if cache.get_cart_not_ready(as_of) is not None or not canonical_cart_payload_is_ready(
@@ -511,6 +555,31 @@ def warm_charts(as_of: str | None = None, top_n: int = CHARTS_TOP_N) -> dict:
     return stats
 
 
+def _products_by_producer(producer_ids: list[int], as_of: str) -> dict[int, list[int]]:
+    supplied = policy.repo.products_by_producer_all(as_of, get_settings().history_days)
+    return {pid: supplied.get(pid, []) for pid in producer_ids}
+
+
+def _load_inputs(
+    as_of: str, producer_ids: list[int], products_by_producer: dict[int, list[int]]
+) -> PlanInputs | None:
+    return load_plan_inputs(as_of, producer_ids, products_by_producer)
+
+
+def cart_inputs(
+    as_of: str,
+    active_days: int | None = None,
+    *,
+    products_by_producer: dict[int, list[int]] | None = None,
+) -> tuple[dict[int, list[int]], PlanInputs | None]:
+    producers = policy.repo.all_producers(as_of, active_days or get_settings().history_days)
+    known = dict(products_by_producer or {})
+    missing = [pid for pid in producers if pid not in known]
+    if missing:
+        known.update(_products_by_producer(missing, as_of))
+    return known, _load_inputs(as_of, producers, {pid: known[pid] for pid in producers})
+
+
 def run(
     as_of: str | None = None,
     limit: int | None = None,
@@ -528,15 +597,28 @@ def run(
     cohort_producers = set(producers)
     if warm_cart_key:
         cohort_producers.update(policy.repo.all_producers(as_of, get_settings().history_days))
-    products_by_producer = {
-        pid: policy.repo.products_for_producer(pid, as_of, get_settings().history_days)
-        for pid in sorted(cohort_producers)
-    }
+    products_by_producer = _products_by_producer(sorted(cohort_producers), as_of)
     products = sorted({product for ids in products_by_producer.values() for product in ids})
     # A worker rebuild always revalidates exact receipt payloads. Existing plan caches are not proof.
     cost_cohort = read_purchase_cost_cohort(products, as_of)
+    loaded: list[PlanInputs | None] = []
+
+    def shared_inputs() -> PlanInputs | None:
+        if not loaded:
+            loaded.append(_load_inputs(as_of, sorted(cohort_producers), products_by_producer))
+            if loaded[0] is not None:
+                log.info(
+                    "procure_inputs_loaded",
+                    products=len(products),
+                    producers=len(cohort_producers),
+                    lead_time_sources=loaded[0].lead_time_sources,
+                    on_order_products=len(loaded[0].on_order),
+                    duration_s=round(time.time() - started, 1),
+                )
+        return loaded[0]
 
     ok = failed = skipped = nonempty_producers = total_items = 0
+    plans: dict[int, ProducerPurchasePlan] = {}
     for i, pid in enumerate(producers, 1):
         key = cache.make_key("producer", pid, as_of)
         if skip_existing:
@@ -549,24 +631,35 @@ def run(
                 == stable_manifest(cost_cohort.manifest(products_by_producer[pid]).model_dump(mode="json"))
             ):
                 skipped += 1
+                try:
+                    plans[pid] = ProducerPurchasePlan.model_validate(cached)
+                except ValueError:
+                    plans.pop(pid, None)
                 cached_item_count = cached.get("item_count")
                 if isinstance(cached_item_count, int) and cached_item_count > 0:
                     nonempty_producers += 1
                     total_items += cached_item_count
                 continue
         try:
+            inputs = shared_inputs()
             plan = policy.build_plan(
-                pid, as_of, only_needed=True, cost_cohort=cost_cohort, product_ids=products_by_producer[pid]
+                pid,
+                as_of,
+                only_needed=True,
+                cost_cohort=cost_cohort,
+                product_ids=products_by_producer[pid],
+                **({"inputs": inputs} if inputs is not None else {}),
             )
             payload = plan.model_dump(mode="json")
             payload["_source_fingerprint"] = source_snapshot.get("source_fingerprint")
             if not cache.set(key, payload, ttl=691200):  # 8 days
                 raise RuntimeError("producer_plan_cache_write_failed")
             ok += 1
+            plans[pid] = plan
             if plan.item_count > 0:
                 nonempty_producers += 1
                 total_items += plan.item_count
-            log.info("producer_planned", producer_id=pid, items=plan.item_count)
+            log.debug("producer_planned", producer_id=pid, items=plan.item_count)
         except masters.MastersReadError as exc:
             _mark_canonical_cart_not_ready(
                 as_of,
@@ -578,7 +671,7 @@ def run(
         except Exception as exc:  # noqa: BLE001
             failed += 1
             log.warning("producer_failed", producer_id=pid, error=str(exc))
-        if i % 10 == 0:
+        if i % 100 == 0:
             log.info(
                 "procure_worker_progress", done=i, total=len(producers), ok=ok, failed=failed, skipped=skipped
             )
@@ -586,13 +679,19 @@ def run(
     cart = charts = None
     if warm_cart_key:
         try:
-            cart = warm_cart(as_of, cost_cohort=cost_cohort, products_by_producer=products_by_producer)
+            cart = warm_cart(
+                as_of,
+                cost_cohort=cost_cohort,
+                products_by_producer=products_by_producer,
+                producer_plans=plans,
+                source_snapshot=source_snapshot,
+            )
         except ProcurementBusinessReadinessError:
             raise
         except Exception as exc:  # noqa: BLE001
             log.warning("procure_cart_warm_failed", error=str(exc))
         try:
-            charts = warm_charts(as_of)
+            charts = warm_charts(as_of, source_snapshot=source_snapshot)
         except ProcurementBusinessReadinessError:
             raise
         except Exception as exc:  # noqa: BLE001

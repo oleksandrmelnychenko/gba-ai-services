@@ -13,7 +13,7 @@ from app.core.history import rolling_coverage
 _MODEL_SETTINGS = get_settings()
 MODEL_VERSION = (
     f"procure-hist{_MODEL_SETTINGS.history_days}-"
-    f"floor{_MODEL_SETTINGS.source_history_start_date:%Y%m%d}-v4-verified-net-cost"
+    f"floor{_MODEL_SETTINGS.source_history_start_date:%Y%m%d}-v6-placeholder-returns"
 )
 
 
@@ -148,6 +148,13 @@ class CheaperAlt(BaseModel):
     comparison_basis: Literal["historical_net_goods"] = "historical_net_goods"
 
 
+class MoqEvidence(BaseModel):
+    documents: int
+    quantities: list[float]
+    source_document_date: str
+    sales_12m_units: float
+
+
 class ReorderSuggestion(BaseModel):
     product_id: int
     product_name: str | None = None
@@ -186,11 +193,19 @@ class ReorderSuggestion(BaseModel):
     seasonal_factor: float | None = None
     raw_qty: float | None = None
     moq: float | None = None
+    moq_basis: Literal["derived_validated", "buyer"] | None = None
+    moq_evidence: MoqEvidence | None = None
     order_multiple: float | None = None
+    pack_multiple: float | None = None
     learned_factor: float | None = None
     value_density: float | None = None
     within_budget: bool | None = None
     cheaper_alt: CheaperAlt | None = None
+    cost_source: Literal["receipt_history", "buyer_supplied", "last_receipt_fallback", "none"] | None = None
+    estimated_unit_cost_eur: float | None = None
+    estimated_line_cost_eur: float | None = None
+    demand_evidence: Literal["regular", "on_request"] | None = None
+    measure_unit: str | None = None
 
 
 class ProducerPurchasePlan(HistoryContractModel):
@@ -199,6 +214,9 @@ class ProducerPurchasePlan(HistoryContractModel):
     lead_time_days: float
     lead_time_std_days: float = 0.0
     lead_time_source: str = "default"
+    lead_time_basis: Literal["measured", "default", "override"] = "default"
+    lead_time_statistic: Literal["mean", "trimmed_mean"] | None = None
+    lead_time_sample_count: int | None = None
     items: list[ReorderSuggestion]
     item_count: int
 
@@ -217,6 +235,7 @@ class CartReplenishmentPlan(HistoryContractModel):
     is_truncated: bool = False
     duplicate_supplier_options_removed: int = 0
     total_suggested_qty: float = 0.0
+    suggested_qty_by_unit: dict[str, float] = Field(default_factory=dict)
     total_cost_eur: float | None = 0.0
     priced_cost_eur: float = 0.0
     unpriced_item_count: int = 0
@@ -231,6 +250,13 @@ class CartReplenishmentPlan(HistoryContractModel):
     selected_count: int | None = None
     deferred_count: int | None = None
     method_used: str | None = None
+    estimated_total_cost_eur: float | None = None
+    certified_cost_eur: float | None = None
+    uncertified_cost_eur: float | None = None
+    unestimated_item_count: int | None = None
+    stale: bool = False
+    built_at: str | None = None
+    source_changed_at: str | None = None
 
 
 # --- dashboard chart data (derived from build_plan; no policy/forecast math change) ---
@@ -242,7 +268,9 @@ class UrgencyMixBucket(BaseModel):
 
 
 class DaysOfCoverBucket(BaseModel):
-    bucket: str = Field(description="one of '<0' | '0-7' | '8-30' | '31-90' | '90+'")
+    bucket: str = Field(
+        description="one of 'немає залишку' | '<0' | '0-7' | '8-30' | '31-90' | '90+'"
+    )
     count: int
 
 
@@ -264,6 +292,7 @@ class ChartPopulation(BaseModel):
     item_count: int
     unique_product_count: int
     total_suggested_qty: float
+    suggested_qty_by_unit: dict[str, float] = Field(default_factory=dict)
     unpriced_item_count: int
     budget_ineligible_item_count: int
     budget_eur: float | None = None

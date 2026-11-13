@@ -6,11 +6,13 @@ return the agreement identity, including on cache hits and empty results.
 
 - The agreement must be active, non-deleted, belong to the current client and
   have an active organization. Validation runs before reading cached results.
-- Order counts, segmentation, frequency, recency, the target similarity basket,
-  repurchase and owned-product exclusions use only the selected agreement's
-  history from 2025-01-01. Historical agreement generations resolve by NetUID.
+- Order counts, segmentation, frequency, recency, the target similarity basket
+  and the repurchase ranking use only the selected agreement's confirmed
+  purchases from 2025-01-01. Historical agreement generations resolve by NetUID.
 - Discovery still uses pooled evidence from other clients and global popularity.
-  It must not label purchases from the selected agreement as discovery.
+  A product the client bought under any of its agreements is never labelled as
+  new: in the personal list it is labelled as a repeat purchase, and the
+  co-purchase list leaves it out.
 - Candidate stock matches the existing Ukrainian sale bucket policy: VAT uses
   the agreement organization's own storage; non-VAT additionally permits
   Ukrainian resale storage. Defective and Polish stock are excluded. Stock is
@@ -25,7 +27,7 @@ return the agreement identity, including on cache hits and empty results.
   selections when the agreement changes. Sale/offer creation receives that same
   agreement. An invalid response cannot silently become client-wide output.
 
-Cache keys include the v39 model version, client, date, top-N, discovery/region
+Cache keys include the model version, client, date, top-N, discovery/region
 flags and canonical agreement UUID. Copurchase additionally separates explicit
 seed lists. Client feedback invalidates every agreement cache for that client;
 the existing “do not recommend to this client” action stays client-wide.
@@ -36,18 +38,20 @@ sales metadata requests (`includeMeta=true`) require an agreement.
 
 ## Daily refresh
 
-The default `DAILY_WARM_HOUR` is **5**, with `TIMEZONE=Europe/Kyiv`. This is the
-start time, not a promise that all calculations finish by 05:00. The worker warms
+The fleet refresh timer starts the worker at 05:00 Europe/Kyiv; the service no longer has
+its own scheduler. The snapshot engine finishes in about two minutes. The worker warms
 both standard recommendations and unseeded copurchase for every active agreement
 of every recently active, non-deleted client, plus the legacy client scope used
 by NBA. Agreements of clients without recent activity calculate on demand.
-Partial failures in either output schedule a retry. Startup catch-up remains.
+A partial failure fails the fleet stage, which retries it with the same token.
+Until the day's refresh has written its keys, `SERVE_LATEST_FALLBACK=true` serves the
+previous snapshot with its true `as_of_date` and `stale: true`.
 
 ## Deployment and verification
 
 Deploy the Python API/worker first, then the corresponding `gba-server` client
 and controller, then the console. Existing `.env` overrides win over defaults;
-set `DAILY_WARM_HOUR=5` in the deployed environment and restart the scheduler.
+restart `gba-reco` after changing them.
 Do not replace running server/console images from an older clean checkout when
 their active branch contains other work: apply these focused commits to the
 current deployment source and rebuild there.

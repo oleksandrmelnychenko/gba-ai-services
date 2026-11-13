@@ -9,8 +9,21 @@ without over-stocking. Consumed by gba-server (.NET).
   source window, including real zero-days but never fabricated days before 2025-01-01.
   Returns mean+std/day.
   Swap-in target later: Croston/SBA, statsforecast, or LightGBM global model.
-- **Lead time** (`services/forecasting/lead_time.py`): per-producer empirical mean+std from
-  factual invoice/order dates to factual receipt dates; configurable fallback.
+- **Lead time** (`services/forecasting/lead_time.py`): per-producer measured transit (supplier
+  document date to receipt posting) plus `lead_time_order_processing_days`, from at least
+  `lead_time_min_samples` (5) receipt intervals; fewer fall back to the currency default.
+  When the intervals scatter more than `lead_time_robust_cv` (0.5) around their mean the
+  20 % trimmed mean is used and the spread is capped at the default CV
+  (`lead_time_statistic: trimmed_mean`). Chosen by hold-out backtest on the latest 30 % of
+  receipts per producer.
+- **Minimum-order terms** (`services/replenishment/derived_terms.py`): the smallest quantity
+  on one supply document (>= 3 documents since the history start) is applied to a plan line
+  only when no check objects: other documents are multiples of it, it does not exceed 12
+  months of sales, its source document is at most 18 months old, it sits on the card's pack
+  grid and the deliveries follow that pack. Recomputed from documents on every run, never
+  stored; lines carry `moq`, `moq_basis: derived_validated`, `pack_multiple`, `moq_evidence`.
+  A buyer's stored term wins; a stored term seeded from documents (`source: derived`) is
+  unvalidated and ignored. `DERIVED_MOQ_ENABLED=false` switches the derivation off.
 - **Replenishment policy** (`services/replenishment/policy.py`):
   - `reorder_point = mean_daily·LT + z(service_level)·√LT·std_daily`
   - `order_up_to   = reorder_point + horizon·mean_daily`

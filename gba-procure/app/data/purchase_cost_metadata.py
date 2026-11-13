@@ -162,8 +162,6 @@ def validated_provenance(
     _require(
         len(proof.current_unit_ids) <= counts[1] and len(proof.supplier_client_agreement_ids) <= counts[1]
     )
-    if counts[1]:
-        _require(bool(components[0].publications))
     aggregation = (
         "mixed_current_units"
         if len(proof.current_unit_ids) > 1

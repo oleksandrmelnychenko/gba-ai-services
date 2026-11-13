@@ -203,6 +203,130 @@ def test_lead_time_geo_fallback_by_currency(monkeypatch):
     assert lt.producer_lead_time(1, "2026-06-15")[2] == "default"
 
 
+def test_empirical_lead_time_adds_the_order_processing_leg(monkeypatch):
+    from app.services.forecasting import lead_time as lt
+
+    samples = [10.0, 12.0, 14.0, 16.0, 18.0]
+    monkeypatch.setattr(lt.repo, "producer_lead_times", lambda pid, asof, lo, hi: samples)
+    mean, std, src = lt.producer_lead_time(1, "2026-06-15")
+    allowance = lt.get_settings().lead_time_order_processing_days
+    assert src == "empirical"
+    assert mean == 14.0 + allowance
+    assert std == max(8.0**0.5, mean * 0.1)
+
+
+def test_fewer_than_five_receipt_intervals_keep_the_currency_default():
+    from app.services.forecasting import lead_time as lt
+
+    assert lt.get_settings().lead_time_min_samples == 5
+    assert lt.lead_time_from([10.0, 10.0, 10.0, 10.0], 2) == (18.0, 9.0, "geo")
+    assert lt.lead_time_from([10.0, 10.0, 10.0, 10.0], None)[2] == "default"
+    assert lt.lead_time_from([10.0] * 5, 2)[2] == "empirical"
+
+
+def test_noisy_measurement_uses_the_trimmed_mean_and_a_capped_spread():
+    from app.services.forecasting import lead_time as lt
+
+    samples = [6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 14.0, 120.0]
+    plain = sum(samples) / len(samples)
+    mean, std, src = lt.lead_time_from(samples, 3)
+    allowance = lt.get_settings().lead_time_order_processing_days
+    assert src == "empirical_trimmed"
+    assert mean == pytest.approx(sum(samples[1:-1]) / 6 + allowance)
+    assert mean < plain
+    assert std == pytest.approx(mean * lt.get_settings().lead_time_cv)
+    assert lt.basis_of(src) == "measured"
+    assert lt.payload_source(src) == "empirical"
+    assert lt.statistic_of(src) == "trimmed_mean"
+
+
+def test_noisy_spread_cap_can_be_switched_off(monkeypatch):
+    from app.services.forecasting import lead_time as lt
+
+    samples = [6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 14.0, 120.0]
+    settings = lt.get_settings().model_copy(update={"lead_time_cap_noisy_spread": False})
+    monkeypatch.setattr(lt, "get_settings", lambda: settings)
+    mean, std, src = lt.lead_time_from(samples, 3)
+    plain = sum(samples) / len(samples)
+    assert src == "empirical_trimmed"
+    assert std == pytest.approx((sum((x - plain) ** 2 for x in samples) / len(samples)) ** 0.5)
+    assert std > mean * settings.lead_time_cv
+
+
+def test_steady_measurement_keeps_the_plain_mean():
+    from app.services.forecasting import lead_time as lt
+
+    samples = [10.0, 11.0, 12.0, 13.0, 14.0, 30.0]
+    mean, std, src = lt.lead_time_from(samples, 3)
+    assert src == "empirical"
+    assert mean == pytest.approx(15.0 + lt.get_settings().lead_time_order_processing_days)
+    assert lt.statistic_of(src) == "mean"
+    assert lt.statistic_of("geo") is None
+
+
+def test_trimmed_mean_drops_a_fifth_from_each_end():
+    from app.services.forecasting import lead_time as lt
+
+    assert lt.trimmed_mean([1.0, 2.0, 3.0, 4.0, 100.0], 0.2) == 3.0
+    assert lt.trimmed_mean([5.0, 7.0], 0.2) == 6.0
+
+
+def test_lead_time_evidence_reports_sample_count_and_basis(monkeypatch):
+    from app.services.forecasting import lead_time as lt
+
+    monkeypatch.setattr(
+        lt.repo, "producer_lead_times", lambda pid, asof, lo, hi: [10.0, 12.0, 14.0, 16.0, 18.0]
+    )
+    assert lt.producer_lead_time_evidence(1, "2026-06-15")[2:] == ("empirical", 5)
+    monkeypatch.setattr(lt.repo, "producer_lead_times", lambda pid, asof, lo, hi: [10.0, 14.0, 18.0])
+    monkeypatch.setattr(lt.repo, "producer_agreement_currency", lambda pid, asof: 2)
+    assert lt.producer_lead_time_evidence(1, "2026-06-15") == (18.0, 9.0, "geo", 3)
+    assert lt.basis_of("empirical") == "measured"
+    assert lt.basis_of("geo") == "default"
+    assert lt.basis_of("default") == "default"
+    assert lt.basis_of("override") == "override"
+
+
+@pytest.mark.parametrize(
+    ("evidence", "basis"),
+    [
+        ((21.0, 4.0, "empirical", 5), "measured"),
+        ((21.0, 4.0, "empirical_trimmed", 9), "measured"),
+        ((18.0, 9.0, "geo", 2), "default"),
+    ],
+)
+def test_plan_payload_labels_the_lead_time_basis(monkeypatch, evidence, basis):
+    from app.core.config import get_settings
+
+    settings = get_settings().model_copy(update={"use_masters": False, "use_feedback": False})
+    monkeypatch.setattr(policy, "get_settings", lambda: settings)
+    monkeypatch.setattr(policy.lead_time_svc, "producer_lead_time_evidence", lambda *a: evidence)
+    monkeypatch.setattr(policy.repo, "on_hand", lambda *a: {1: 20.0})
+    monkeypatch.setattr(policy.repo, "reserved", lambda *a: {})
+    monkeypatch.setattr(policy.repo, "on_order", lambda *a: {})
+    monkeypatch.setattr(policy.repo, "product_daily_demand_bulk", lambda *a: {})
+    monkeypatch.setattr(policy.cost_repo, "producer_unit_costs_eur", lambda *a, **k: {})
+    monkeypatch.setattr(policy.cost_repo, "sale_prices_eur", lambda *a: {})
+    monkeypatch.setattr(policy.cost_repo, "cheapest_alt_eur", lambda *a, **k: {})
+    monkeypatch.setattr(policy.repo, "product_meta", lambda *a: {})
+    plan = policy.build_plan(
+        99,
+        "2026-09-07",
+        only_needed=False,
+        abc_map={1: "C"},
+        producer_name="Test",
+        cost_cohort=make_cohort([1], as_of="2026-09-07", costs={(99, 1): [None]}),
+        product_ids=[1],
+    ).model_dump(mode="json")
+    assert plan["lead_time_days"] == evidence[0]
+    assert plan["lead_time_source"] == ("geo" if basis == "default" else "empirical")
+    assert plan["lead_time_statistic"] == {
+        "empirical": "mean", "empirical_trimmed": "trimmed_mean", "geo": None
+    }[evidence[2]]
+    assert plan["lead_time_basis"] == basis
+    assert plan["lead_time_sample_count"] == evidence[3]
+
+
 def test_seasonal_index_shrinks_and_bounds():
     from app.services.forecasting import demand as d
 
@@ -240,7 +364,7 @@ def test_reservations_and_incoming_supply_affect_actual_plan(
         }
     )
     monkeypatch.setattr(policy, "get_settings", lambda: settings)
-    monkeypatch.setattr(policy.lead_time_svc, "producer_lead_time", lambda *a: (10.0, 0.0, "test"))
+    monkeypatch.setattr(policy.lead_time_svc, "producer_lead_time_evidence", lambda *a: (10.0, 0.0, "test", 0))
     monkeypatch.setattr(policy.repo, "products_for_producer", lambda *a: [1])
     monkeypatch.setattr(policy.repo, "on_hand", lambda *a: {1: 20.0})
     monkeypatch.setattr(policy.repo, "reserved", lambda *a: {1: float(reserved)})

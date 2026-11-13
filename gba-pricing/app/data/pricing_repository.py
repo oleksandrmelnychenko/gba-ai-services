@@ -2,8 +2,10 @@
 
 All SQL is parameterized (:name) — no f-string interpolation. Every query honors the
 discovery data traps (/tmp/pricing-discovery.json):
-  (a) NEVER filter Deleted=0 on Sale/Order/OrderItem (=1 on 100% of rows). Validity comes from
-      OrderItem.IsValidForCurrentSale=1.
+  (a) A realised price is a line of gba-server's confirmed sale (the native sales reports'
+      fact): a non-deleted, invoiced Sale that is not an accounting carrier, with a non-deleted
+      valid line of positive quantity that the buyer has not returned in full, dated by its
+      invoice instant (Sale.ChangedToInvoice, UTC) over whole Europe/Kyiv days.
   (b) Synthetic 1С debt-entry line («Ввід боргів», ID resolved live by synthetic_product_id —
       the row gets re-minted) is EXCLUDED everywhere (cost lots, peer band, discount
       distribution) — it contaminates cost and realized price.
@@ -18,9 +20,9 @@ discovery data traps (/tmp/pricing-discovery.json):
   (g) UoM piece-vs-box outliers -> peer percentiles reject lines by a per-product median/MAD
       modified-z filter (k=3.5), which adapts to the contaminated fraction (a fixed decile trim
       leaked when >10% of lines were the wrong UoM).
-  (h) Every behavioral Sale.Created window is additionally clamped to
-      SOURCE_HISTORY_START_DATE. Live engine prices, active price-book/discount rows, identity
-      lookups and on-hand costs are current-state snapshots and intentionally remain unclamped.
+  (h) Every behavioral sales window is additionally clamped to SOURCE_HISTORY_START_DATE.
+      Live engine prices, active price-book/discount rows, identity lookups and on-hand costs
+      are current-state snapshots and intentionally remain unclamped.
 
 The baseline price is computed by the live engine itself
 (dbo.GetCalculatedProductPriceWithSharesAndVat), never re-derived here.
@@ -29,9 +31,11 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from datetime import time as day_time
 from decimal import Decimal
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from app.core.config import get_settings
 from app.core.history import (
@@ -40,17 +44,76 @@ from app.core.history import (
     trailing_month_history_window,
 )
 from app.core.logging import get_logger
+from app.core.refresh import refresh_generation
 from app.data.db import query
 from app.domain.money import optional_decimal
 
 log = get_logger("pricing_repository")
 
 _SYNTHETIC_REFRESH_S = 3600.0
+_NO_SYNTHETIC_PRODUCT_ID = 0
 _synthetic_id: int | None = None
 _synthetic_expires_at = 0.0
 _READINESS_TTL_S = 60.0
 _readiness_lock = threading.Lock()
 _readiness_state: dict[tuple[int, str, int, str], tuple[float, dict[str, Any]]] = {}
+_segment_lock = threading.Lock()
+_segment_cache: dict[tuple[int, int, str, str], dict[str, Any]] = {}
+
+
+BUSINESS_ZONE = ZoneInfo("Europe/Kyiv")
+SALE_INSTANT = "s.ChangedToInvoice"
+CONFIRMED_SALE = (
+    "s.Deleted = 0 AND s.ChangedToInvoice IS NOT NULL "
+    "AND NOT EXISTS (SELECT 1 FROM dbo.DataSyncAccountingSourceTarget carrier "
+    "WHERE carrier.TargetEntityType = N'Sale' AND carrier.TargetEntityID = s.ID "
+    "AND carrier.IsCurrent = 1 AND carrier.OwnershipType = 1)"
+)
+KEPT_LINE = (
+    "oi.Deleted = 0 AND oi.IsValidForCurrentSale = 1 AND oi.Qty > 0 "
+    "AND CAST(oi.Qty AS decimal(38, 6)) > ISNULL(("
+    "SELECT SUM(CAST(sri.Qty AS decimal(38, 6))) "
+    "FROM dbo.SaleReturnItem sri "
+    "JOIN dbo.SaleReturn sr ON sr.ID = sri.SaleReturnID "
+    "WHERE sri.OrderItemID = oi.ID AND sri.Deleted = 0 AND sri.Qty > 0 "
+    "AND sr.Deleted = 0 AND sr.IsCanceled = 0), 0)"
+)
+SALE_WINDOW = f"{SALE_INSTANT} >= :window_from AND {SALE_INSTANT} < :window_to"
+CONFIRMED_SALE_2 = CONFIRMED_SALE.replace("s.", "s2.").replace("carrier", "carrier2")
+KEPT_LINE_2 = (
+    KEPT_LINE.replace("oi.", "oi2.")
+    .replace("sri", "sri2")
+    .replace("sr.", "sr2.")
+    .replace(" sr ", " sr2 ")
+)
+SALE_WINDOW_2 = SALE_WINDOW.replace("s.", "s2.")
+
+
+AGREEMENT_WORLD = """            SELECT CASE
+                WHEN DATALENGTH(a.SourceAmgID) = 16 AND ISNULL(a.SourceAmgCode, 0) > 0
+                     AND ISNULL(DATALENGTH(a.SourceFenixID), 0) = 0 AND ISNULL(a.SourceFenixCode, 0) = 0
+                    THEN CONVERT(bit, 1)
+                WHEN DATALENGTH(a.SourceFenixID) = 16 AND ISNULL(a.SourceFenixCode, 0) > 0
+                     AND ISNULL(DATALENGTH(a.SourceAmgID), 0) = 0 AND ISNULL(a.SourceAmgCode, 0) = 0
+                    THEN CONVERT(bit, 0)
+                ELSE org.PriceSourceIsAmg
+            END AS for_amg
+            FROM dbo.Organization org
+            WHERE org.ID = a.OrganizationID AND org.Deleted = 0"""
+ENGINE_PRODUCT_GROUP = """            SELECT TOP 1 assignment.ProductGroupID
+            FROM dbo.ProductProductGroup assignment
+            LEFT JOIN dbo.ProductProductGroupSyncOwner owner
+                  ON owner.ImportedForAmg = ISNULL(world.for_amg, 0)
+                 AND owner.ProductID = assignment.ProductID
+                 AND owner.ProductProductGroupID = assignment.ID
+            WHERE assignment.ProductID = :pid AND assignment.Deleted = 0
+            ORDER BY CASE WHEN owner.ProductProductGroupID IS NULL THEN 1 ELSE 0 END,
+                     assignment.ID"""
+
+
+def utc_instant(local_day: date) -> datetime:
+    local_midnight = datetime.combine(local_day, day_time.min, tzinfo=BUSINESS_ZONE)
+    return local_midnight.astimezone(UTC).replace(tzinfo=None)
 
 
 def behavioral_history_window(as_of_date: str, window_months: int) -> HistoryWindow:
@@ -66,16 +129,16 @@ def _behavioral_history_params(as_of_date: str, window_months: int) -> dict[str,
     """Parameters shared by every historical Sale.Created predicate."""
     window = behavioral_history_window(as_of_date, window_months)
     return {
-        "asof": window.as_of.isoformat(),
-        "neg_months": -window_months,
-        "source_history_start": window.source_history_start.isoformat(),
+        "window_from": utc_instant(window.effective_start),
+        "window_to": utc_instant(window.as_of),
     }
 
 
 def synthetic_product_id() -> int:
     """The 1С debt-entry product («Ввід боргів») is periodically re-minted with a NEW ID (the old
-    hardcoded 25422404 is dead), so the exclusion ID is resolved live and cached for an hour;
-    SYNTHETIC_LINE_PRODUCT_ID is only the fallback when the lookup fails and nothing is cached.
+    hardcoded 25422404 and 29555414 are dead), so the exclusion ID is resolved live and cached for
+    an hour; when the lookup fails and nothing is cached no configured ID is trusted and 0 (no
+    product) is returned, leaving the name-based guards as the only exclusion.
     """
     global _synthetic_id, _synthetic_expires_at
     now = time.monotonic()
@@ -98,7 +161,7 @@ def synthetic_product_id() -> int:
         log.warning("synthetic_product_resolve_failed", error=str(exc))
     if _synthetic_id is not None:
         return _synthetic_id
-    return get_settings().synthetic_line_product_id
+    return _NO_SYNTHETIC_PRODUCT_ID
 
 
 def source_readiness(max_lag_days: int) -> dict[str, Any]:
@@ -366,7 +429,7 @@ def client_world_fallback_baseline(
     """
     history_params = _behavioral_history_params(as_of_date, window_months)
     rows = query(
-        """
+        f"""
         WITH req AS (
             SELECT org.PriceSourceIsAmg AS world, ca.ClientID AS client_id
             FROM dbo.ClientAgreement ca
@@ -389,13 +452,12 @@ def client_world_fallback_baseline(
                   ON org2.ID = a2.OrganizationID
                  AND org2.Deleted = 0
             WHERE oi.ProductID = :pid
-                  AND oi.IsValidForCurrentSale = 1
+                  AND {CONFIRMED_SALE}
+                  AND {KEPT_LINE}
                   AND oi.ProductID <> :synthetic
                   AND oi.PricePerItem > 0
                   AND org2.PriceSourceIsAmg = req.world
-                  AND s.Created <= :asof
-                  AND s.Created >= DATEADD(month, :neg_months, :asof)
-                  AND s.Created >= :source_history_start
+                  AND {SALE_WINDOW}
         )
         SELECT DISTINCT
             CAST(
@@ -426,9 +488,14 @@ def base_list_price_and_markup(product_id: int, agreement_id: int) -> dict[str, 
     Mirrors dbo.GetCalculatedProductPriceWithSharesAndVat exactly:
       P          = ProductPricing.Price WHERE ProductID=@p AND PricingID = dbo.GetBasePricingId(
                    Agreement.PricingID) AND Deleted=0 (trap f) — read at the ROOT base tier.
-      ExtraCharge= the engine's @ExtraCharge: Pricing.CalculatedExtraCharge of the AGREEMENT tier
-                   (Pricing.ID = Agreement.PricingID), overridden by PricingProductGroupDiscount.
-                   CalculatedExtraCharge for that (tier × product-group) when present (Deleted=0).
+      ExtraCharge= the engine's @ExtraCharge: the effective markup of the AGREEMENT tier
+                   (Pricing.ID = Agreement.PricingID) in the agreement's price world (the
+                   agreement's own 1C ownership, else Organization.PriceSourceIsAmg, as
+                   dbo.GetPricingSourceForAgreementId) — PricingSourceDefinition.
+                   CalculatedExtraCharge, which GBA markup edits keep current; the frozen
+                   Pricing.CalculatedExtraCharge only for a tier without source definitions —
+                   overridden by PricingProductGroupDiscount.CalculatedExtraCharge for that
+                   (tier × product-group) when present (Deleted=0).
     The base tier (root) carries 0% markup, so reading ExtraCharge from the base tier dropped the
     agreement's actual margin (e.g. tier 852/847 = +30%). Together they give
     marked_up = ROUND(P + P*ExtraCharge/100, 14) — the denominator the suggested DiscountRate is
@@ -439,11 +506,16 @@ def base_list_price_and_markup(product_id: int, agreement_id: int) -> dict[str, 
     which is keyed on the base-tier family via GetBasePricingId).
     """
     rows = query(
-        """
+        f"""
         SELECT TOP 1
             pp.Price AS base_price,
             CASE WHEN ppgd.CalculatedExtraCharge IS NOT NULL
                  THEN ppgd.CalculatedExtraCharge
+                 WHEN world_def.CalculatedExtraCharge IS NOT NULL
+                 THEN world_def.CalculatedExtraCharge
+                 WHEN EXISTS (SELECT 1 FROM dbo.PricingSourceDefinition any_def
+                              WHERE any_def.PricingID = agr_pr.ID)
+                 THEN NULL
                  ELSE agr_pr.CalculatedExtraCharge
             END AS extra_charge,
             base_pr.ID AS base_pricing_id,
@@ -457,10 +529,15 @@ def base_list_price_and_markup(product_id: int, agreement_id: int) -> dict[str, 
         JOIN dbo.Pricing base_pr ON base_pr.ID = bp.base_pricing_id
         JOIN dbo.Pricing agr_pr ON agr_pr.ID = a.PricingID
         OUTER APPLY (
-            SELECT TOP 1 ppg.ProductGroupID
-            FROM dbo.ProductProductGroup ppg
-            WHERE ppg.ProductID = :pid AND ppg.Deleted = 0
-            ORDER BY ppg.ID
+{AGREEMENT_WORLD}
+        ) world
+        OUTER APPLY (
+            SELECT TOP 1 psd.CalculatedExtraCharge
+            FROM dbo.PricingSourceDefinition psd
+            WHERE psd.PricingID = agr_pr.ID AND psd.ImportedForAmg = world.for_amg
+        ) world_def
+        OUTER APPLY (
+{ENGINE_PRODUCT_GROUP}
         ) pg
         LEFT JOIN dbo.PricingProductGroupDiscount ppgd
               ON ppgd.PricingID = agr_pr.ID
@@ -502,18 +579,28 @@ def is_promotional(product_id: int, agreement_id: int) -> bool:
     return bool(rows)
 
 
-def product_group_id(product_id: int) -> int | None:
-    """Resolve a product to its ProductGroup (TOP 1, Deleted=0) — needed for the active group
-    discount lookup and the segment discount distribution.
+def product_group_id(product_id: int, agreement_id: int | None = None) -> int | None:
+    """The product group the live engine prices this product in for the agreement's price world.
+
+    A product can sit in one group per 1C source; dbo.GetCalculatedProductPriceWithSharesAndVat
+    reads dbo.GetProductGroupForSource(product, world) (mirrored inline: the read-only login
+    cannot execute it), which prefers the assignment owned by the
+    agreement's world (dbo.GetPricingSourceForAgreementId) and only then the oldest one. The
+    group discount, the tier markup override and the segment cap must all use that same group.
     """
     rows = query(
-        """
-        SELECT TOP 1 ProductGroupID
-        FROM dbo.ProductProductGroup
-        WHERE ProductID = :pid AND Deleted = 0
-        ORDER BY ID
+        f"""
+        SELECT pg.ProductGroupID
+        FROM (SELECT CAST(:aid AS bigint) AS agreement_id) req
+        LEFT JOIN dbo.Agreement a ON a.ID = req.agreement_id AND a.Deleted = 0
+        OUTER APPLY (
+{AGREEMENT_WORLD}
+        ) world
+        CROSS APPLY (
+{ENGINE_PRODUCT_GROUP}
+        ) pg
         """,
-        {"pid": product_id},
+        {"pid": product_id, "aid": agreement_id},
     )
     return int(rows[0]["ProductGroupID"]) if rows and rows[0]["ProductGroupID"] is not None else None
 
@@ -681,22 +768,22 @@ def peer_band(product_id: int, as_of_date: str, window_months: int,
     _ = fx_date
     history_params = _behavioral_history_params(as_of_date, window_months)
     rows = query(
-        """
-        WITH priced AS (
-            SELECT
-                o.ClientAgreementID AS ca_id,
-                oi.PricePerItem AS eur_price
-            FROM dbo.OrderItem oi
-            JOIN dbo.[Order] o ON o.ID = oi.OrderID
-            JOIN dbo.Sale s ON s.OrderID = o.ID
-            WHERE oi.ProductID = :pid
-                  AND oi.IsValidForCurrentSale = 1
-                  AND oi.ProductID <> :synthetic
-                  AND oi.PricePerItem > 0
-                  AND s.Created <= :asof
-                  AND s.Created >= DATEADD(month, :neg_months, :asof)
-                  AND s.Created >= :source_history_start
-        ),
+        f"""
+        SET NOCOUNT ON;
+        DROP TABLE IF EXISTS #priced;
+        SELECT o.ClientAgreementID AS ca_id,
+               oi.PricePerItem AS eur_price
+        INTO #priced
+        FROM dbo.OrderItem oi
+        JOIN dbo.[Order] o ON o.ID = oi.OrderID
+        JOIN dbo.Sale s ON s.OrderID = o.ID
+        WHERE oi.ProductID = :pid
+              AND {CONFIRMED_SALE}
+                  AND {KEPT_LINE}
+              AND oi.ProductID <> :synthetic
+              AND oi.PricePerItem > 0
+              AND {SALE_WINDOW};
+        WITH priced AS (SELECT ca_id, eur_price FROM #priced),
         stats AS (
             SELECT
                 PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY eur_price) OVER () AS med,
@@ -773,18 +860,32 @@ def segment_discount_distribution(product_group_id_value: int, base_pricing_id: 
     discount being capped. See tests/test_source_guards.py (active_group_discount must not filter
     Deleted) — this cap obeys the same invariant.
     """
+    cache_key = (
+        int(product_group_id_value),
+        int(base_pricing_id),
+        str(culture),
+        refresh_generation(),
+    )
+    with _segment_lock:
+        cached = _segment_cache.get(cache_key)
+    if cached is not None:
+        return dict(cached)
     rows = query(
         """
-        WITH seg AS (
+        WITH fam AS (
+            SELECT p.ID
+            FROM dbo.Pricing p
+            WHERE dbo.GetBasePricingId(p.ID) = :base_pricing_id
+        ),
+        seg AS (
             SELECT pgd.DiscountRate AS discount_rate
             FROM dbo.ProductGroupDiscount pgd
             JOIN dbo.ClientAgreement ca ON ca.ID = pgd.ClientAgreementID
             JOIN dbo.Agreement a ON a.ID = ca.AgreementID
-            JOIN dbo.Pricing pr ON pr.ID = dbo.GetBasePricingId(a.PricingID)
+            JOIN fam ON fam.ID = a.PricingID
+            JOIN dbo.Pricing pr ON pr.ID = :base_pricing_id AND pr.Culture = :culture
             WHERE pgd.ProductGroupID = :pgid
                   AND pgd.IsActive = 1
-                  AND pr.ID = :base_pricing_id
-                  AND pr.Culture = :culture
         )
         SELECT DISTINCT
             PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY discount_rate) OVER () AS p75,
@@ -799,13 +900,24 @@ def segment_discount_distribution(product_group_id_value: int, base_pricing_id: 
         },
     )
     if not rows:
-        return {"p75": None, "p90": None, "n": 0}
-    r = rows[0]
-    return {
-        "p75": float(r["p75"]) if r["p75"] is not None else None,
-        "p90": float(r["p90"]) if r["p90"] is not None else None,
-        "n": int(r["n"] or 0),
-    }
+        result: dict[str, Any] = {"p75": None, "p90": None, "n": 0}
+    else:
+        r = rows[0]
+        result = {
+            "p75": float(r["p75"]) if r["p75"] is not None else None,
+            "p90": float(r["p90"]) if r["p90"] is not None else None,
+            "n": int(r["n"] or 0),
+        }
+    with _segment_lock:
+        for stale in [k for k in _segment_cache if k[3] != cache_key[3]]:
+            del _segment_cache[stale]
+        _segment_cache[cache_key] = dict(result)
+    return result
+
+
+def reset_segment_cache() -> None:
+    with _segment_lock:
+        _segment_cache.clear()
 
 
 def product_line_count(product_id: int, as_of_date: str, window_months: int) -> int:
@@ -814,19 +926,17 @@ def product_line_count(product_id: int, as_of_date: str, window_months: int) -> 
     Same valid-row + synthetic-exclude filters as the panel."""
     history_params = _behavioral_history_params(as_of_date, window_months)
     rows = query(
-        """
+        f"""
         SELECT COUNT(*) AS n
         FROM dbo.OrderItem oi
         JOIN dbo.[Order] o ON o.ID = oi.OrderID
         JOIN dbo.Sale s ON s.OrderID = o.ID
         WHERE oi.ProductID = :pid
-              AND oi.IsValidForCurrentSale = 1
+              AND {CONFIRMED_SALE}
+                  AND {KEPT_LINE}
               AND oi.ProductID <> :synthetic
               AND oi.PricePerItem > 0
-              AND oi.Qty > 0
-              AND s.Created <= :asof
-              AND s.Created >= DATEADD(month, :neg_months, :asof)
-              AND s.Created >= :source_history_start
+              AND {SALE_WINDOW}
         """,
         {
             "pid": product_id,
@@ -852,7 +962,7 @@ def product_panel(product_id: int, as_of_date: str, window_months: int) -> list[
     """
     history_params = _behavioral_history_params(as_of_date, window_months)
     return query(
-        """
+        f"""
         SELECT
             o.ClientAgreementID AS agreement_id,
             FORMAT(s.Created, 'yyyy-MM') AS month,
@@ -862,13 +972,11 @@ def product_panel(product_id: int, as_of_date: str, window_months: int) -> list[
         JOIN dbo.[Order] o ON o.ID = oi.OrderID
         JOIN dbo.Sale s ON s.OrderID = o.ID
         WHERE oi.ProductID = :pid
-              AND oi.IsValidForCurrentSale = 1
+              AND {CONFIRMED_SALE}
+                  AND {KEPT_LINE}
               AND oi.ProductID <> :synthetic
               AND oi.PricePerItem > 0
-              AND oi.Qty > 0
-              AND s.Created <= :asof
-              AND s.Created >= DATEADD(month, :neg_months, :asof)
-              AND s.Created >= :source_history_start
+              AND {SALE_WINDOW}
         GROUP BY o.ClientAgreementID, FORMAT(s.Created, 'yyyy-MM')
         """,
         {
@@ -890,7 +998,7 @@ def group_panel(product_group_id_value: int, as_of_date: str, window_months: int
     """
     history_params = _behavioral_history_params(as_of_date, window_months)
     return query(
-        """
+        f"""
         WITH grp AS (
             SELECT ProductID
             FROM dbo.ProductProductGroup
@@ -902,13 +1010,11 @@ def group_panel(product_group_id_value: int, as_of_date: str, window_months: int
             JOIN grp ON grp.ProductID = oi2.ProductID
             JOIN dbo.[Order] o2 ON o2.ID = oi2.OrderID
             JOIN dbo.Sale s2 ON s2.OrderID = o2.ID
-            WHERE oi2.IsValidForCurrentSale = 1
+            WHERE {CONFIRMED_SALE_2}
+                  AND {KEPT_LINE_2}
                   AND oi2.ProductID <> :synthetic
                   AND oi2.PricePerItem > 0
-                  AND oi2.Qty > 0
-                  AND s2.Created <= :asof
-                  AND s2.Created >= DATEADD(month, :neg_months, :asof)
-                  AND s2.Created >= :source_history_start
+                  AND {SALE_WINDOW_2}
             GROUP BY oi2.ProductID
             ORDER BY COUNT(*) DESC
         )
@@ -922,13 +1028,11 @@ def group_panel(product_group_id_value: int, as_of_date: str, window_months: int
         JOIN ranked ON ranked.pid = oi.ProductID
         JOIN dbo.[Order] o ON o.ID = oi.OrderID
         JOIN dbo.Sale s ON s.OrderID = o.ID
-        WHERE oi.IsValidForCurrentSale = 1
+        WHERE {CONFIRMED_SALE}
+                  AND {KEPT_LINE}
               AND oi.ProductID <> :synthetic
               AND oi.PricePerItem > 0
-              AND oi.Qty > 0
-              AND s.Created <= :asof
-              AND s.Created >= DATEADD(month, :neg_months, :asof)
-              AND s.Created >= :source_history_start
+              AND {SALE_WINDOW}
         GROUP BY oi.ProductID, o.ClientAgreementID, FORMAT(s.Created, 'yyyy-MM')
         """,
         {

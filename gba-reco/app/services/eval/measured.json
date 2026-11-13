@@ -1,0 +1,23 @@
+{
+  "model_version": "v42-confirmed-sales-history-floor-20250101",
+  "evaluated_on": "2026-11-13",
+  "protocol": "temporal holdout, 6 origins 2026-05-13..2026-10-13, 30-day truth window, served list of 25",
+  "cases": 2499,
+  "precision": {
+    "personal": {
+      "10": 0.0953,
+      "25": 0.0633
+    },
+    "copurchase": {
+      "10": 0.0171,
+      "25": 0.0134
+    }
+  },
+  "hit_rate": {
+    "10": 0.4451,
+    "25": 0.5493
+  },
+  "revenue_hit": {
+    "25": 0.1156
+  }
+}

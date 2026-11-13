@@ -89,10 +89,14 @@ def plan_input(monkeypatch):
     monkeypatch.setattr(policy.repo, "on_hand", lambda *args: {})
     monkeypatch.setattr(policy.repo, "reserved", lambda *args: {})
     monkeypatch.setattr(policy.repo, "on_order", lambda *args: {})
-    monkeypatch.setattr(policy.repo, "product_daily_demand_bulk", lambda *args: {})
+    monkeypatch.setattr(
+        policy.repo,
+        "product_daily_demand_bulk",
+        lambda *args: {pid: [{"d": "2026-09-01", "units": 5}] for pid in products},
+    )
     monkeypatch.setattr(policy.repo, "product_meta", lambda *args: {})
-    monkeypatch.setattr(policy.lead_time_svc, "producer_lead_time", lambda *args: (10, 0, "fixture"))
-    monkeypatch.setattr(policy.classify_svc, "get_abc_map", lambda *args: {})
+    monkeypatch.setattr(policy.lead_time_svc, "producer_lead_time_evidence", lambda *args: (10, 0, "fixture", 0))
+    monkeypatch.setattr(policy.classify_svc, "get_abc_map", lambda *args: dict.fromkeys(products, "A"))
     monkeypatch.setattr(policy.masters, "producer_profile", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         policy.masters, "product_terms_for", lambda *args, **kwargs: {4: {"unit_cost_override": 1}}

@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     cache_ttl: int = 90000
 
     # API — port 8004 (8000 reco, 8001 procure, 8002 nba, 8003 solvency, 8004 pricing)
-    api_host: str = "0.0.0.0"
+    api_host: str = "127.0.0.1"
     api_port: int = 8004
     log_level: str = "INFO"
     # Shared secret the trusted gba-server proxy must present (X-Internal-Api-Key).
@@ -48,7 +48,9 @@ class Settings(BaseSettings):
     # Competitor price scanner (Claude web-search agent, POST /competitors/search).
     # Empty api key = feature disabled: the endpoint answers 503 competitor_scanner_not_configured.
     anthropic_api_key: str = ""
-    anthropic_model: str = "claude-sonnet-5"
+    anthropic_model: str = "claude-sonnet-5-5"
+    competitor_effort: str = "medium"
+    competitor_max_tokens: int = 16000
     competitor_max_offers: int = 12
     competitor_web_search_max_uses: int = 10
     competitor_web_fetch_max_uses: int = 12
@@ -64,7 +66,8 @@ class Settings(BaseSettings):
     # not merely that MSSQL accepts connections. 31 days tolerates quiet holiday periods while
     # still failing closed on a stopped 1C/sales synchronization.
     max_source_lag_days: int = 31
-    # Margin floor: recommended price never below unit_cost_eur*(1+target_margin_pct/100).
+    # Price floor: recommended price never below unit_cost_eur*(1+target_margin_pct/100); a
+    # markup on cost (12 % on cost = 10.71 % margin of price).
     target_margin_pct: float = 12.0
     # The restored factual sales source starts here. Behavioral queries must never infer data
     # before this boundary; current engine prices, current discounts and on-hand stock remain
@@ -76,12 +79,6 @@ class Settings(BaseSettings):
     # FX snapshot date — GetExchangedToEuroValue revalues at call time, so a run MUST pin a
     # fixed date to stay deterministic. Empty => the engine uses the request's as_of_date.
     fx_snapshot_date: str = ""
-
-    # Synthetic 1С debt-entry line ('Ввід боргів з 1С'): contaminates cost lots and realized
-    # price; EXCLUDED everywhere (cost, peer band, discount distribution). The live ID is
-    # resolved dynamically (pricing_repository.synthetic_product_id, 1h cache — the row gets
-    # re-minted); this value is only the fallback when that lookup fails.
-    synthetic_line_product_id: int = 29555414
 
     # 1С debt/balance-import document type on dbo.ProductIncome.SourceDocumentType. These lots
     # carry inflated balance-import AccountingPrice (~800-26683 EUR) across BOTH

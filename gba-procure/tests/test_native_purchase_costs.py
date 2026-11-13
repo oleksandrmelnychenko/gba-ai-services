@@ -149,7 +149,7 @@ def test_same_product_with_incompatible_current_units_has_no_cost_scalar():
     "path,value",
     [
         (("version",), True),
-        (("version",), 2),
+        (("version",), 3),
         (("scope",), "HistoricReceipts"),
         (("resolver_version",), "other"),
         (("currency",), "UAH"),
@@ -371,7 +371,7 @@ def test_client_posts_exact_dedicated_header_and_body_without_logging_or_live_io
     assert message.method == "POST" and message.full_url.endswith(costs._PATH)
     assert message.get_header("X-procure-cost-key") == KEY
     assert message.get_header("X-internal-api-key") is None
-    assert json.loads(message.data) == request().payload() and timeout == 150
+    assert json.loads(message.data) == {**request().payload(), "version": 2} and timeout == 150
     assert result.observations[0].unit_net_cost_eur == Decimal("10")
     assert KEY not in repr(client)
     assert capsys.readouterr() == ("", "")
@@ -463,3 +463,88 @@ def test_key_length_matches_dedicated_server_auth_before_any_request(length, acc
         assert secret not in str(error.value)
         with pytest.raises(NativePurchaseCostError, match="purchase_cost_not_configured"):
             NativePurchaseCostClient("http://analytics.internal", secret)
+
+
+def gba_row(identity=9, cost="7.25", **changes):
+    value = row(identity, cost=cost)
+    value.update(
+        evidence_receipt_id=None, evidence_line_ordinals=[], document_date_utc="2026-09-02T08:00:00Z"
+    )
+    value.update(changes)
+    return value
+
+
+def test_version_two_prices_gba_receipts_once_without_a_1c_receipt():
+    data = payload(rows=[row(), gba_row(), gba_row(10, cost="7.75")])
+    data["version"] = 2
+    snapshot = parse(data)
+    native = [item for item in snapshot.observations if item.evidence_receipt_id is None]
+    assert [item.unit_net_cost_eur for item in native] == [Decimal("7.25"), Decimal("7.75")]
+    assert all(item.evidence_line_ordinals == () for item in native)
+    group = aggregate_verified_costs((snapshot,)).by_product[0]
+    assert (group.observation_count, group.known_count, group.coverage) == (3, 3, "complete")
+    assert group.median_unit_net_cost_eur == Decimal("7.75")
+    only_gba = payload(rows=[gba_row()])
+    only_gba.update(version=2, publications=[])
+    assert parse(only_gba).observations[0].unit_net_cost_eur == Decimal("7.25")
+
+
+@pytest.mark.parametrize(
+    "version,changes",
+    [
+        (1, {}),
+        (2, {"evidence_line_ordinals": [0]}),
+        (2, {"evidence_receipt_id": FAILED_RECEIPT}),
+        (2, {"supplier_client_agreement_id": None}),
+        (2, {"unit_id": None}),
+        (2, {"reason_codes": ["price_invalid"]}),
+        (2, {"document_date_utc": "2026-09-08T00:00:00Z"}),
+        (2, {"unit_net_cost_eur": None}),
+    ],
+)
+def test_gba_receipt_rows_need_version_two_and_complete_identity(version, changes):
+    data = payload(rows=[gba_row(**changes)])
+    data["version"] = version
+    with pytest.raises(NativePurchaseCostError, match="^invalid_purchase_cost_response$"):
+        parse(data)
+
+
+class SequenceOpener:
+    def __init__(self, *responses):
+        self.responses = list(responses)
+        self.requests = []
+
+    def open(self, message, timeout):
+        self.requests.append(json.loads(message.data))
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+def refusal(error):
+    body = io.BytesIO(json.dumps({"error": error}).encode())
+    return HTTPError("http://analytics.internal", 400, "Bad Request", {}, body)
+
+
+def test_client_reads_version_one_only_when_an_older_server_refuses_version_two():
+    body = json.dumps(payload()).encode()
+    opener = SequenceOpener(refusal("invalid_purchase_cost_scope"), Response(body, length=len(body)))
+    result = NativePurchaseCostClient("http://analytics.internal", KEY, _opener=opener).read(request())
+    assert [item["version"] for item in opener.requests] == [2, 1]
+    assert result.observations[0].unit_net_cost_eur == Decimal("10")
+
+
+@pytest.mark.parametrize("error", ["purchase_cost_read_bound_exceeded", "invalid_purchase_cost_scope "])
+def test_other_refusals_never_repeat_the_read(error):
+    opener = SequenceOpener(refusal(error))
+    with pytest.raises(NativePurchaseCostError, match="purchase_cost_transport_unavailable"):
+        NativePurchaseCostClient("http://analytics.internal", KEY, _opener=opener).read(request())
+    assert [item["version"] for item in opener.requests] == [2]
+
+
+def test_version_one_refusal_is_not_repeated():
+    opener = SequenceOpener(refusal("invalid_purchase_cost_scope"), refusal("invalid_purchase_cost_scope"))
+    with pytest.raises(NativePurchaseCostError, match="purchase_cost_transport_unavailable"):
+        NativePurchaseCostClient("http://analytics.internal", KEY, _opener=opener).read(request())
+    assert [item["version"] for item in opener.requests] == [2, 1]

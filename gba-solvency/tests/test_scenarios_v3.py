@@ -24,8 +24,9 @@ from __future__ import annotations
 
 from zoneinfo import ZoneInfo
 
+import math
 import os
-from datetime import UTC, datetime
+from datetime import datetime
 
 import pytest
 
@@ -105,26 +106,39 @@ skip_no_db = pytest.mark.skipif(
 )
 
 
-_LIVE_PROBE: dict[str, bool] = {}
+_LIVE_PROBE: dict[str, str] = {}
 
 
-def _live_reachable() -> bool:
+def _live_skip_reason() -> str:
     """Probe the live service lazily (cached). Evaluated at CALL time, not import/collection
     time, so a sandboxed collection phase doesn't wrongly mark the service unreachable."""
-    if "ok" not in _LIVE_PROBE:
+    if "reason" not in _LIVE_PROBE:
+        reason = ""
         try:
             import httpx as requests
 
-            r = requests.get(f"{LIVE_BASE_URL}/health", headers=_api_headers(), timeout=5)
-            _LIVE_PROBE["ok"] = r.status_code == 200
+            health = requests.get(f"{LIVE_BASE_URL}/health", headers=_api_headers(), timeout=5)
+            if health.status_code != 200:
+                reason = f"live solvency service not reachable at {LIVE_BASE_URL}"
+            else:
+                probe = requests.post(
+                    f"{LIVE_BASE_URL}/score", json={}, headers=_api_headers(), timeout=5
+                )
+                if probe.status_code in (401, 403):
+                    reason = (
+                        f"live solvency service at {LIVE_BASE_URL} rejected the configured "
+                        "INTERNAL_API_KEY (set it via .env or env)"
+                    )
         except Exception:
-            _LIVE_PROBE["ok"] = False
-    return _LIVE_PROBE["ok"]
+            reason = f"live solvency service not reachable at {LIVE_BASE_URL}"
+        _LIVE_PROBE["reason"] = reason
+    return _LIVE_PROBE["reason"]
 
 
 def _require_live() -> None:
-    if not _live_reachable():
-        pytest.skip(f"live solvency service not reachable at {LIVE_BASE_URL}")
+    reason = _live_skip_reason()
+    if reason:
+        pytest.skip(reason)
 
 
 def _api_headers() -> dict[str, str]:
@@ -290,11 +304,13 @@ def forward_at_risk_cohort() -> list[dict]:
     clients = dataset.buyer_ids()
     labels = dataset.label_sev180(_AS_OF, clients)
     aging = dataset.feat_debt_aging(_AS_OF)
+    # feat_debt_aging covers every debtor; the cohort is the buyer universe only, so a debtor
+    # without a buyer role (absent from `labels`) is not a candidate.
     candidates = sorted(
         [
             (int(row.client_id), float(row.total_debt_eur))
             for row in aging.itertuples()
-            if float(row.total_debt_eur) >= 1.0 and labels[int(row.client_id)] == 0
+            if float(row.total_debt_eur) >= 1.0 and labels.get(int(row.client_id)) == 0
         ],
         key=lambda item: item[1],
         reverse=True,
@@ -564,11 +580,29 @@ def test_contract_live_batch_scores_cohort(
 # --------------------------------------------------------------------------------------------
 @skip_no_db
 def test_edge_zero_debt_buyer_high_score_without_forward_risk(service, clean_cohort):
-    res = _score(service, clean_cohort[0])
-    assert res.applicable is True
-    assert res.score is not None and res.score >= 90, f"clean buyer scored low: {res.score}"
-    assert res.rating in {"A", "B"}
-    assert res.forward_risk is None
+    from app.risk.score_current import _card
+
+    card = _card()
+    mapping = card["score_mapping"]
+    band_b_pd = card["bands"]["B"]
+    band_b_raw = mapping["anchor_offset"] + mapping["pdo"] / math.log(2) * math.log(
+        (1 - band_b_pd) / band_b_pd
+    )
+    band_b_floor = (
+        (band_b_raw - mapping["score_range_lo"])
+        / (mapping["score_range_hi"] - mapping["score_range_lo"]) * 100
+    )
+    for client_id in clean_cohort:
+        res = _score(service, client_id)
+        assert res.applicable is True
+        assert res.rating in {"A", "B"}, f"clean buyer {client_id} rated {res.rating}"
+        assert res.pd is not None and res.pd < band_b_pd
+        assert res.score is not None and res.score >= math.floor(band_b_floor), (
+            f"clean buyer {client_id} scored {res.score}, below the band-B floor "
+            f"{band_b_floor:.1f} of the served scorecard"
+        )
+        assert res.risk_90d is not None and res.risk_90d.reason_code == "no_debt"
+        assert res.forward_risk is None
 
 
 @skip_no_db

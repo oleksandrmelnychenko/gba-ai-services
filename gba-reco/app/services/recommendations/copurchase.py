@@ -6,7 +6,7 @@ own affinity (frequency). This is classic item-item collaborative filtering, whi
 beats user-user CF on sparse B2B catalogs and is cheap to compute.
 
 Similarity: cosine over the client×product co-occurrence (a product is a vector of which
-clients bought it). Computed point-in-time (Created < as_of) so it's eval-safe.
+clients bought it). Computed point-in-time (source_rules.window) so it's eval-safe.
 
 No heavy deps — pure SQL aggregation + dict math. Designed to be A/B'd against V3.2 and the
 naive baselines through the SAME eval harness (returns ranked product_ids).
@@ -17,12 +17,10 @@ import math
 from collections import defaultdict
 
 from app.core.config import get_settings
-from app.core.history import (
-    full_history_coverage,
-    source_history_start_iso,
-)
+from app.core.history import full_history_coverage
 from app.data import cache
 from app.data import sales_repository as repo
+from app.data import source_rules as rules
 from app.data.db import in_clause, query
 from app.domain.models import (
     ProductRec,
@@ -30,6 +28,7 @@ from app.domain.models import (
     RecSource,
     RecSourceDetail,
 )
+from app.services.eval import measured
 
 _COOC_ROW_CAP = 1500
 
@@ -38,23 +37,19 @@ def _client_products_with_freq(
     customer_id: int, as_of: str, client_agreement_net_id: str | None = None,
 ) -> dict[int, float]:
     rows = query(
-        """
+        f"""
         SELECT oi.ProductID AS pid, COUNT(DISTINCT o.ID) AS c
-        FROM dbo.ClientAgreement ca
-        JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
-        JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
+        FROM {rules.SPINE}
         WHERE ca.ClientID = :cid
               AND (:agreement_uid IS NULL OR ca.NetUID = CONVERT(uniqueidentifier, :agreement_uid))
-              AND oi.IsValidForCurrentSale = 1
-              AND o.Created < :asof AND o.Created >= :history_start
-              AND oi.ProductID IS NOT NULL
+              AND {rules.PURCHASED}
         GROUP BY oi.ProductID
+        ORDER BY COUNT(DISTINCT o.ID) DESC, MAX({rules.SALE_INSTANT}) DESC, oi.ProductID ASC
         """,
         {
             "cid": customer_id,
             "agreement_uid": client_agreement_net_id,
-            "asof": as_of,
-            "history_start": source_history_start_iso(),
+            **rules.window(as_of),
         },
     )
     return {int(r["pid"]): float(r["c"]) for r in rows}
@@ -77,22 +72,15 @@ def _cooccurring_products(seed_products: list[int], as_of: str, limit_seed: int 
         f"""
         WITH seed_clients AS (
             SELECT DISTINCT ca.ClientID AS cid, oi.ProductID AS seed
-            FROM dbo.ClientAgreement ca
-            JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
-            JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-            WHERE oi.IsValidForCurrentSale = 1
-                  AND o.Created < :asof AND o.Created >= :history_start
+            FROM {rules.SPINE}
+            WHERE {rules.PURCHASED}
                   AND oi.ProductID IN {seed_ph}
         ),
         cand AS (
             SELECT DISTINCT ca.ClientID AS cid, oi.ProductID AS cand
-            FROM seed_clients sc
-            JOIN dbo.ClientAgreement ca ON ca.ClientID = sc.cid
-            JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
-            JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-            WHERE oi.IsValidForCurrentSale = 1
-                  AND o.Created < :asof AND o.Created >= :history_start
-                  AND oi.ProductID IS NOT NULL
+            FROM {rules.SPINE}
+            WHERE {rules.PURCHASED}
+                  AND ca.ClientID IN (SELECT sc.cid FROM seed_clients sc)
         )
         SELECT TOP (:cap) sc.seed AS seed, c.cand AS cand, COUNT(DISTINCT sc.cid) AS co_clients
         FROM seed_clients sc
@@ -102,9 +90,8 @@ def _cooccurring_products(seed_products: list[int], as_of: str, limit_seed: int 
         ORDER BY COUNT(DISTINCT sc.cid) DESC, sc.seed ASC, c.cand ASC
         """,
         {
-            "asof": as_of,
             "cap": _COOC_ROW_CAP,
-            "history_start": source_history_start_iso(),
+            **rules.window(as_of),
             **seed_params,
         },
     )
@@ -132,17 +119,13 @@ def _product_degrees(product_ids: list[int], as_of: str) -> dict[int, int]:
     rows = query(
         f"""
         SELECT oi.ProductID AS pid, COUNT(DISTINCT ca.ClientID) AS deg
-        FROM dbo.ClientAgreement ca
-        JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
-        JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-        WHERE oi.IsValidForCurrentSale = 1
-              AND o.Created < :asof AND o.Created >= :history_start
+        FROM {rules.SPINE}
+        WHERE {rules.PURCHASED}
               AND oi.ProductID IN {ph}
         GROUP BY oi.ProductID
         """,
         {
-            "asof": as_of,
-            "history_start": source_history_start_iso(),
+            **rules.window(as_of),
             **params,
         },
     )
@@ -167,8 +150,10 @@ def recommend(
     started = datetime.now()
     history = full_history_coverage(as_of_date)
 
-    excl = repo.ubiquitous_product_ids(get_settings().ubiquity_exclude_pct) | cache.get_negatives(customer_id)
-    owned_live = repo.owned_live_product_ids(customer_id, as_of_date, **scope)
+    excl = (repo.ubiquitous_product_ids(get_settings().ubiquity_exclude_pct, as_of_date)
+            | cache.get_negatives(customer_id)
+            | repo.open_order_product_ids(customer_id, as_of_date))
+    owned_live = repo.owned_live_product_ids(customer_id, as_of_date)
     own = {
         p: f for p, f in _client_products_with_freq(customer_id, as_of_date, **scope).items()
         if p not in excl
@@ -239,9 +224,10 @@ def recommend(
         customer_id=customer_id, client_agreement_net_id=client_agreement_net_id,
         recommendations=recs, count=len(recs),
         discovery_count=discovery, segment="COPURCHASE",
+        precision_estimate=measured.precision("copurchase", top_n),
         latency_ms=round(latency, 2), as_of_date=as_of_date,
         source_history_start=history.source_history_start.isoformat(),
         effective_start=history.effective_start.isoformat(),
         history_complete=history.history_complete,
-        model_version="copurchase-v3-agreement-history-floor-20250101",
+        model_version="copurchase-v5-confirmed-sales-history-floor-20250101",
     )

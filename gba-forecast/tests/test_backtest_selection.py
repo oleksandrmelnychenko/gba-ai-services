@@ -53,15 +53,14 @@ def test_classify_keeps_interior_droughts():
 # --- method selection ---------------------------------------------------------------------
 
 
-def test_default_segment_map_is_backtest_proven_choice():
-    # Re-derived on the corrected full-sales data: smooth adopts EWMA (lowest MAE + near-zero
-    # bias); erratic reverts to moving_avg (lowest MAE in every split on the corrected data);
-    # intermittent/lumpy keep SBA; no_demand stays the safe moving_avg.
-    assert selection.method_for_segment(classify.SMOOTH) == "ewma"
-    assert selection.method_for_segment(classify.ERRATIC) == "moving_avg"
-    assert selection.method_for_segment(classify.INTERMITTENT) == "sba"
-    assert selection.method_for_segment(classify.LUMPY) == "sba"
+def test_default_segment_map_is_holdout_proven_choice():
+    for segment in (classify.SMOOTH, classify.ERRATIC, classify.INTERMITTENT, classify.LUMPY):
+        assert selection.method_for_segment(segment) == "ewma"
     assert selection.method_for_segment(classify.NO_DEMAND) == "moving_avg"
+    assert selection.is_auto("auto") and selection.is_auto("") and selection.is_auto("unknown")
+    assert not selection.is_auto("ewma") and not selection.is_auto("SBA")
+    assert selection.method_label("ewma", 0.4) == "ewma_a0.4"
+    assert selection.method_label("sba", 0.4) == "sba"
 
 
 def test_method_for_segment_defaults_safely_on_unknown():
@@ -79,16 +78,17 @@ def test_select_method_auto_uses_segment():
     intermittent = [100.0, 0.0, 0.0, 100.0, 0.0, 0.0, 100.0]
     method, segment = selection.select_method(intermittent, "auto")
     assert segment == classify.INTERMITTENT
-    assert method == "sba"
+    assert method == "tsb"
+    assert selection.select_method(intermittent, "auto", scope=selection.SCOPE_PRODUCT)[0] == "tsb"
+    assert selection.select_method(intermittent, "auto", scope=selection.SCOPE_PAIR)[0] == "ewma"
+    assert selection.select_method(intermittent, "auto", {classify.INTERMITTENT: "sba"})[0] == "sba"
 
 
-def test_select_method_routes_erratic_to_moving_avg():
-    # erratic = regular cadence, volatile size (low ADI, high CV2) -> moving_avg under auto
-    # (re-derived: window mean has the lowest MAE on the corrected full data for this segment).
+def test_select_method_routes_erratic_to_ewma():
     erratic = [100.0, 800.0, 50.0, 900.0, 120.0, 700.0]
     method, segment = selection.select_method(erratic, "auto")
     assert segment == classify.ERRATIC
-    assert method == "moving_avg"
+    assert method == "ewma"
 
 
 def test_select_method_forced_new_methods_are_runnable():
@@ -215,3 +215,49 @@ def test_backtest_dense_series_respects_source_history_floor():
     )
 
     assert dense == [10.0, 0.0, 30.0]
+
+
+def test_method_depends_on_scope_and_class():
+    expected = {
+        selection.SCOPE_CLIENT: ("ewma_a0.3", "ewma_a0.3", "tsb_a0.5_b0.5", "tsb_a0.5_b0.5"),
+        selection.SCOPE_PRODUCT: ("ewma_a0.15", "ewma_a0.15", "tsb_a0.2_b0.3", "tsb_a0.2_b0.3"),
+        selection.SCOPE_PAIR: ("ewma_a0.1", "ewma_a0.1", "ewma_a0.4", "ewma_a0.4"),
+    }
+    classes = (classify.SMOOTH, classify.ERRATIC, classify.INTERMITTENT, classify.LUMPY)
+    series = [100.0, 0.0, 80.0, 0.0, 0.0, 120.0]
+    for scope, labels in expected.items():
+        assert tuple(selection.auto_rate(series, c, scope)[1] for c in classes) == labels
+    assert set(selection.SEGMENT_EWMA_ALPHA) == set(selection.SCOPES)
+    assert set(selection.SEGMENT_TSB) == set(selection.SCOPES)
+    for scope in selection.SCOPES:
+        assert not set(selection.SEGMENT_EWMA_ALPHA[scope]) & set(selection.SEGMENT_TSB[scope])
+        assert set(selection.SEGMENT_EWMA_ALPHA[scope]) | set(selection.SEGMENT_TSB[scope]) == set(classes)
+
+
+def test_auto_rate_uses_the_named_method():
+    from app.services.forecasting import demand
+
+    series = [100.0, 0.0, 80.0, 0.0, 0.0, 120.0]
+    assert selection.auto_rate(series, classify.LUMPY, selection.SCOPE_CLIENT)[0] == demand.tsb_rate(
+        series, 0.5, 0.5
+    )
+    assert selection.auto_rate(series, classify.LUMPY, selection.SCOPE_PRODUCT)[0] == demand.tsb_rate(
+        series, 0.2, 0.3
+    )
+    assert selection.auto_rate(series, classify.LUMPY, selection.SCOPE_PAIR)[0] == demand.ewma_rate(
+        series, 0.4
+    )
+    assert selection.auto_rate([0.0, 0.0], classify.NO_DEMAND, selection.SCOPE_CLIENT)[0] == 0.0
+
+
+def test_horizon_shape_names_the_flat_run_rate():
+    assert selection.horizon_shape("auto") == "flat_run_rate"
+    assert selection.horizon_shape("ewma") == "flat_run_rate"
+    assert selection.horizon_shape("damped_trend") == "damped_trend"
+
+
+def test_unknown_scope_is_rejected():
+    import pytest
+
+    with pytest.raises(ValueError, match="unknown forecast scope"):
+        selection.auto_rate([1.0, 2.0, 3.0], classify.SMOOTH, "warehouse")

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-files=(app/risk/artifacts/cv_report.json app/risk/artifacts/forward_model_status.json app/risk/artifacts/monitor_baseline.json app/risk/artifacts/scorecard_coefficients.json)
+files=(app/risk/artifacts/MODEL_CARD.md app/risk/artifacts/cv_report.json app/risk/artifacts/forward_model_status.json app/risk/artifacts/monitor_baseline.json app/risk/artifacts/scorecard_coefficients.json)
 if git diff --quiet -- "${files[@]}"; then
   exit 0
 fi

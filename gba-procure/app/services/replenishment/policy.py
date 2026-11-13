@@ -39,6 +39,7 @@ from app.domain.models import (
     DemandPoint,
     DemandSeries,
     InventoryPosition,
+    MoqEvidence,
     PlanCharts,
     ProducerPurchasePlan,
     ReorderSuggestion,
@@ -52,7 +53,9 @@ from app.services.classify import segmentation
 from app.services.classify import service as classify_svc
 from app.services.forecasting import demand as demand_svc
 from app.services.forecasting import lead_time as lead_time_svc
+from app.services.replenishment import derived_terms
 from app.services.optimization import milp as milp_opt
+from app.services.replenishment.inputs import PlanInputs
 
 # Shared urgency ordering (critical first) for sorting and the mix histogram.
 _URGENCY_ORDER = {Urgency.CRITICAL: 0, Urgency.HIGH: 1, Urgency.NORMAL: 2, Urgency.NONE: 3}
@@ -96,6 +99,20 @@ def _resolved_unit_cost(
     return factual_cost
 
 
+def _attach_cost_estimate(sug: ReorderSuggestion, fallback_cost: float | None) -> None:
+    if sug.unit_cost_eur is not None:
+        sug.cost_source = sug.cost_provenance.source
+        sug.estimated_unit_cost_eur = sug.unit_cost_eur
+        sug.estimated_line_cost_eur = sug.line_cost_eur
+    elif fallback_cost is not None and fallback_cost > 0:
+        unit_cost = _round_decimal(fallback_cost, _FOUR_DECIMALS)
+        sug.cost_source = "last_receipt_fallback"
+        sug.estimated_unit_cost_eur = unit_cost
+        sug.estimated_line_cost_eur = _line_cost(unit_cost, sug.suggested_qty)
+    else:
+        sug.cost_source = "none"
+
+
 def _profit_at_risk(sug: ReorderSuggestion) -> float:
     margin = max(sug.unit_margin_eur or 0.0, 0.0)
     return margin * sug.suggested_qty * _URGENCY_WEIGHT[sug.urgency]
@@ -136,19 +153,50 @@ def _deduplicate_supplier_options(
     return list(by_product.values()), len(items) - len(by_product)
 
 
+def _qty_by_unit(items: list[ReorderSuggestion]) -> dict[str, float]:
+    totals: dict[str, Fraction] = {}
+    for item in items:
+        unit = (item.measure_unit or "").strip()
+        totals[unit] = totals.get(unit, Fraction()) + Fraction(_decimal(item.suggested_qty))
+    return {unit: _exact_quantity_float(_decimal(totals[unit])) for unit in sorted(totals)}
+
+
 def _cart_totals(items: list[ReorderSuggestion]) -> dict:
     total_qty = sum((Fraction(_decimal(item.suggested_qty)) for item in items), Fraction())
     priced_cost = sum(
         (Fraction(_decimal(item.line_cost_eur)) for item in items if item.line_cost_eur is not None),
         Fraction(),
     )
+    certified = sum(
+        (
+            Fraction(_decimal(item.line_cost_eur))
+            for item in items
+            if item.line_cost_eur is not None and item.cost_provenance.budget_eligible
+        ),
+        Fraction(),
+    )
     unpriced = sum(1 for item in items if item.line_cost_eur is None)
     priced_cost_eur = _round_decimal(priced_cost, _CENT)
+    fallback = sum(
+        (
+            Fraction(_decimal(item.estimated_line_cost_eur))
+            for item in items
+            if item.line_cost_eur is None and item.estimated_line_cost_eur is not None
+        ),
+        Fraction(),
+    )
     return {
         "total_suggested_qty": _exact_quantity_float(_decimal(total_qty)),
+        "suggested_qty_by_unit": _qty_by_unit(items),
         "priced_cost_eur": priced_cost_eur,
         "total_cost_eur": None if unpriced else priced_cost_eur,
         "unpriced_item_count": unpriced,
+        "estimated_total_cost_eur": _round_decimal(priced_cost + fallback, _CENT),
+        "certified_cost_eur": _round_decimal(certified, _CENT),
+        "uncertified_cost_eur": _round_decimal(priced_cost - certified + fallback, _CENT),
+        "unestimated_item_count": sum(
+            1 for item in items if item.line_cost_eur is None and item.estimated_line_cost_eur is None
+        ),
     }
 
 
@@ -242,6 +290,48 @@ def _urgency(position: float, safety_stock: float, reorder_point: float, order_u
     return Urgency.NONE
 
 
+_FRACTIONAL_UNITS = frozenset({"м", "кг", "л", "г", "т", "мл", "м.кв", "м2", "м.куб", "м3", "пог.м", "м.п"})
+_THIN_DEMAND_MAX_UNITS = 1.0
+_CRITICAL_MIN_LEAD_DEMAND = 1.0
+
+
+def _is_fractional_unit(unit: str | None) -> bool:
+    return bool(unit) and unit.strip().lower().rstrip(".") in _FRACTIONAL_UNITS
+
+
+def _whole_units(qty: float, unit: str | None) -> float:
+    if qty <= 0 or _is_fractional_unit(unit):
+        return qty
+    return float(math.ceil(round(qty, 6)))
+
+
+def _demand_evidence(rows: list[dict]) -> str:
+    sold = sum(float(r["units"] or 0) for r in rows)
+    return "on_request" if sold <= _THIN_DEMAND_MAX_UNITS else "regular"
+
+
+def _priority_urgency(sug: ReorderSuggestion, abc: str | None, evidence: str) -> Urgency:
+    """Spread the stock-position band by business weight.
+
+    critical: at or below safety stock, ABC class A, and at least one unit expected to
+              sell before a replenishment can arrive;
+    high:     at or below safety stock for class A/B or with that lead-time demand,
+              or class A below its reorder point;
+    normal:   every other line that needs ordering, and all thin-evidence lines.
+    """
+    if sug.urgency in (Urgency.NONE, Urgency.NORMAL):
+        return sug.urgency
+    if evidence == "on_request":
+        return Urgency.NORMAL
+    below_safety = sug.urgency == Urgency.CRITICAL
+    sells_within_lead = (sug.lead_demand or 0.0) >= _CRITICAL_MIN_LEAD_DEMAND
+    if below_safety and abc == "A" and sells_within_lead:
+        return Urgency.CRITICAL
+    if (below_safety and (abc in ("A", "B") or sells_within_lead)) or abc == "A":
+        return Urgency.HIGH
+    return Urgency.NORMAL
+
+
 def _suggest_one(
     product_id: int,
     producer_id: int,
@@ -315,6 +405,19 @@ def _exact_quantity_float(quantity: Decimal) -> float:
     return result
 
 
+_MOQ_EVIDENCE_QUANTITIES = 40
+
+
+def _order_term(stored: dict | None, derived: dict | None) -> dict | None:
+    """A buyer's stored term wins; a stored term that was merely seeded from documents is
+    unvalidated and yields to the validated derivation."""
+    if stored and stored.get("source") != "derived" and (
+        stored.get("moq") or stored.get("order_multiple")
+    ):
+        return stored
+    return derived
+
+
 def _round_order_qty(qty: float, moq: float | None, multiple: float | None) -> float:
     if qty <= 0:
         return 0.0
@@ -373,16 +476,29 @@ def build_plan(
     *,
     cost_cohort: PurchaseCostCohort | None = None,
     product_ids: list[int] | None = None,
+    inputs: PlanInputs | None = None,
 ) -> ProducerPurchasePlan:
     s = get_settings()
     coverage = rolling_coverage(as_of, s.history_days)
-    lt_mean, lt_std, lt_source = lead_time_svc.producer_lead_time(producer_id, as_of)
     if product_ids is None:
         product_ids = repo.products_for_producer(producer_id, as_of, s.history_days)
+    if inputs is not None and not inputs.covers(producer_id, product_ids, as_of):
+        inputs = None
+    lt_sample_count: int | None = None
+    if inputs is not None:
+        lt_mean, lt_std, lt_source = inputs.lead_time(producer_id)
+        lt_sample_count = len(inputs.lead_time_samples.get(producer_id, []))
+    else:
+        lt_mean, lt_std, lt_source, lt_sample_count = lead_time_svc.producer_lead_time_evidence(
+            producer_id, as_of
+        )
     cost_cohort = cost_cohort or read_purchase_cost_cohort(product_ids, as_of)
     cost_cohort.require_scope(product_ids, as_of)
 
-    profile = masters.producer_profile(producer_id, required=True) if s.use_masters else None
+    if inputs is not None:
+        profile = inputs.profiles.get(producer_id) if inputs.profiles is not None else None
+    else:
+        profile = masters.producer_profile(producer_id, required=True) if s.use_masters else None
     prod_sl_floor: float | None = None
     if profile:
         override = profile.get("lead_time_override_days")
@@ -392,25 +508,41 @@ def build_plan(
             lt_source = "override"
         if profile.get("service_level_target"):
             prod_sl_floor = float(profile["service_level_target"])
-    terms = masters.product_terms_for(producer_id, product_ids, required=True) if s.use_masters else {}
-    factors = (
-        feedback.learned_factors(
-            producer_id, s.feedback_min_samples, s.override_factor_min, s.override_factor_max
-        )
-        if s.use_feedback
-        else {}
-    )
     _season_month = _next_month(_as_date(as_of)).month
-
-    on_hand = repo.on_hand(product_ids)
-    reserved = repo.reserved(product_ids)
-    on_order = repo.on_order(product_ids, as_of)
-    # ONE (chunked) demand query for ALL candidate products instead of one per product.
-    demand_rows = repo.product_daily_demand_bulk(product_ids, as_of, s.history_days)
     costs = cost_repo.producer_unit_costs_eur(producer_id, product_ids, as_of, cohort=cost_cohort)
-    sales = cost_repo.sale_prices_eur(product_ids, as_of, s.history_days)
-    if abc_map is None:
-        abc_map = classify_svc.get_abc_map(as_of, s.history_days)
+    if inputs is not None:
+        terms = inputs.terms.get(producer_id, {})
+        derived = inputs.derived_terms.get(producer_id, {})
+        factors = inputs.factors.get(producer_id, {})
+        on_hand, reserved, on_order = inputs.on_hand, inputs.reserved, inputs.on_order
+        demand_rows, sales = inputs.demand_rows, inputs.sales
+        measure_units, fallback_costs = inputs.measure_units, inputs.fallback_costs
+        if abc_map is None:
+            abc_map = inputs.abc_map
+    else:
+        terms = (
+            masters.product_terms_for(producer_id, product_ids, required=True) if s.use_masters else {}
+        )
+        factors = (
+            feedback.learned_factors(
+                producer_id, s.feedback_min_samples, s.override_factor_min, s.override_factor_max
+            )
+            if s.use_feedback
+            else {}
+        )
+        on_hand = repo.on_hand(product_ids)
+        reserved = repo.reserved(product_ids)
+        on_order = repo.on_order(product_ids, as_of)
+        # ONE (chunked) demand query for ALL candidate products instead of one per product.
+        demand_rows = repo.product_daily_demand_bulk(product_ids, as_of, s.history_days)
+        sales = cost_repo.sale_prices_eur(product_ids, as_of, s.history_days)
+        measure_units = repo.product_measure_units(product_ids)
+        derived = derived_terms.validated_terms(
+            as_of, {producer_id: product_ids}, measure_units
+        ).get(producer_id, {})
+        fallback_costs = repo.last_document_costs_eur(as_of, product_ids)
+        if abc_map is None:
+            abc_map = classify_svc.get_abc_map(as_of, s.history_days)
 
     items: list[ReorderSuggestion] = []
     for pid in product_ids:
@@ -470,16 +602,31 @@ def build_plan(
         if only_needed and sug.suggested_qty <= 0:
             continue
         original_qty = sug.suggested_qty
+        unit = measure_units.get(pid)
+        sug.measure_unit = unit
+        sug.demand_evidence = _demand_evidence(dr)
+        sug.urgency = _priority_urgency(sug, abc, sug.demand_evidence)
         factor = factors.get(abc)
         if factor is not None and factor != 1.0:
             sug.learned_factor = round(factor, 3)
             sug.suggested_qty = round(sug.suggested_qty * factor, 2)
-        if t:
-            moq = t.get("moq")
-            mult = t.get("order_multiple")
-            sug.suggested_qty = _round_order_qty(sug.suggested_qty, moq, mult)
+        sug.suggested_qty = _whole_units(sug.suggested_qty, unit)
+        order_term = _order_term(t, derived.get(pid))
+        if order_term:
+            moq = order_term.get("moq")
+            mult = order_term.get("order_multiple")
+            sug.suggested_qty = _whole_units(_round_order_qty(sug.suggested_qty, moq, mult), unit)
             sug.moq = float(moq) if moq else None
             sug.order_multiple = float(mult) if mult else None
+            sug.pack_multiple = sug.order_multiple
+            sug.moq_basis = order_term.get("moq_basis", derived_terms.BASIS_BUYER)
+            if sug.moq_basis == derived_terms.BASIS_DERIVED_VALIDATED:
+                sug.moq_evidence = MoqEvidence(
+                    documents=order_term["documents"],
+                    quantities=order_term["quantities"][:_MOQ_EVIDENCE_QUANTITIES],
+                    source_document_date=order_term["source_document_date"],
+                    sales_12m_units=round(order_term["sales_12m_units"], 3),
+                )
         if sug.suggested_qty != original_qty:
             sug.raw_qty = round(original_qty, 2)
         sug.applied_service_level = round(sl, 4)
@@ -497,6 +644,7 @@ def build_plan(
             if override is not None and float(override) > 0
             else cost_cohort.provenance(pid, producer_id, sug.suggested_qty)
         )
+        _attach_cost_estimate(sug, fallback_costs.get((producer_id, pid)))
         sug.budget_priority_weight = _URGENCY_WEIGHT[sug.urgency] if sug.suggested_qty > 0 else 0.0
         if sale is not None:
             sug.unit_sale_eur = sale
@@ -517,7 +665,12 @@ def build_plan(
         )
     )
 
-    resolved_name = repo.producer_name(producer_id) if producer_name is _UNSET else producer_name
+    if producer_name is not _UNSET:
+        resolved_name = producer_name
+    elif inputs is not None:
+        resolved_name = inputs.names.get(producer_id)
+    else:
+        resolved_name = repo.producer_name(producer_id)
     # Stamp producer_name onto every line so the warehouse lens (cart plan spanning all
     # producers) can group by producer without a second lookup.
     # Product meta (name / OE number / photo) so the console renders a readable товар.
@@ -535,7 +688,10 @@ def build_plan(
         producer_name=resolved_name,
         lead_time_days=round(lt_mean, 1),
         lead_time_std_days=round(lt_std, 1),
-        lead_time_source=lt_source,
+        lead_time_source=lead_time_svc.payload_source(lt_source),
+        lead_time_basis=lead_time_svc.basis_of(lt_source),
+        lead_time_statistic=lead_time_svc.statistic_of(lt_source),
+        lead_time_sample_count=lt_sample_count,
         items=items,
         item_count=len(items),
         cost_observation_manifest=cost_cohort.manifest(product_ids),
@@ -555,6 +711,7 @@ def _cart_producer_plan(
     *,
     cost_cohort: PurchaseCostCohort,
     product_ids: list[int],
+    inputs: PlanInputs | None = None,
 ) -> ProducerPurchasePlan:
     # Cached producer outputs are not proof of the current build's financial input.
     return build_plan(
@@ -565,6 +722,7 @@ def _cart_producer_plan(
         producer_name=producer_name,
         cost_cohort=cost_cohort,
         product_ids=product_ids,
+        **({"inputs": inputs} if inputs is not None else {}),
     )
 
 
@@ -625,6 +783,8 @@ def build_cart_plan(
     *,
     cost_cohort: PurchaseCostCohort | None = None,
     products_by_producer: dict[int, list[int]] | None = None,
+    producer_plans: dict[int, ProducerPurchasePlan] | None = None,
+    inputs: PlanInputs | None = None,
 ) -> CartReplenishmentPlan:
     s = get_settings()
     coverage = rolling_coverage(as_of, s.history_days)
@@ -644,16 +804,23 @@ def build_cart_plan(
 
     items: list[ReorderSuggestion] = []
     for producer_id in producer_ids:
-        plan = _cart_producer_plan(
-            producer_id,
-            as_of,
-            only_needed,
-            abc_map,
-            names.get(producer_id),
-            source_fingerprint,
-            cost_cohort=cost_cohort,
-            product_ids=products_by_producer[producer_id],
-        )
+        built = (producer_plans or {}).get(producer_id) if only_needed else None
+        if built is not None and built.as_of_date == as_of and built.producer_id == producer_id:
+            plan = built.model_copy(deep=True)
+            for sug in plan.items:
+                sug.producer_name = names.get(producer_id)
+        else:
+            plan = _cart_producer_plan(
+                producer_id,
+                as_of,
+                only_needed,
+                abc_map,
+                names.get(producer_id),
+                source_fingerprint,
+                cost_cohort=cost_cohort,
+                product_ids=products_by_producer[producer_id],
+                inputs=inputs,
+            )
         if only_needed:
             items.extend(sug for sug in plan.items if sug.suggested_qty > 0)
         else:
@@ -776,10 +943,13 @@ def captured_cart_variant(
 # How many of the top items get a demand_series (history + forecast). "Top few."
 _DEMAND_SERIES_MAX = 5
 # days_of_cover histogram edges, inclusive upper bound per bucket.
-_COVER_BUCKETS = ("<0", "0-7", "8-30", "31-90", "90+")
+_NO_STOCK_BUCKET = "немає залишку"
+_COVER_BUCKETS = (_NO_STOCK_BUCKET, "<0", "0-7", "8-30", "31-90", "90+")
 
 
-def _cover_bucket(days: float) -> str:
+def _cover_bucket(days: float, position: float | None = None) -> str:
+    if position is not None and position <= 0:
+        return _NO_STOCK_BUCKET
     if days < 0:
         return "<0"
     if days <= 7:
@@ -912,7 +1082,7 @@ def build_charts(
     # days_of_cover_hist — fixed buckets, every bucket present (count 0 if empty).
     hist = {b: 0 for b in _COVER_BUCKETS}
     for it in items:
-        hist[_cover_bucket(it.days_of_cover)] += 1
+        hist[_cover_bucket(it.days_of_cover, it.inventory.position)] += 1
     days_of_cover_hist = [DaysOfCoverBucket(bucket=b, count=hist[b]) for b in _COVER_BUCKETS]
 
     ranked_all = sorted(items, key=lambda x: (_URGENCY_ORDER[x.urgency], -x.suggested_qty))
@@ -985,6 +1155,7 @@ def _chart_population(plan, producer_id: int | None) -> ChartPopulation:
         scope="supplier_assortment" if producer_id is not None else "needed_cart",
         item_count=len(plan.items), unique_product_count=len({item.product_id for item in plan.items}),
         total_suggested_qty=sum(item.suggested_qty for item in plan.items),
+        suggested_qty_by_unit=_qty_by_unit(plan.items),
         unpriced_item_count=sum(item.line_cost_eur is None for item in plan.items),
         budget_ineligible_item_count=sum(not item.cost_provenance.budget_eligible for item in plan.items),
         budget_eur=getattr(plan, "budget_eur", None),

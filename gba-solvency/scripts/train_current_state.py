@@ -21,6 +21,7 @@ Outputs (under app/risk/artifacts/ and data/):
 """
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -267,7 +268,7 @@ def cv_eval_woe(X: pd.DataFrame, y: np.ndarray, features: list[str]) -> dict:
         Xtr, Xte, ytr = X.iloc[tr], X.iloc[te], y[tr]
         bm = fit_binmap(Xtr, ytr, features)
         Wtr, Wte = woe_matrix(Xtr, bm, features), woe_matrix(Xte, bm, features)
-        clf = LogisticRegression(C=0.5, penalty="l2", class_weight="balanced",
+        clf = LogisticRegression(C=0.5, l1_ratio=0, class_weight="balanced",
                                  max_iter=2000, solver="lbfgs")
         clf.fit(Wtr, ytr)
         p = clf.predict_proba(Wte)[:, 1]
@@ -305,6 +306,55 @@ def _summary(aucs, kss, briers, oof, y) -> dict:
     }
 
 
+def subset_quality(y: np.ndarray, p: np.ndarray) -> dict:
+    """AUC / KS / Brier of predictions `p` on one population; AUC and KS need both classes."""
+    y = np.asarray(y).astype(int)
+    p = np.asarray(p, dtype=float)
+    both_classes = len(y) > 0 and 0 < int(y.sum()) < len(y)
+    return {
+        "rows": int(len(y)),
+        "positives": int(y.sum()),
+        "auc": float(roc_auc_score(y, p)) if both_classes else None,
+        "ks": ks_stat(y, p) if both_classes else None,
+        "brier": float(brier_score_loss(y, p)) if len(y) else None,
+    }
+
+
+def open_debt_quality(
+    total_debt_eur: np.ndarray, y: np.ndarray, oof: np.ndarray, pd_serving: np.ndarray
+) -> dict:
+    """Model quality among buyers that carry open debt at the feature date.
+
+    Most buyers have no debt and are trivially safe, so the all-rows AUC mostly measures the
+    split "has debt / has no debt". This subset is where the scorecard actually has to rank.
+    `oof` is the out-of-fold cross-validation prediction (the gate metric); `served` is the
+    final calibrated PD with the SEV180 policy floor, in-sample.
+    """
+    mask = np.asarray(total_debt_eur, dtype=float) > 0.0
+    return {
+        "definition": "total_debt_eur > 0 at the feature date",
+        "share_of_rows": float(mask.mean()) if len(mask) else 0.0,
+        "oof": subset_quality(y[mask], oof[mask]),
+        "served": subset_quality(y[mask], pd_serving[mask]),
+    }
+
+
+def score_ceiling_share(score: np.ndarray) -> dict:
+    """Share of training rows whose served score rounds to exactly 100.
+
+    The training dataset fills a missing sales recency differently from the serving path, so
+    the serving "insufficient data" rule cannot be replayed here; scripts/retrain.py measures
+    the same share on the live buyer population with the serving rule.
+    """
+    at_ceiling = np.rint(np.asarray(score, dtype=float)) == 100
+    return {
+        "definition": "training rows whose served score rounds to 100",
+        "rows": int(len(at_ceiling)),
+        "score_100_rows": int(at_ceiling.sum()),
+        "score_100_share": float(at_ceiling.mean()) if len(at_ceiling) else None,
+    }
+
+
 # ---------------------------------------------------------------------------------------------
 def pd_to_score(pd_arr: np.ndarray, lo=400.0, hi=800.0, pdo=20.0, offset=600.0) -> np.ndarray:
     pd_arr = np.clip(pd_arr, 1e-6, 1 - 1e-6)
@@ -312,6 +362,10 @@ def pd_to_score(pd_arr: np.ndarray, lo=400.0, hi=800.0, pdo=20.0, offset=600.0) 
     factor = pdo / np.log(2)
     raw = offset + factor * np.log(odds)
     return np.clip((raw - lo) / (hi - lo) * 100, 0, 100)
+
+
+def _fmt(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.4f}"
 
 
 def band_from_pd(p: float) -> str:
@@ -324,7 +378,17 @@ def band_from_pd(p: float) -> str:
     return "D"
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Train the current-state SEV180 scorecard.")
+    parser.add_argument(
+        "--evaluate-only", action="store_true",
+        help="run the CV and quality report on the existing dataset; write no artifact",
+    )
+    parser.add_argument(
+        "--report-out", type=Path, default=None,
+        help="with --evaluate-only: also write the report JSON to this path",
+    )
+    args = parser.parse_args(argv)
     dataset_path = DATA / "risk_dataset_v3.parquet"
     df = pd.read_parquet(dataset_path)
     dataset_lineage = validate_dataset_manifest(
@@ -434,7 +498,7 @@ def main() -> None:
     # ---- FINAL FIT (PRIMARY) -----------------------------------------------------------------
     binmap = fit_binmap(X_primary, y, PRIMARY_FEATURES)
     W = woe_matrix(X_primary, binmap, PRIMARY_FEATURES)
-    final_lr = LogisticRegression(C=0.5, penalty="l2", class_weight="balanced",
+    final_lr = LogisticRegression(C=0.5, l1_ratio=0, class_weight="balanced",
                                   max_iter=2000, solver="lbfgs")
     final_lr.fit(W, y)
     lin = final_lr.decision_function(W)
@@ -456,6 +520,32 @@ def main() -> None:
     validation["sev180_policy_rows"] = int(severe_current.sum())
     if not validation["sev180_policy_passed"]:
         raise LineageError("current-state SEV180 policy validation failed")
+
+    report["open_debt_subset"] = open_debt_quality(
+        df["total_debt_eur"].to_numpy(dtype=float), y, woe_primary["oof"], pd_serving
+    )
+    report["score_distribution"] = score_ceiling_share(score_full)
+    report["all_rows_served"] = subset_quality(y, pd_serving)
+    print("\n== Quality where the model has to rank ==")
+    print(f"  all rows:       OOF AUC={oof_auc:.4f}  (n={len(df)}, pos={n_pos})")
+    open_debt = report["open_debt_subset"]
+    for name in ("oof", "served"):
+        q = open_debt[name]
+        print(
+            f"  open debt {name:>6}: AUC={_fmt(q['auc'])} KS={_fmt(q['ks'])} "
+            f"Brier={_fmt(q['brier'])}  (n={q['rows']}, pos={q['positives']}, "
+            f"{open_debt['share_of_rows']:.1%} of rows)"
+        )
+    ceiling = report["score_distribution"]
+    print(
+        f"  score exactly 100: {ceiling['score_100_rows']} of {ceiling['rows']} training rows "
+        f"({_fmt(ceiling['score_100_share'])})"
+    )
+    if args.evaluate_only:
+        if args.report_out is not None:
+            write_json_atomic(args.report_out, report)
+        print("\nEVALUATE-ONLY: no artifact written.")
+        return
 
     df_out = df[["client_id"]].copy()
     df_out["pd"] = pd_serving

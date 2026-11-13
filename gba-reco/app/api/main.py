@@ -19,12 +19,10 @@ from app.core.logging import get_logger
 from app.core.metrics import METRICS
 from app.data import cache
 from app.data import sales_repository as repo
-from app.data.db import dispose, get_engine
+from app.data import source_rules as rules
+from app.data.db import SOURCE_UNAVAILABLE, dispose, get_engine, unavailable_reason
 from app.domain.models import (
-    ProductRec,
     RecommendationResult,
-    RecSource,
-    RecSourceDetail,
 )
 from app.services.recommendations import copurchase, service
 
@@ -226,55 +224,81 @@ def recommend(req: RecommendRequest) -> RecommendationResult:
         raise HTTPException(status_code=404, detail={"code": "client_agreement_unavailable"}) from exc
     except service.UnknownCustomerError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except SOURCE_UNAVAILABLE as exc:
+        raise _source_unavailable("recommend", req.customer_id, exc) from exc
     except Exception as exc:  # noqa: BLE001
         error_id = uuid.uuid4().hex
         log.error("recommend_failed", customer_id=req.customer_id, error_id=error_id, error=str(exc))
         raise HTTPException(status_code=500, detail=f"recommendation_failed (ref {error_id})") from exc
 
 
+def _source_unavailable(route: str, customer_id: int, exc: BaseException) -> HTTPException:
+    reason = unavailable_reason(exc)
+    log.error("source_unavailable", route=route, customer_id=customer_id, reason=reason,
+              error=str(exc)[:300])
+    return HTTPException(
+        status_code=503,
+        detail={"code": "source_unavailable", "reason": reason},
+        headers={"Retry-After": "30"},
+    )
+
+
 @app.post("/recommend/copurchase", response_model=RecommendationResult)
 def recommend_copurchase(req: RecommendRequest) -> RecommendationResult:
     """Item-item co-purchase recommender — the discovery source for cross-sell (faster than the
     v3.2 user-Jaccard and competitive in eval). Synthetic/ubiquitous lines already excluded."""
-    as_of = req.as_of_date.isoformat() if req.as_of_date else time.strftime("%Y-%m-%d")
-    if not repo.client_exists(req.customer_id):
-        raise HTTPException(status_code=404, detail=f"customer {req.customer_id} was not found")
-    try:
-        agreement_uid = service.require_agreement(
-            req.customer_id, str(req.client_agreement_net_id) if req.client_agreement_net_id else None,
-        )
-    except service.UnknownAgreementError as exc:
-        raise HTTPException(status_code=404, detail={"code": "client_agreement_unavailable"}) from exc
-    scope = {"client_agreement_net_id": agreement_uid} if agreement_uid else {}
+    as_of = req.as_of_date.isoformat() if req.as_of_date else rules.today()
+    requested = str(req.client_agreement_net_id) if req.client_agreement_net_id else None
     seeds = sorted(set(req.product_ids)) if req.product_ids else None
-    if seeds:
-        missing = sorted(set(seeds) - repo.active_product_ids(seeds))
-        if missing:
+
+    def cache_key(agreement: str | None) -> str:
+        key = cache.make_copurchase_key(
+            req.customer_id, as_of, req.top_n,
+            **({"client_agreement_net_id": agreement} if agreement else {}),
+        )
+        return f"{key}:s{','.join(map(str, seeds))}" if seeds else key
+
+    try:
+        if not repo.client_exists(req.customer_id):
+            raise HTTPException(status_code=404, detail=f"customer {req.customer_id} was not found")
+        try:
+            agreement_uid = service.require_agreement(req.customer_id, requested)
+        except service.UnknownAgreementError as exc:
             raise HTTPException(
-                status_code=404,
-                detail={"message": "seed products were not found", "product_ids": missing},
+                status_code=404, detail={"code": "client_agreement_unavailable"},
+            ) from exc
+        if seeds:
+            missing = sorted(set(seeds) - repo.active_product_ids(seeds))
+            if missing:
+                raise HTTPException(
+                    status_code=404,
+                    detail={"message": "seed products were not found", "product_ids": missing},
+                )
+    except SOURCE_UNAVAILABLE as exc:
+        result = None
+        if req.use_cache and not seeds:
+            result = service.cached_while_source_is_down(
+                cache_key(requested), req.customer_id, as_of, requested, exc,
             )
-    key = cache.make_copurchase_key(req.customer_id, as_of, req.top_n, **scope)
-    if seeds:
-        key = f"{key}:s{','.join(map(str, seeds))}"
+        if result is None:
+            raise _source_unavailable("copurchase", req.customer_id, exc) from exc
+        return result
+    scope = {"client_agreement_net_id": agreement_uid} if agreement_uid else {}
+    key = cache_key(agreement_uid)
     if req.use_cache:
-        cached = cache.get(key)
+        cached = cache.get(key) if seeds else service.read_cached(key, as_of)
         if cached is not None:
-            cached["cached"] = True
-            cached["recommendations"] = [
-                ProductRec(product_id=r["product_id"], score=r["score"], rank=r["rank"],
-                           segment=r["segment"], source=RecSource(r["source"]),
-                           source_detail=RecSourceDetail(r["source_detail"]))
-                for r in cached["recommendations"]
-            ]
-            result = RecommendationResult(**cached)
-            if (result.customer_id != req.customer_id or result.as_of_date != as_of
-                    or result.client_agreement_net_id != agreement_uid):
-                raise HTTPException(status_code=503, detail="cached recommendation identity mismatch")
-            return result
+            try:
+                return service.from_cache(cached, req.customer_id, as_of, agreement_uid)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=503, detail="cached recommendation identity mismatch",
+                ) from exc
     try:
         result = copurchase.recommend(req.customer_id, as_of, top_n=req.top_n, include_owned=False,
                                       seed_product_ids=seeds, **scope)
+    except SOURCE_UNAVAILABLE as exc:
+        raise _source_unavailable("copurchase", req.customer_id, exc) from exc
     except Exception as exc:  # noqa: BLE001
         error_id = uuid.uuid4().hex
         log.error("copurchase_failed", customer_id=req.customer_id, error_id=error_id, error=str(exc))
@@ -313,7 +337,11 @@ def recommend_batch(req: BatchRequest) -> dict:
             error_id = uuid.uuid4().hex
             log.error("recommend_batch_item_failed", customer_id=cid, error_id=error_id,
                       error=str(exc))
-            errors.append({"customer_id": cid, "error": f"recommendation_failed (ref {error_id})",
+            label = (
+                f"source_unavailable:{unavailable_reason(exc)}"
+                if isinstance(exc, SOURCE_UNAVAILABLE) else "recommendation_failed"
+            )
+            errors.append({"customer_id": cid, "error": f"{label} (ref {error_id})",
                            "error_id": error_id})
     return {"results": results, "errors": errors, "count": len(results), "failed": len(errors)}
 

@@ -64,10 +64,10 @@ def _get_client() -> redis.Redis | None:
 
 
 def make_key(product: int | str, agreement: str, as_of: str,
-             target_margin_pct: float, with_vat: bool, culture: str) -> str:
+             target_margin_pct: float, culture: str) -> str:
     return (
         f"price:{_model_fingerprint()}:{product}:{agreement.lower()}:{as_of}"
-        f":{target_margin_pct}:{int(with_vat)}:{culture}:{refresh_generation()}"
+        f":{target_margin_pct}:{culture}:{refresh_generation()}"
     )
 
 

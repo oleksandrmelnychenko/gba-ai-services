@@ -53,24 +53,47 @@ def record(producer_id: int, product_id: int, suggested_qty: float, final_qty: f
     return doc
 
 
+def _factors_from(docs, min_samples: int, lo: float, hi: float) -> dict[str, float]:
+    ratios: dict[str, list[float]] = {}
+    for d in docs:
+        sq = float(d.get("suggested_qty") or 0)
+        if sq <= 0:
+            continue
+        abc = d.get("abc") or "C"
+        ratios.setdefault(abc, []).append(max(0.0, float(d.get("final_qty") or 0)) / sq)
+    out: dict[str, float] = {}
+    for abc, vals in ratios.items():
+        if len(vals) >= min_samples:
+            out[abc] = min(max(median(vals), lo), hi)
+    return out
+
+
 def learned_factors(producer_id: int, min_samples: int, lo: float, hi: float) -> dict[str, float]:
     """Per-ABC override factor = clamp(median(final/suggested)) over recent accept/edit/dismiss."""
     coll = _feedback()
     if coll is None:
         return {}
     try:
-        ratios: dict[str, list[float]] = {}
-        for d in coll.find({"producer_id": int(producer_id)}, {"_id": 0}):
-            sq = float(d.get("suggested_qty") or 0)
-            if sq <= 0:
-                continue
-            abc = d.get("abc") or "C"
-            ratios.setdefault(abc, []).append(max(0.0, float(d.get("final_qty") or 0)) / sq)
-        out: dict[str, float] = {}
-        for abc, vals in ratios.items():
-            if len(vals) >= min_samples:
-                out[abc] = min(max(median(vals), lo), hi)
-        return out
+        return _factors_from(
+            coll.find({"producer_id": int(producer_id)}, {"_id": 0}), min_samples, lo, hi
+        )
     except Exception as exc:  # noqa: BLE001
         log.warning("learned_factors_failed", producer_id=producer_id, error=str(exc))
+        return {}
+
+
+def learned_factors_all(min_samples: int, lo: float, hi: float) -> dict[int, dict[str, float]]:
+    coll = _feedback()
+    if coll is None:
+        return {}
+    try:
+        by_producer: dict[int, list[dict]] = {}
+        for d in coll.find({}, {"_id": 0}):
+            by_producer.setdefault(int(d["producer_id"]), []).append(d)
+        return {
+            producer: _factors_from(docs, min_samples, lo, hi)
+            for producer, docs in by_producer.items()
+        }
+    except Exception as exc:  # noqa: BLE001
+        log.warning("learned_factors_failed", producer_id=None, error=str(exc))
         return {}

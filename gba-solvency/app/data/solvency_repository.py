@@ -2,26 +2,44 @@
 
 All SQL is parameterized (:name) — no f-string interpolation. Every query honors the
 discovery data traps:
-  (a) NEVER filter Deleted=0 on Sale/Order/OrderItem (=1 on 100% of rows). Validity comes
-      from OrderItem.IsValidForCurrentSale=1 and SaleReturn.IsCanceled=0.
+  (a) A sale is gba-server's confirmed sale (app.data.source_rules): Sale.Deleted=0, invoiced,
+      not an accounting carrier; lines OrderItem.Deleted=0, IsValidForCurrentSale=1, Qty>0.
+      Open debt is a ClientInDebt/Debt pair, both Deleted=0, with Debt.Total > 0.
   (b) Synthetic 1С debt-entry line (ProductID 25422404) is EXCLUDED from turnover/activity
       but KEPT in debt/exposure (it is real carried debt).
   (c) FX snapshot date is pinned per run (GetExchangedToEuroValue revalues at call time).
   (d) BaseSalePaymentStatus.Amount=0 even when Paid -> use the status ENUM (count-based).
   (e) Multi-currency: EUR-normalize via dbo.GetExchangedToEuroValue.
 
-The window is bounded by Sale.Created in [as_of - window_months, as_of].
+A sale is dated by its invoice instant, Sale.ChangedToInvoice (UTC), as in gba-server's sales
+reports. The turnover window is complete Europe/Kyiv days: [as_of - window_months, as_of),
+passed as UTC instants (app.core.history.sales_window). Ages in days and months compare the
+Europe/Kyiv date of the stored instant with the as-of date.
 """
 from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
 from app.core.config import get_settings
+from app.core.history import sales_window
 from app.data.db import in_clause, query
+from app.data.source_rules import (
+    convertible_currencies,
+    debt_agreement,
+    confirmed_line,
+    confirmed_sale,
+    days_since,
+    local_month,
+    months_since,
+    open_debt,
+    sold_at,
+)
 from app.data.synthetic_product import synthetic_product_ids
 from app.domain.money import as_decimal, round_cent
 
@@ -32,6 +50,8 @@ _SALE_NOTPAID = (0,)         # NotPaid
 _SALE_REFUND = (4,)          # Refund -> EXCLUDED from the discipline ratio
 _SALE_OPEN_UNPAID = (0, 3)   # NotPaid + PartialPaid -> open exposure proxy
 _READINESS_TTL_S = 60.0
+# MSSQL caps a statement at 2,100 parameters; id lists are chunked well below that.
+_ID_CHUNK = 900
 _readiness_lock = threading.Lock()
 _readiness_state: dict[int, tuple[float, dict[str, Any]]] = {}
 
@@ -178,6 +198,82 @@ def has_buyer_role(client_id: int) -> bool:
     return bool(rows)
 
 
+def has_hopeless_debt_role(client_id: int) -> bool:
+    """True when the entity sits in the «Безнадійна заборгованість» client group.
+
+    The group is a 1С master-data verdict: these debtors carry no open-debt rows, sales or
+    payments in the imported history, so every debt feature is empty and the scorecard alone
+    would rate them A. The role is matched by name because role IDs are re-minted by syncs.
+    """
+    rows = query(
+        """
+        SELECT TOP 1 1 AS hit
+        FROM dbo.ClientInRole cir
+        JOIN dbo.ClientTypeRole ctr ON ctr.ID = cir.ClientTypeRoleID
+        WHERE cir.ClientID = :cid
+              AND cir.Deleted = 0
+              AND ctr.Name = :hopeless_role
+        """,
+        {"cid": client_id, "hopeless_role": get_settings().hopeless_debt_role_name},
+    )
+    return bool(rows)
+
+
+@dataclass(frozen=True)
+class ClientGate:
+    is_buyer: bool
+    hopeless_debt: bool
+
+
+def _id_chunks(client_ids: Iterable[int]) -> Iterator[list[int]]:
+    ids = list(dict.fromkeys(int(c) for c in client_ids))
+    for start in range(0, len(ids), _ID_CHUNK):
+        yield ids[start:start + _ID_CHUNK]
+
+
+def client_gates(client_ids: Iterable[int]) -> dict[int, ClientGate]:
+    """Set-based client_exists + has_buyer_role + has_hopeless_debt_role for an id list.
+
+    One statement per chunk of ids instead of three round trips per id. An id that is absent
+    from the result does not exist in dbo.Client; the predicates are the same as the per-client
+    helpers above.
+    """
+    gates: dict[int, ClientGate] = {}
+    hopeless_role = get_settings().hopeless_debt_role_name
+    for chunk in _id_chunks(client_ids):
+        ph, params = in_clause("cid", chunk)
+        rows = query(
+            f"""
+            SELECT c.ID AS client_id,
+                   CASE WHEN EXISTS (
+                       SELECT 1
+                       FROM dbo.ClientInRole cir
+                       JOIN dbo.ClientType ct ON ct.ID = cir.ClientTypeID
+                       WHERE cir.ClientID = c.ID
+                             AND cir.Deleted = 0
+                             AND ct.[Type] = 0
+                   ) THEN 1 ELSE 0 END AS is_buyer,
+                   CASE WHEN EXISTS (
+                       SELECT 1
+                       FROM dbo.ClientInRole cir
+                       JOIN dbo.ClientTypeRole ctr ON ctr.ID = cir.ClientTypeRoleID
+                       WHERE cir.ClientID = c.ID
+                             AND cir.Deleted = 0
+                             AND ctr.Name = :hopeless_role
+                   ) THEN 1 ELSE 0 END AS hopeless_debt
+            FROM dbo.Client c
+            WHERE c.ID IN {ph}
+            """,
+            {"hopeless_role": hopeless_role, **params},
+        )
+        for row in rows:
+            gates[int(row["client_id"])] = ClientGate(
+                is_buyer=bool(row["is_buyer"]),
+                hopeless_debt=bool(row["hopeless_debt"]),
+            )
+    return gates
+
+
 def payment_status_counts(client_id: int, as_of_date: str, window_months: int) -> dict[str, int]:
     """(1) PaymentDiscipline source — count-based over the status ENUM (trap d).
 
@@ -221,17 +317,6 @@ def payment_status_counts(client_id: int, as_of_date: str, window_months: int) -
     return out
 
 
-def retail_payment_status_counts(client_id: int, as_of_date: str,
-                                 window_months: int) -> dict[str, int]:
-    """Retail sales are rows of dbo.Sale carrying RetailClientId; their payment state is the
-    same BaseSalePaymentStatus already aggregated by payment_status_counts. There is no
-    separate dbo.RetailSale table, and RetailPaymentStatus is a payment-image lookup, not a
-    per-sale status. So retail needs no extra counts here — return empty and let the regular
-    Sale path drive the discipline ratio.
-    """
-    return {"paid": 0, "partial": 0, "notpaid": 0}
-
-
 def open_unpaid_stats(client_id: int, as_of_date: str, window_months: int) -> dict[str, Any]:
     """open_unpaid_count / open_unpaid_max_age_days / avg — Sale where payment status IN
     (NotPaid, PartialPaid); age = DATEDIFF(day, Sale.Created, :asof). Anchored on as_of_date so a
@@ -270,51 +355,13 @@ def open_unpaid_stats(client_id: int, as_of_date: str, window_months: int) -> di
     }
 
 
-def open_unpaid_aging_buckets(client_id: int, as_of_date: str,
-                              window_months: int) -> list[dict[str, Any]]:
-    """Aging buckets (0-30 / 31-60 / 61-90 / 90+) for open NotPaid+PartialPaid sales.
-
-    Age anchored on as_of_date (reproduces GETDATE() when :asof is today) so a back-dated run
-    buckets invoices as of that date. Feeds the open_invoice_aging_bars chart. Count-based (trap d).
-    """
-    placeholder, params = in_clause("st", list(_SALE_OPEN_UNPAID))
-    rows = query(
-        f"""
-        SELECT bucket, COUNT(*) AS cnt FROM (
-            SELECT CASE
-                WHEN DATEDIFF(day, s.Created, :asof) <= 30 THEN '0-30'
-                WHEN DATEDIFF(day, s.Created, :asof) <= 60 THEN '31-60'
-                WHEN DATEDIFF(day, s.Created, :asof) <= 90 THEN '61-90'
-                ELSE '90+'
-            END AS bucket
-            FROM dbo.Sale s
-            JOIN dbo.BaseSalePaymentStatus bsps ON bsps.ID = s.BaseSalePaymentStatusID
-            JOIN dbo.ClientAgreement ca ON ca.ID = s.ClientAgreementID
-            WHERE ca.ClientID = :cid
-                  AND s.Created <= :asof
-                  AND s.Created >= DATEADD(month, :neg_months, :asof)
-                  AND s.Created >= :history_start
-                  AND bsps.SalePaymentStatusType IN {placeholder}
-        ) t
-        GROUP BY bucket
-        """,
-        {
-            "cid": client_id,
-            "asof": as_of_date,
-            "neg_months": -window_months,
-            "history_start": _history_start(),
-            **params,
-        },
-    )
-    return [{"bucket": r["bucket"], "count": int(r["cnt"] or 0)} for r in rows]
-
-
 def debt_aging_buckets_truth(client_id: int, as_of_date: str,
                              fx_date: str) -> list[dict[str, Any]]:
     """TRUTH aging buckets (0-30 / 31-60 / 61-90 / 90+) from real overdue debt — the same source
     the model's aging features (app/risk/dataset.feat_debt_aging) and overdue_amount_eur use.
 
-    A debt line is overdue by od = DATEDIFF(day, Debt.Created, :asof) - Agreement.NumberDaysDebt;
+    A debt line is overdue by od = days from the Kyiv date of Debt.Created to :asof -
+    Agreement.NumberDaysDebt;
     only past-grace lines (od > 0) are bucketed (within-grace carried trade credit is not "open
     overdue"). Count is the line count; amount_eur is the EUR-normalized Debt.Total via the pinned
     fx_date (dbo.GetExchangedToEuroValue). Replaces the stale BaseSalePaymentStatus.NotPaid proxy
@@ -322,7 +369,7 @@ def debt_aging_buckets_truth(client_id: int, as_of_date: str,
     debt line counts incl. the synthetic 1С line — it is real carried debt (trap b: kept in debt).
     """
     rows = query(
-        """
+        f"""
         SELECT bucket,
                COUNT(*) AS cnt,
                ISNULL(SUM(e), 0) AS amount_eur
@@ -335,16 +382,15 @@ def debt_aging_buckets_truth(client_id: int, as_of_date: str,
             END AS bucket,
             e
             FROM (
-                SELECT DATEDIFF(day, d.Created, :asof) - a.NumberDaysDebt AS od,
+                SELECT {days_since("d.Created", ":asof")} - a.NumberDaysDebt AS od,
                        CAST(dbo.GetExchangedToEuroValue(
                            d.Total, a.CurrencyID, :fxdate
                        ) AS decimal(38, 6)) AS e
                 FROM dbo.ClientInDebt cid
                 JOIN dbo.Debt d ON d.ID = cid.DebtID
-                JOIN dbo.Agreement a ON a.ID = cid.AgreementID
+                {debt_agreement(":fxdate")}
                 WHERE cid.ClientID = :cid
-                      AND cid.Deleted = 0
-                      AND d.Deleted = 0
+                      AND {open_debt()}
                       AND d.Created <= :asof
             ) g
             WHERE od > 0
@@ -365,53 +411,108 @@ def debt_aging_buckets_truth(client_id: int, as_of_date: str,
 
 def debt_exposure_donut_truth(client_id: int, as_of_date: str, window_months: int,
                               fx_date: str) -> dict[str, Any]:
-    """TRUTH-based discipline donut from settlement reality (Debt/ClientInDebt), replacing the
-    stale BaseSalePaymentStatus.NotPaid split that showed ~93% unpaid for nearly every client.
+    """Discipline donut over one population: the buyer's confirmed sales of the window.
 
-    Slices (count-based, donut shape preserved): the buyer's window sales partition into
-      - settled : sales NOT carrying an open debt line (paid / fully settled) -> the good side.
-      - current : open debt lines still within the agreement grace (carried trade credit).
-      - overdue : open debt lines past grace (od > 0) -> the genuine delinquency exposure.
-    settled = max(total_window_sales - open_debt_lines, 0). For a fully-settled client (no debt
-    rows) this is ~100% settled; for a debtor the overdue slice carries the real exposure. EUR
-    sums (current/overdue) are returned alongside for the amount-aware view (trap e: EUR via the
-    pinned fx_date). All debt lines count incl. the synthetic 1С line (real carried debt, trap b).
+    Each sale is settled (no open debt line), current (open line within the agreement grace)
+    or overdue (an open line past grace), so the three slices add up to the window's sales.
+    Open lines whose sale lies outside the window (older invoices, opening balances) are not
+    part of that population; they are counted in outside_window_lines and stay in the aging
+    bars and the exposure line.
     """
-    total = total_sales_count(client_id, as_of_date, window_months)
+    window = sales_window(as_of_date, window_months)
+    params = {"cid": client_id, "asof": as_of_date, "fxdate": fx_date, **window.params()}
     rows = query(
-        """
+        f"""
         SELECT
-            SUM(CASE WHEN od <= 0 THEN 1 ELSE 0 END) AS current_lines,
-            SUM(CASE WHEN od >  0 THEN 1 ELSE 0 END) AS overdue_lines,
-            ISNULL(SUM(CASE WHEN od <= 0 THEN e ELSE 0 END), 0) AS current_eur,
-            ISNULL(SUM(CASE WHEN od >  0 THEN e ELSE 0 END), 0) AS overdue_eur
-        FROM (
-            SELECT DATEDIFF(day, d.Created, :asof) - a.NumberDaysDebt AS od,
-                   CAST(dbo.GetExchangedToEuroValue(
+            SUM(CASE WHEN line.lines = 0 THEN 1 ELSE 0 END) AS settled,
+            SUM(CASE WHEN line.lines > 0 AND ISNULL(line.od, 0) <= 0 THEN 1 ELSE 0 END)
+                AS current_sales,
+            SUM(CASE WHEN line.od > 0 THEN 1 ELSE 0 END) AS overdue_sales,
+            ISNULL(SUM(CASE WHEN line.lines > 0 AND ISNULL(line.od, 0) <= 0 THEN line.e END), 0)
+                AS current_eur,
+            ISNULL(SUM(CASE WHEN line.od > 0 THEN line.e END), 0) AS overdue_eur,
+            ISNULL(SUM(line.lines), 0) AS window_lines
+        FROM dbo.Sale s
+        JOIN dbo.ClientAgreement ca ON ca.ID = s.ClientAgreementID
+        CROSS APPLY (
+            SELECT COUNT(*) AS lines,
+                   MAX({days_since("d.Created", ":asof")} - a.NumberDaysDebt) AS od,
+                   SUM(CAST(dbo.GetExchangedToEuroValue(
                        d.Total, a.CurrencyID, :fxdate
-                   ) AS decimal(38, 6)) AS e
+                   ) AS decimal(38, 6))) AS e
             FROM dbo.ClientInDebt cid
             JOIN dbo.Debt d ON d.ID = cid.DebtID
-            JOIN dbo.Agreement a ON a.ID = cid.AgreementID
-            WHERE cid.ClientID = :cid
-                  AND cid.Deleted = 0
-                  AND d.Deleted = 0
+            {debt_agreement(":fxdate")}
+            WHERE cid.SaleID = s.ID
+                  AND cid.ClientID = :cid
+                  AND {open_debt()}
                   AND d.Created <= :asof
-        ) t
+        ) line
+        WHERE ca.ClientID = :cid
+              AND {confirmed_sale()}
+              AND {sold_at()} >= :history_start
+              AND {sold_at()} >= :window_start
+              AND {sold_at()} < :window_end
+        """,
+        params,
+    )
+    open_lines = query(
+        f"""
+        SELECT COUNT(*) AS lines
+        FROM dbo.ClientInDebt cid
+        JOIN dbo.Debt d ON d.ID = cid.DebtID
+        {debt_agreement(":fxdate")}
+        WHERE cid.ClientID = :cid
+              AND {open_debt()}
+              AND d.Created <= :asof
         """,
         {"cid": client_id, "asof": as_of_date, "fxdate": fx_date},
     )
     r = rows[0] if rows else {}
-    current_lines = int(r.get("current_lines") or 0)
-    overdue_lines = int(r.get("overdue_lines") or 0)
-    settled = max(total - current_lines - overdue_lines, 0)
+    all_lines = int(open_lines[0]["lines"] or 0) if open_lines else 0
     return {
-        "settled": settled,
-        "current": current_lines,
-        "overdue": overdue_lines,
+        "settled": int(r.get("settled") or 0),
+        "current": int(r.get("current_sales") or 0),
+        "overdue": int(r.get("overdue_sales") or 0),
         "current_eur": round_cent(r.get("current_eur") or Decimal(0)),
         "overdue_eur": round_cent(r.get("overdue_eur") or Decimal(0)),
+        "outside_window_lines": max(all_lines - int(r.get("window_lines") or 0), 0),
     }
+
+
+def unconverted_debt(client_ids: Iterable[int], as_of_date: str,
+                     fx_date: str) -> dict[int, list[dict[str, Any]]]:
+    """Open debt lines no EUR sum contains: their agreement currency has no rate on fx_date."""
+    out: dict[int, list[dict[str, Any]]] = {}
+    for chunk in _id_chunks(client_ids):
+        placeholder, params = in_clause("uc", chunk)
+        for r in query(
+            f"""
+            SELECT cid.ClientID AS client_id, a.CurrencyID AS currency_id,
+                   currency.Code AS currency, COUNT(*) AS lines, SUM(d.Total) AS amount
+            FROM dbo.ClientInDebt cid
+            JOIN dbo.Debt d ON d.ID = cid.DebtID
+            JOIN dbo.Agreement a ON a.ID = cid.AgreementID
+            LEFT JOIN dbo.Currency currency ON currency.ID = a.CurrencyID
+            WHERE cid.ClientID IN {placeholder}
+                  AND {open_debt()}
+                  AND d.Created <= :asof
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {convertible_currencies(":fxdate")} fx
+                      WHERE fx.ID = a.CurrencyID
+                  )
+            GROUP BY cid.ClientID, a.CurrencyID, currency.Code
+            ORDER BY cid.ClientID, a.CurrencyID
+            """,
+            {"asof": as_of_date, "fxdate": fx_date, **params},
+        ):
+            out.setdefault(int(r["client_id"]), []).append({
+                "currency_id": None if r["currency_id"] is None else int(r["currency_id"]),
+                "currency": r["currency"],
+                "lines": int(r["lines"]),
+                "amount": round_cent(r["amount"] or Decimal(0)),
+            })
+    return out
 
 
 def total_sales_count(client_id: int, as_of_date: str, window_months: int) -> int:
@@ -422,58 +523,58 @@ def total_sales_count(client_id: int, as_of_date: str, window_months: int) -> in
         FROM dbo.Sale s
         JOIN dbo.ClientAgreement ca ON ca.ID = s.ClientAgreementID
         WHERE ca.ClientID = :cid
-              AND s.Created <= :asof
-              AND s.Created >= DATEADD(month, :neg_months, :asof)
+              AND s.Deleted = 0
+              AND s.Created < :window_end
+              AND s.Created >= :window_start
               AND s.Created >= :history_start
         """,
-        {
-            "cid": client_id,
-            "asof": as_of_date,
-            "neg_months": -window_months,
-            "history_start": _history_start(),
-        },
+        {"cid": client_id, **sales_window(as_of_date, window_months).params()},
     )
     return int(rows[0]["n"]) if rows else 0
 
 
-def credit_limit_utilization(client_id: int) -> list[dict[str, Any]]:
-    """credit_limit / term_days / current_balance / limit_utilization per controlled agreement.
+def limit_utilization_basis(client_id: int, as_of_date: str) -> list[dict[str, Any]]:
+    """Open debt against the credit limit, per amount-controlled agreement with a limit.
 
-    Agreement.AmountDebt (gate IsControlAmountDebt=1), Agreement.NumberDaysDebt (gate
-    IsControlNumberDaysDebt=1). current_balance = ClientAgreement.CurrentAmount.
-    limit_utilization = CurrentAmount / AmountDebt. Returns one row per agreement so the engine
-    can apply the credit-policy caps and render the utilization gauge.
+    Mirrors gba-server's sale-time limit check: Agreement.AmountDebt is in the agreement
+    currency and is compared with the client's positive open debt (Debt.Total) on that
+    agreement and on every other agreement of the same currency. No conversion is involved.
+    Returns no rows when the client has no live agreement with IsControlAmountDebt=1 and
+    AmountDebt > 0 — the caller reports that as "no limit", never as 0%.
     """
     rows = query(
-        """
-        SELECT
-            a.ID AS agreement_id,
-            a.IsControlAmountDebt AS is_control_amount,
-            a.AmountDebt AS amount_debt,
-            a.IsControlNumberDaysDebt AS is_control_days,
-            a.NumberDaysDebt AS number_days_debt,
-            a.CurrencyID AS currency_id,
-            ca.CurrentAmount AS current_amount,
-            CASE WHEN a.IsControlAmountDebt = 1 AND a.AmountDebt > 0
-                 THEN ca.CurrentAmount * 1.0 / a.AmountDebt END AS limit_utilization
+        f"""
+        SELECT a.ID AS agreement_id,
+               a.CurrencyID AS currency_id,
+               a.AmountDebt AS limit_amount,
+               ISNULL(debt.amount, 0) AS debt_amount
         FROM dbo.ClientAgreement ca
         JOIN dbo.Agreement a ON a.ID = ca.AgreementID
+        OUTER APPLY (
+            SELECT SUM(d.Total) AS amount
+            FROM dbo.ClientInDebt cid
+            JOIN dbo.Debt d ON d.ID = cid.DebtID
+            JOIN dbo.Agreement da ON da.ID = cid.AgreementID
+            WHERE cid.ClientID = ca.ClientID
+                  AND {open_debt()}
+                  AND d.Created <= :asof
+                  AND (da.ID = a.ID OR da.CurrencyID = a.CurrencyID)
+        ) debt
         WHERE ca.ClientID = :cid
+              AND ca.Deleted = 0
+              AND a.Deleted = 0
+              AND a.IsControlAmountDebt = 1
+              AND a.AmountDebt > 0
+        ORDER BY a.ID
         """,
-        {"cid": client_id},
+        {"cid": client_id, "asof": as_of_date},
     )
     return [
         {
             "agreement_id": int(r["agreement_id"]),
-            "is_control_amount": bool(r["is_control_amount"]),
-            "amount_debt": float(r["amount_debt"] or 0.0),
-            "is_control_days": bool(r["is_control_days"]),
-            "number_days_debt": int(r["number_days_debt"] or 0),
             "currency_id": int(r["currency_id"]) if r["currency_id"] is not None else None,
-            "current_amount": float(r["current_amount"] or 0.0),
-            "limit_utilization": (
-                float(r["limit_utilization"]) if r["limit_utilization"] is not None else None
-            ),
+            "limit_amount": as_decimal(r["limit_amount"]),
+            "debt_amount": as_decimal(r["debt_amount"]),
         }
         for r in rows
     ]
@@ -503,15 +604,15 @@ def turnover_eur(client_id: int, as_of_date: str, window_months: int,
         JOIN dbo.ClientAgreement ca ON ca.ID = s.ClientAgreementID
         JOIN dbo.Agreement a ON a.ID = ca.AgreementID
         WHERE ca.ClientID = :cid
-              AND oi.IsValidForCurrentSale = 1
+              AND {confirmed_sale()}
+              AND {confirmed_line()}
               AND oi.ProductID NOT IN {ph}
-              AND s.Created >= :history_start
-              AND s.Created <= :asof
-              AND s.Created >= DATEADD(month, :neg_months, :asof)
+              AND {sold_at()} >= :history_start
+              AND {sold_at()} >= :window_start
+              AND {sold_at()} < :window_end
         """,
         {
-            "cid": client_id, "asof": as_of_date, "neg_months": -window_months,
-            "fxdate": fx_date, "history_start": _history_start(), **syn,
+            "cid": client_id, **sales_window(as_of_date, window_months).params(), **syn,
         },
     )
     return float(round_cent(rows[0]["turnover"])) if rows else 0.0
@@ -534,16 +635,17 @@ def turnover_eur_by_currency(client_id: int, as_of_date: str, window_months: int
         JOIN dbo.ClientAgreement ca ON ca.ID = s.ClientAgreementID
         JOIN dbo.Agreement a ON a.ID = ca.AgreementID
         WHERE ca.ClientID = :cid
-              AND oi.IsValidForCurrentSale = 1
+              AND {confirmed_sale()}
+              AND {confirmed_line()}
               AND oi.ProductID NOT IN {ph}
-              AND s.Created >= :history_start
-              AND s.Created <= :asof
-              AND s.Created >= DATEADD(month, :neg_months, :asof)
+              AND {sold_at()} >= :history_start
+              AND {sold_at()} >= :window_start
+              AND {sold_at()} < :window_end
         GROUP BY a.CurrencyID
+        ORDER BY a.CurrencyID
         """,
         {
-            "cid": client_id, "asof": as_of_date, "neg_months": -window_months,
-            "fxdate": fx_date, "history_start": _history_start(), **syn,
+            "cid": client_id, **sales_window(as_of_date, window_months).params(), **syn,
         },
     )
     return [
@@ -555,12 +657,62 @@ def turnover_eur_by_currency(client_id: int, as_of_date: str, window_months: int
     ]
 
 
+def turnover_eur_by_currency_many(
+    client_ids: Iterable[int], as_of_date: str, window_months: int, fx_date: str
+) -> dict[int, list[dict[str, Any]]]:
+    """turnover_eur_by_currency for an id list: same filters, grouped by client and currency.
+
+    Returns {client_id: rows} for every requested id (an empty list when the client has no
+    sales in the window), each list ordered by currency like the per-client query.
+    """
+    ph_syn, syn = _synthetic_not_in()
+    out: dict[int, list[dict[str, Any]]] = {}
+    for chunk in _id_chunks(client_ids):
+        out.update({cid: [] for cid in chunk})
+        ph, params = in_clause("cid", chunk)
+        rows = query(
+            f"""
+            SELECT ca.ClientID AS client_id,
+                   a.CurrencyID AS currency_id,
+                   ISNULL(SUM(
+                       CAST(oi.Qty AS decimal(19, 6))
+                       * CAST(oi.PricePerItem AS decimal(19, 6))
+                   ), 0) AS turnover_eur
+            FROM dbo.Sale s
+            JOIN dbo.[Order] o ON o.ID = s.OrderID
+            JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
+            JOIN dbo.ClientAgreement ca ON ca.ID = s.ClientAgreementID
+            JOIN dbo.Agreement a ON a.ID = ca.AgreementID
+            WHERE ca.ClientID IN {ph}
+                  AND {confirmed_sale()}
+                  AND {confirmed_line()}
+                  AND oi.ProductID NOT IN {ph_syn}
+                  AND {sold_at()} >= :history_start
+                  AND {sold_at()} >= :window_start
+                  AND {sold_at()} < :window_end
+            GROUP BY ca.ClientID, a.CurrencyID
+            ORDER BY ca.ClientID, a.CurrencyID
+            """,
+            {**sales_window(as_of_date, window_months).params(), **params, **syn},
+        )
+        for r in rows:
+            out[int(r["client_id"])].append(
+                {
+                    "currency_id": (
+                        int(r["currency_id"]) if r["currency_id"] is not None else None
+                    ),
+                    "turnover_eur": round_cent(r["turnover_eur"] or Decimal(0)),
+                }
+            )
+    return out
+
+
 def activity_stats(client_id: int, as_of_date: str, window_months: int) -> dict[str, Any]:
     """order_count / tenure_months / recency_days, over REAL sales only.
 
     order_count = COUNT(DISTINCT Sale.ID) in window.
-    tenure_months = DATEDIFF(month, MIN(Sale.Created), as_of) over all available history from
-    SOURCE_HISTORY_START_DATE. recency_days uses the same bounded available history.
+    tenure_months = months from the Kyiv date of the first invoice to as_of over all available
+    history from SOURCE_HISTORY_START_DATE. recency_days uses the same bounded available history.
 
     A Sale only counts if it carries a real, valid, non-synthetic line — i.e. EXISTS a
     OrderItem with IsValidForCurrentSale=1 and ProductID not in the synthetic-1С set. Without
@@ -575,34 +727,35 @@ def activity_stats(client_id: int, as_of_date: str, window_months: int) -> dict[
              FROM dbo.Sale s2
              JOIN dbo.ClientAgreement ca2 ON ca2.ID = s2.ClientAgreementID
              WHERE ca2.ClientID = :cid
-                   AND s2.Created <= :asof
-                   AND s2.Created >= DATEADD(month, :neg_months, :asof)
-                   AND s2.Created >= :history_start
+                   AND {confirmed_sale("s2")}
+                   AND {sold_at("s2")} >= :history_start
+                   AND {sold_at("s2")} >= :window_start
+                   AND {sold_at("s2")} < :window_end
                    AND EXISTS (
                        SELECT 1 FROM dbo.OrderItem oi2
                        WHERE oi2.OrderID = s2.OrderID
                              AND oi2.ProductID NOT IN {ph}
-                             AND oi2.IsValidForCurrentSale = 1
+                             AND {confirmed_line("oi2")}
                    )) AS order_count,
-            DATEDIFF(month, MIN(s.Created), :asof) AS tenure_months,
-            DATEDIFF(day, MAX(s.Created), :asof) AS recency_days
+            {months_since(f"MIN({sold_at()})", ":asof")} AS tenure_months,
+            {days_since(f"MAX({sold_at()})", ":asof")} AS recency_days
         FROM dbo.Sale s
         JOIN dbo.ClientAgreement ca ON ca.ID = s.ClientAgreementID
         WHERE ca.ClientID = :cid
-              AND s.Created >= :history_start
-              AND s.Created <= :asof
+              AND {confirmed_sale()}
+              AND {sold_at()} >= :history_start
+              AND {sold_at()} < :window_end
               AND EXISTS (
                   SELECT 1 FROM dbo.OrderItem oi
                   WHERE oi.OrderID = s.OrderID
                         AND oi.ProductID NOT IN {ph}
-                        AND oi.IsValidForCurrentSale = 1
+                        AND {confirmed_line()}
               )
         """,
         {
             "cid": client_id,
             "asof": as_of_date,
-            "neg_months": -window_months,
-            "history_start": _history_start(),
+            **sales_window(as_of_date, window_months).params(),
             **syn,
         },
     )
@@ -639,8 +792,8 @@ def return_qty_rate(client_id: int, as_of_date: str, window_months: int) -> floa
                       AND oi.ProductID IS NOT NULL
                       AND oi.ProductID NOT IN {ph}
                       AND sr.ClientID = :cid
-                      AND sr.FromDate <= :asof
-                      AND sr.FromDate >= DATEADD(month, :neg_months, :asof)
+                      AND sr.FromDate < :window_end
+                      AND sr.FromDate >= :window_start
                       AND sr.FromDate >= :history_start
                 GROUP BY sri.SaleReturnID, sri.OrderItemID
              ) line) AS return_qty,
@@ -650,19 +803,14 @@ def return_qty_rate(client_id: int, as_of_date: str, window_months: int) -> floa
              JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
              JOIN dbo.ClientAgreement ca3 ON ca3.ID = s3.ClientAgreementID
              WHERE ca3.ClientID = :cid
-                   AND oi.IsValidForCurrentSale = 1
+                   AND {confirmed_sale("s3")}
+                   AND {confirmed_line()}
                    AND oi.ProductID NOT IN {ph}
-                   AND s3.Created <= :asof
-                   AND s3.Created >= DATEADD(month, :neg_months, :asof)
-                   AND s3.Created >= :history_start) AS sold_qty
+                   AND {sold_at("s3")} < :window_end
+                   AND {sold_at("s3")} >= :window_start
+                   AND {sold_at("s3")} >= :history_start) AS sold_qty
         """,
-        {
-            "cid": client_id,
-            "asof": as_of_date,
-            "neg_months": -window_months,
-            "history_start": _history_start(),
-            **syn,
-        },
+        {"cid": client_id, **sales_window(as_of_date, window_months).params(), **syn},
     )
     if not rows:
         return 0.0
@@ -670,15 +818,6 @@ def return_qty_rate(client_id: int, as_of_date: str, window_months: int) -> floa
     if sold <= 0:
         return 0.0
     return float(rows[0]["return_qty"] or 0.0) / sold
-
-
-def client_flags(client_id: int) -> dict[str, Any]:
-    """Client.IsBlocked — drives the blocked-half cap."""
-    rows = query(
-        "SELECT IsBlocked FROM dbo.Client WHERE ID = :cid",
-        {"cid": client_id},
-    )
-    return {"is_blocked": bool(rows[0]["IsBlocked"]) if rows else False}
 
 
 def debt_sync_is_live() -> bool:
@@ -775,14 +914,14 @@ def overdue_amount_eur(client_id: int, as_of_date: str, fx_date: str) -> float:
     """overdue_amount (Debt-live path): SUM(Debt.Total -> EUR) for debts older than the
     agreement grace (Agreement.NumberDaysDebt), evaluated as of as_of_date.
 
-    ClientInDebt(Deleted=0) JOIN Debt(Deleted=0) JOIN Agreement; lateness =
-    DATEDIFF(day, Debt.Created, :asof) > Agreement.NumberDaysDebt, and only debts created on or
+    ClientInDebt(Deleted=0) JOIN Debt(Deleted=0) JOIN Agreement; lateness = days from the Kyiv
+    date of Debt.Created to :asof > Agreement.NumberDaysDebt, and only debts created on or
     before :asof count (no future debt leaks into a back-dated valuation). EUR via the pinned
     fx_date. When :asof is today this reproduces the GETUTCDATE() behavior. Only meaningful when
     debt_sync_is_live() is True.
     """
     rows = query(
-        """
+        f"""
         SELECT ISNULL(SUM(
             CAST(dbo.GetExchangedToEuroValue(
                 d.Total, a.CurrencyID, :fxdate
@@ -790,12 +929,11 @@ def overdue_amount_eur(client_id: int, as_of_date: str, fx_date: str) -> float:
         ), 0) AS overdue
         FROM dbo.ClientInDebt cid
         JOIN dbo.Debt d ON d.ID = cid.DebtID
-        JOIN dbo.Agreement a ON a.ID = cid.AgreementID
+        {debt_agreement(":fxdate")}
         WHERE cid.ClientID = :cid
-              AND cid.Deleted = 0
-              AND d.Deleted = 0
+              AND {open_debt()}
               AND d.Created <= :asof
-              AND DATEDIFF(day, d.Created, :asof) > a.NumberDaysDebt
+              AND {days_since("d.Created", ":asof")} > a.NumberDaysDebt
         """,
         {"cid": client_id, "asof": as_of_date, "fxdate": fx_date},
     )
@@ -804,11 +942,18 @@ def overdue_amount_eur(client_id: int, as_of_date: str, fx_date: str) -> float:
 
 def monthly_turnover_series(client_id: int, as_of_date: str, window_months: int,
                             fx_date: str) -> list[dict[str, Any]]:
-    """Per-month turnover (EUR) for the turnover_trend / turnover_vs_exposure charts."""
+    """Per-month turnover (EUR) for the turnover_trend / turnover_vs_exposure charts.
+
+    Months are Europe/Kyiv calendar months of confirmed sales by invoice date. The series
+    starts at the first Kyiv month start inside the window, so it never opens with a partial
+    month; the last point is the month of the previous Kyiv day, to date. Every month in
+    between is present: a month without sales is an explicit zero.
+    """
     ph, syn = _synthetic_not_in()
+    window = sales_window(as_of_date, window_months)
     rows = query(
         f"""
-        SELECT FORMAT(s.Created, 'yyyy-MM') AS period,
+        SELECT {local_month(sold_at())} AS period,
                ISNULL(SUM(
                    CAST(oi.Qty AS decimal(19, 6))
                    * CAST(oi.PricePerItem AS decimal(19, 6))
@@ -819,23 +964,22 @@ def monthly_turnover_series(client_id: int, as_of_date: str, window_months: int,
         JOIN dbo.ClientAgreement ca ON ca.ID = s.ClientAgreementID
         JOIN dbo.Agreement a ON a.ID = ca.AgreementID
         WHERE ca.ClientID = :cid
-              AND oi.IsValidForCurrentSale = 1
+              AND {confirmed_sale()}
+              AND {confirmed_line()}
               AND oi.ProductID NOT IN {ph}
-              AND s.Created >= :history_start
-              AND s.Created <= :asof
-              AND s.Created >= DATEADD(month, :neg_months, :asof)
-        GROUP BY FORMAT(s.Created, 'yyyy-MM')
+              AND {sold_at()} >= :history_start
+              AND {sold_at()} >= :window_start
+              AND {sold_at()} < :window_end
+        GROUP BY {local_month(sold_at())}
         ORDER BY period
         """,
-        {
-            "cid": client_id, "asof": as_of_date, "neg_months": -window_months,
-            "fxdate": fx_date, "history_start": _history_start(), **syn,
-        },
+        {"cid": client_id, **window.params(), "window_start": window.series_start, **syn},
     )
+    by_period = {r["period"]: r["turnover_eur"] for r in rows}
     return [
         {
-            "period": r["period"],
-            "turnover_eur": round_cent(r["turnover_eur"] or Decimal(0)),
+            "period": period,
+            "turnover_eur": round_cent(by_period.get(period) or Decimal(0)),
         }
-        for r in rows
+        for period in window.periods
     ]

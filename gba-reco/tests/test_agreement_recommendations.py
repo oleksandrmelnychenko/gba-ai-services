@@ -1,7 +1,6 @@
 """Agreement isolation across calculation, API, cache warming and retry behavior."""
 
 from datetime import datetime
-from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -10,7 +9,6 @@ from app.api.main import app
 from app.core.config import get_settings
 from app.data import cache
 from app.data import sales_repository as repo
-from app.services import scheduler
 from app.services.recommendations import copurchase, live_remap, service, worker
 
 A = "8a375ce0-47fe-4804-b1e6-a7c8787dd880"
@@ -25,6 +23,8 @@ def scoped_data(monkeypatch):
     monkeypatch.setattr(repo, "count_orders_before", lambda *args, **kw: 5)
     monkeypatch.setattr(repo, "ubiquitous_product_ids", lambda *args: frozenset())
     monkeypatch.setattr(cache, "get_negatives", lambda *args: frozenset())
+    monkeypatch.setattr(repo, "open_order_product_ids", lambda *args: frozenset())
+    monkeypatch.setattr(repo, "sibling_articles", lambda: {})
     monkeypatch.setattr(repo, "product_groups", lambda ids: {})
     monkeypatch.setattr(live_remap, "remap_recs_to_live", lambda recs: recs)
     histories = {A: {101: 4}, B: {202: 9}, None: {101: 4, 202: 9}}
@@ -93,17 +93,15 @@ def test_foreign_or_inactive_agreement_fails_even_if_customer_exists(scoped_data
     assert response.json() == {"detail": {"code": "client_agreement_unavailable"}}
 
 
-def test_copurchase_uses_selected_agreement_history_and_ownership(scoped_data, monkeypatch):
+def test_copurchase_never_offers_what_the_client_bought_under_any_agreement(scoped_data, monkeypatch):
     monkeypatch.setattr(
         copurchase, "_cooccurring_products", lambda *args, **kw: {101: 0.8, 202: 0.7, 303: 0.6}
     )
     results = [
         copurchase.recommend(7, AS_OF, include_owned=False, client_agreement_net_id=uid) for uid in (A, B)
     ]
-    assert 101 not in {r.product_id for r in results[0].recommendations}
-    assert 202 in {r.product_id for r in results[0].recommendations}
-    assert 202 not in {r.product_id for r in results[1].recommendations}
-    assert 101 in {r.product_id for r in results[1].recommendations}
+    for result in results:
+        assert {r.product_id for r in result.recommendations} == {303}
     assert [r.client_agreement_net_id for r in results] == [A, B]
 
 
@@ -111,7 +109,7 @@ def test_worker_warms_each_agreement_and_legacy_scope(scoped_data, monkeypatch):
     monkeypatch.setattr(worker, "active_clients", lambda *args: [7])
     monkeypatch.setattr(worker, "_check_identity_churn", lambda *args: None)
     monkeypatch.setattr(copurchase, "_cooccurring_products", lambda *args, **kw: {})
-    result = worker.run(AS_OF, top_n=1, include_discovery=False)
+    result = worker.run(AS_OF, top_n=1, include_discovery=False, engine="legacy")
     assert result["agreements"] == 2
     assert result["contexts"] == result["ok"] == result["copurchase_ok"] == 3
     assert result["failed"] == result["copurchase_failed"] == 0
@@ -119,20 +117,6 @@ def test_worker_warms_each_agreement_and_legacy_scope(scoped_data, monkeypatch):
     for uid in (None, A, B):
         assert cache.make_key(7, AS_OF, 1, False, client_agreement_net_id=uid) in entries
         assert cache.make_copurchase_key(7, AS_OF, 1, client_agreement_net_id=uid) in entries
-
-
-@pytest.mark.parametrize("failed,cop_failed", [(1, 0), (0, 1)])
-def test_partial_warm_failure_schedules_retry(monkeypatch, failed, cop_failed):
-    from zoneinfo import ZoneInfo
-
-    jobs = []
-    fake = SimpleNamespace(timezone=ZoneInfo("Europe/Kyiv"), add_job=lambda *args, **kw: jobs.append(kw))
-    monkeypatch.setattr(
-        worker, "run", lambda: {"clients": 3, "ok": 2, "failed": failed, "copurchase_failed": cop_failed}
-    )
-    scheduler._job(fake)
-    assert len(jobs) == 1
-    assert jobs[0]["id"] == "daily_warm_retry"
 
 
 def test_contract_key_isolation_and_case_normalization():
@@ -148,7 +132,7 @@ def test_worker_does_not_count_failed_cache_writes_as_updates(scoped_data, monke
     monkeypatch.setattr(worker, "_check_identity_churn", lambda *args: None)
     monkeypatch.setattr(copurchase, "_cooccurring_products", lambda *args, **kw: {})
     monkeypatch.setattr(cache, "set", lambda *args, **kw: False)
-    result = worker.run(AS_OF, top_n=1, include_discovery=False)
+    result = worker.run(AS_OF, top_n=1, include_discovery=False, engine="legacy")
     assert result["ok"] == result["copurchase_ok"] == 0
     assert result["failed"] == result["copurchase_failed"] == 3
 
@@ -164,15 +148,24 @@ def test_parallel_worker_resumes_only_unwritten_scope(scoped_data, monkeypatch):
     monkeypatch.setattr(worker, "active_clients", lambda *args: [7])
     monkeypatch.setattr(worker, "_check_identity_churn", lambda *args: None)
     monkeypatch.setattr(copurchase, "_cooccurring_products", lambda *args, **kw: {})
-    result = worker.run(AS_OF, top_n=1, include_discovery=False, workers=4, refresh_token="cycle-1")
+    result = worker.run(
+        AS_OF, top_n=1, include_discovery=False, workers=4, refresh_token="cycle-1", engine="legacy"
+    )
     assert result["ok"] == result["copurchase_ok"] == 3
     missing = cache.make_copurchase_key(7, AS_OF, 1, client_agreement_net_id=B)
     entries.pop(missing)
     calls = []
     original = copurchase.recommend
-    monkeypatch.setattr(copurchase, "recommend", lambda *a, **kw: calls.append(kw.get("client_agreement_net_id")) or original(*a, **kw))
-    monkeypatch.setattr(service, "get_recommendations", lambda *a, **kw: pytest.fail("completed context recalculated"))
-    result = worker.run(AS_OF, top_n=1, include_discovery=False, workers=4, refresh_token="cycle-1")
+    monkeypatch.setattr(
+        copurchase, "recommend",
+        lambda *a, **kw: calls.append(kw.get("client_agreement_net_id")) or original(*a, **kw),
+    )
+    monkeypatch.setattr(
+        service, "get_recommendations", lambda *a, **kw: pytest.fail("completed context recalculated")
+    )
+    result = worker.run(
+        AS_OF, top_n=1, include_discovery=False, workers=4, refresh_token="cycle-1", engine="legacy"
+    )
     assert result["failed"] == result["copurchase_failed"] == 0
     assert calls == [B]
     assert entries[missing]["_fleet_refresh"] == "cycle-1"

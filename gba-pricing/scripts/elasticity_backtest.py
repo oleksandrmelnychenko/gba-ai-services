@@ -22,7 +22,9 @@ Usage:
                                                   [max_skus] [band=AB|A]
 Defaults: as_of=2026-01-01 pre_months=9 post_months=5 max_skus=400 band=AB
 Reads the dev DB via the service read-only creds (.env). Read-only; no live service touched.
-Every pre/post query is hard-clamped to SOURCE_HISTORY_START_DATE; a pre-floor as_of exits with
+Sales are counted exactly as in serving: the repository's confirmed-sale and kept-line predicates
+windowed on the invoice instant at Kyiv day boundaries, with the pre panel read through
+repo.product_panel. Every pre/post query is hard-clamped to SOURCE_HISTORY_START_DATE; a pre-floor as_of exits with
 code 2, and the JSON report carries the same source/effective/completeness lineage as serving.
 """
 from __future__ import annotations
@@ -35,45 +37,32 @@ import numpy as np
 
 from app.core.config import get_settings
 from app.core.history import history_metadata, trailing_month_history_window
+from app.data import pricing_repository as repo
 from app.data.db import query
 from app.services.pricing import elasticity as el
 
 
-def _history_query_params(as_of: str, months: int) -> dict[str, str | int]:
-    settings = get_settings()
-    window = trailing_month_history_window(
-        as_of,
-        months,
-        settings.source_history_start_date,
-    )
-    return {
-        "asof": window.as_of.isoformat(),
-        "neg": -months,
-        "source_history_start": window.source_history_start.isoformat(),
-    }
-
-
 def _estimable_products(as_of: str, pre_months: int, min_lines: int, max_skus: int) -> list[int]:
-    history_params = _history_query_params(as_of, pre_months)
+    window = repo.behavioral_history_window(as_of, pre_months)
     rows = query(
-        """
+        f"""
         SELECT TOP (:max_skus) oi.ProductID AS pid, COUNT(*) AS n_lines
         FROM dbo.OrderItem oi
         JOIN dbo.[Order] o ON o.ID = oi.OrderID
         JOIN dbo.Sale s ON s.OrderID = o.ID
-        WHERE oi.IsValidForCurrentSale = 1
-              AND oi.ProductID <> 25422404
+        WHERE {repo.CONFIRMED_SALE}
+              AND {repo.KEPT_LINE}
+              AND oi.ProductID <> :synthetic
               AND oi.PricePerItem > 0
-              AND oi.Qty > 0
-              AND s.Created < :asof
-              AND s.Created >= DATEADD(month, :neg, :asof)
-              AND s.Created >= :source_history_start
+              AND {repo.SALE_WINDOW}
         GROUP BY oi.ProductID
         HAVING COUNT(*) >= :min_lines
         ORDER BY COUNT(*) DESC
         """,
         {
-            **history_params,
+            "window_from": repo.utc_instant(window.effective_start),
+            "window_to": repo.utc_instant(window.as_of),
+            "synthetic": repo.synthetic_product_id(),
             "min_lines": min_lines,
             "max_skus": max_skus,
         },
@@ -82,50 +71,34 @@ def _estimable_products(as_of: str, pre_months: int, min_lines: int, max_skus: i
 
 
 def _pre_panel(pid: int, as_of: str, pre_months: int) -> list[el.PanelCell]:
-    history_params = _history_query_params(as_of, pre_months)
-    rows = query(
-        """
-        SELECT o.ClientAgreementID AS agreement_id,
-               FORMAT(s.Created, 'yyyy-MM') AS month,
-               SUM(oi.Qty) AS qty,
-               SUM(oi.Qty * oi.PricePerItem) / NULLIF(SUM(oi.Qty), 0) AS price
-        FROM dbo.OrderItem oi
-        JOIN dbo.[Order] o ON o.ID = oi.OrderID
-        JOIN dbo.Sale s ON s.OrderID = o.ID
-        WHERE oi.ProductID = :pid AND oi.IsValidForCurrentSale = 1
-              AND oi.ProductID <> 25422404 AND oi.PricePerItem > 0 AND oi.Qty > 0
-              AND s.Created < :asof AND s.Created >= DATEADD(month, :neg, :asof)
-              AND s.Created >= :source_history_start
-        GROUP BY o.ClientAgreementID, FORMAT(s.Created, 'yyyy-MM')
-        """,
-        {"pid": pid, **history_params},
-    )
     return [
         el.PanelCell(int(r["agreement_id"]), str(r["month"]), float(r["qty"]), float(r["price"]))
-        for r in rows
+        for r in repo.product_panel(pid, as_of, pre_months)
     ]
 
 
-def _period_aggregate(pid: int, lo: str, hi: str) -> tuple[float, float] | None:
+def _period_aggregate(pid: int, lo: date, hi: date) -> tuple[float, float] | None:
     """Volume-weighted price and total Qty for a product over [lo, hi). None if no valid sales."""
-    source_history_start = get_settings().source_history_start_date.isoformat()
+    floor = get_settings().source_history_start_date
     rows = query(
-        """
+        f"""
         SELECT SUM(oi.Qty) AS q,
                SUM(oi.Qty * oi.PricePerItem) / NULLIF(SUM(oi.Qty), 0) AS p
         FROM dbo.OrderItem oi
         JOIN dbo.[Order] o ON o.ID = oi.OrderID
         JOIN dbo.Sale s ON s.OrderID = o.ID
-        WHERE oi.ProductID = :pid AND oi.IsValidForCurrentSale = 1
-              AND oi.ProductID <> 25422404 AND oi.PricePerItem > 0 AND oi.Qty > 0
-              AND s.Created >= :lo AND s.Created < :hi
-              AND s.Created >= :source_history_start
+        WHERE oi.ProductID = :pid
+              AND {repo.CONFIRMED_SALE}
+              AND {repo.KEPT_LINE}
+              AND oi.ProductID <> :synthetic
+              AND oi.PricePerItem > 0
+              AND {repo.SALE_WINDOW}
         """,
         {
             "pid": pid,
-            "lo": lo,
-            "hi": hi,
-            "source_history_start": source_history_start,
+            "window_from": repo.utc_instant(max(lo, floor)),
+            "window_to": repo.utc_instant(hi),
+            "synthetic": repo.synthetic_product_id(),
         },
     )
     if not rows or rows[0]["q"] is None or rows[0]["p"] is None:
@@ -158,7 +131,7 @@ def main() -> int:
     except ValueError as exc:
         print(json.dumps({"error": str(exc), "as_of": as_of}))
         return 2
-    post_hi = _add_months(as_of_d, post_months).isoformat()
+    post_hi = _add_months(as_of_d, post_months)
     rel_flat = 0.01  # price moves under 1% carry no directional signal -> excluded
 
     pids = _estimable_products(as_of, pre_months, min_lines, max_skus)
@@ -190,8 +163,8 @@ def main() -> int:
     sane_correct = 0
     for f in fitted:
         pid = f["pid"]
-        pre = _period_aggregate(pid, _add_months(as_of_d, -pre_months).isoformat(), as_of)
-        post = _period_aggregate(pid, as_of, post_hi)
+        pre = _period_aggregate(pid, pre_window.effective_start, as_of_d)
+        post = _period_aggregate(pid, as_of_d, post_hi)
         if pre is None or post is None:
             continue
         p0, q0 = pre

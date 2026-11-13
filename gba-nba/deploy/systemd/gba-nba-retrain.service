@@ -1,0 +1,23 @@
+[Unit]
+Description=GBA NBA propensity model retrain (5 vintages + live labels; pooled OOT AUC >= 0.62 and per-type gate; atomic swap)
+After=network-online.target gba-nba.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/projects/gba-nba
+# Rolling-window retrain: rebuild the 5 latest fully-labelled monthly vintages (cross_sell hits the
+# persisted reco cache — no live reco contention), union any manager-logged live outcomes from Mongo,
+# retrain the calibrated propensity model, then validate (pooled OOT AUC >= 0.62 AND >= old - 0.01 on
+# the same test fold, or abort + restore) and atomically swap the artifacts. A per-type gate records
+# which heads are published (enough labelled rows and OOT AUC >= the floor); the rest are served by the
+# heuristic. Only the newest 4 backup dirs are kept. Uses gba-nba's OWN venv (pandas/sklearn live there).
+ExecStart=/root/projects/gba-nba/.venv/bin/python scripts/retrain.py --auc-floor 0.62 --auc-epsilon 0.01
+# Belt-and-suspenders: restart the live service after a successful swap so the in-process model
+# lru_cache (app/ml/score_task.py) picks up the new artifacts. Harmless if already current.
+ExecStartPost=/bin/systemctl try-restart gba-nba.service
+TimeoutStartSec=3600
+StandardOutput=append:/var/log/gba-nba-retrain.log
+StandardError=append:/var/log/gba-nba-retrain.log
+
+# Do NOT [Install] / WantedBy here — this unit is started by gba-nba-retrain.timer, not at boot.

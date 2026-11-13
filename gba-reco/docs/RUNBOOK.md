@@ -46,18 +46,31 @@ curl localhost:8000/metrics
 
 ## 4. Pre-compute cache (worker)
 ```bash
-make worker        # or: python -m app.services.recommendations.worker --top-n 50
+make worker        # or: python -m app.services.recommendations.worker [--engine legacy]
 ```
-Schedule weekly via host cron / k8s CronJob. Idempotent & resumable.
+In the fleet this runs daily through `refresh_ai_service.py reco --as-of <day> --token <run>`;
+a re-run with the same token reuses every payload already written. Idempotent and resumable.
+
+- `REFRESH_ENGINE=snapshot` (default): set-based load, in-memory compute, about two minutes.
+- `REFRESH_ENGINE=legacy`: per-context SQL loop, about 50 minutes; fallback for one release.
+- `SERVE_LATEST_FALLBACK=true`: serve the latest warmed payload while the day's refresh has
+  not run, marked `stale: true`, for at most `LATEST_FALLBACK_MAX_AGE_DAYS` (2) days. Needs a
+  gba-server build that accepts an `as_of_date` older than requested.
+- After a model-version change run the reco stage, then `systemctl restart gba-reco`.
+  Payloads of older versions and dates can be removed with `cache.purge_dated_before(as_of)`;
+  it never touches `reco:neg:*`.
 
 ## 5. Evaluate / tune (needs representative data)
 ```bash
-python -m app.services.eval.harness --compare --k 10        # v3.2 vs copurchase vs naive
-python -m app.services.eval.harness --fold-as-of 2025-09-01 # + ALS (trained once)
+python -m app.services.eval.holdout --origins 2026-05-13,2026-06-13,2026-07-13,2026-08-13,2026-09-13,2026-10-13
+python -m app.services.eval.holdout --origins <dates> --write-measured   # refresh precision_estimate
+python -m app.services.eval.harness --compare --k 10        # older leave-last-basket harness
 ```
-⚠️ On the small dev DB all algos tie / lose to global_popular (84% cold-start clients).
-Run these against a representative (prod-like) dataset to pick the winning algorithm.
-**Rule:** any algorithm must beat `naive_global_popular` to ship.
+Choose on the earlier origins, confirm on the last two (`--confirm 2`), and record the tables
+in `docs/eval-<date>.md`. `measured.json` must carry the served model version; a guard test
+fails otherwise.
+Truth is what a client ordered and was invoiced for inside the window, net of returns;
+orders already open at the origin are excluded from both the list and the truth.
 
 ## 6. Integration (gba-server)
 gba-server (development) calls this via `IProductRecommendationService` →
@@ -66,7 +79,12 @@ gba-server (development) calls this via `IProductRecommendationService` →
 ## Health / monitoring
 - `GET /health` → db_connected, redis_connected, model_version.
 - `GET /metrics` → requests, error_rate, avg_latency_ms, cache_hit_rate.
-- Redis down → service degrades gracefully (uncached, still serves). DB down → /health degraded.
+- Redis down → every request is calculated from the database (seconds instead of
+  milliseconds); `/health` reports `redis_connected: false`.
+- Database slow or down → cached lists are served with `degraded: true` and a
+  `degraded_reason`; anything not cached answers 503 `source_unavailable` with the reason
+  (`database_timeout` after `QUERY_TIMEOUT` seconds, `database_unavailable` otherwise).
+- Measured latency and memory: `docs/eval-2026-11-13.md`.
 
 ## Rollback
 Stateless service; roll back by redeploying the previous image tag. Cache auto-expires (TTL).

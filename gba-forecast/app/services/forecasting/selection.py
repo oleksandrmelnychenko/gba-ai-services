@@ -1,57 +1,89 @@
-"""Per-segment forecast-method selection.
+"""Per-scope, per-segment forecast-method selection.
 
-Replaces a single fixed FORECAST_METHOD with a principled choice driven by the demand
-pattern of each series. The map below is the BACKTEST-PROVEN choice per segment, re-derived on
-the CORRECTED full-sales data (rolling-origin evaluation over 1000 real client+product series,
-scripts/run_backtest.py). The earlier map was tuned on a buggy ~16% sample (the old
-`o.Deleted = 0` validity filter dropped ~84% of real sales); on the full IsValidForCurrentSale=1
-data the erratic winner moves, while smooth and the sporadic quadrants hold:
+Regular series (smooth, erratic) are forecast with an EWMA level. Sporadic series
+(intermittent, lumpy) of the client and product scopes are forecast with TSB: a smoothed
+demand probability times a smoothed demand size. Sporadic client+product pairs keep the EWMA
+level. Constants depend on the scope and the demand class and are chosen on the months the
+service emits: the current month is still open when a forecast is requested, so the first
+emitted point is two steps past the last closed month.
 
-  - smooth                -> EWMA  (these EUR series trend UPWARD, so a backward-looking window
-                                   mean structurally LAGS the growth and under-forecasts. EWMA
-                                   weights recent months more, tracking the drift. On the
-                                   corrected sample it beats moving_avg on MAE, sMAPE AND bias:
-                                   MAE 1400->1197 (-15%), bias -1083->-182 (-83%). The chronic
-                                   negative (under-forecast) bias is the symptom EWMA cures.)
-  - erratic               -> moving_avg  (CHANGED from EWMA. On the corrected full data the
-                                   window mean has the LOWEST MAE for erratic in every split
-                                   (combined 849 vs EWMA 887, +4.5%; clients-only and
-                                   products-only agree on the direction), so the MAE-keyed
-                                   selection rule — the backtest's documented primary metric —
-                                   picks it. EWMA still wins erratic on sMAPE (0.792 vs 0.803)
-                                   and slashes the bias (-37 vs -357); that trade-off is real,
-                                   but the selector follows MAE for consistency, so erratic
-                                   reverts to the window mean here.)
-  - intermittent / lumpy  -> SBA  (Croston is the textbook intermittent forecaster; SBA removes
-                                   Croston's documented positive bias. On the corrected data —
-                                   which finally exposes a real intermittent/lumpy population the
-                                   buggy 16% sample lacked — SBA/Croston keep the lowest MAE on
-                                   both sporadic quadrants (intermittent 1429, lumpy 624) while
-                                   trend/recency methods HURT them, so the literature prior holds.
-                                   SBA is kept over Croston: marginally higher MAE but the
-                                   bias-corrected variant is the principled intermittent choice.)
-  - no_demand             -> moving_avg  (returns 0.0 either way; cheap and safe).
+Evidence, 2026-11-13: rolling origins on confirmed sales net of returns 2025-01..2026-10,
+steps 2..7, constants chosen on targets up to 2026-04 and checked on 2026-05..2026-10
+(section 11 of docs/statistical-review-2026-11-12.md).
 
-This map is what the backtest measures and, where the data disagrees, overrides: run_backtest
-emits an empirically-tuned map, but this default is the already-validated choice so the service
-is correct out of the box with no calibration step.
+  scope    class         method            WAPE on the choice window, before -> after
+  client   smooth        EWMA 0.30         kept
+  client   erratic       EWMA 0.30         kept
+  client   intermittent  TSB 0.5 / 0.5     116.8 -> 116.3
+  client   lumpy         TSB 0.5 / 0.5     145.2 -> 141.2
+  product  smooth        EWMA 0.15         kept
+  product  erratic       EWMA 0.15         kept
+  product  intermittent  TSB 0.2 / 0.3     124.2 -> 123.0
+  product  lumpy         TSB 0.2 / 0.3     118.0 -> 114.4
+  pair     smooth        EWMA 0.10         kept
+  pair     erratic       EWMA 0.10         kept
+  pair     sporadic      EWMA 0.40         kept, no candidate is better
+
+The horizon is a flat run-rate. A pooled growth term, a pooled seasonal factor, a damped trend,
+reversion to the long mean and a separate constant per step were each tested per step; none
+beats the flat line on the choice window.
 
 `forecast_method` in Settings selects the MODE:
-  "auto"                                   -> use this per-segment selector (recommended).
+  "auto"                                   -> use this selector (recommended).
   "moving_avg"|"croston"|"sba"|"ewma"|"damped_trend"
                                            -> force that single method for every series (A-B).
-The response contract is unchanged: the selector only chooses which projection function runs.
 """
 
 from __future__ import annotations
 
-from app.services.forecasting import classify
+from app.services.forecasting import classify, demand
 
-# Backtest-proven segment -> method map (re-derived on the CORRECTED full-sales data). Methods
-# are the demand.forecast_path dispatch names. smooth adopts EWMA (lowest MAE + near-zero bias);
-# erratic reverts to moving_avg (lowest MAE on the corrected data, in every client/product split);
-# intermittent/lumpy keep SBA (trend methods raise their MAE on the now-real sporadic population).
 DEFAULT_SEGMENT_METHOD: dict[str, str] = {
+    classify.SMOOTH: "ewma",
+    classify.ERRATIC: "ewma",
+    classify.INTERMITTENT: "ewma",
+    classify.LUMPY: "ewma",
+    classify.NO_DEMAND: "moving_avg",
+}
+
+SCOPE_CLIENT = "client"
+SCOPE_PRODUCT = "product"
+SCOPE_PAIR = "pair"
+SCOPES = (SCOPE_CLIENT, SCOPE_PRODUCT, SCOPE_PAIR)
+
+SEGMENT_EWMA_ALPHA: dict[str, dict[str, float]] = {
+    SCOPE_CLIENT: {
+        classify.SMOOTH: 0.3,
+        classify.ERRATIC: 0.3,
+    },
+    SCOPE_PRODUCT: {
+        classify.SMOOTH: 0.15,
+        classify.ERRATIC: 0.15,
+    },
+    SCOPE_PAIR: {
+        classify.SMOOTH: 0.1,
+        classify.ERRATIC: 0.1,
+        classify.INTERMITTENT: 0.4,
+        classify.LUMPY: 0.4,
+    },
+}
+
+SEGMENT_TSB: dict[str, dict[str, tuple[float, float]]] = {
+    SCOPE_CLIENT: {
+        classify.INTERMITTENT: (0.5, 0.5),
+        classify.LUMPY: (0.5, 0.5),
+    },
+    SCOPE_PRODUCT: {
+        classify.INTERMITTENT: (0.2, 0.3),
+        classify.LUMPY: (0.2, 0.3),
+    },
+    SCOPE_PAIR: {},
+}
+
+HORIZON_FLAT = "flat_run_rate"
+HORIZON_DAMPED_TREND = "damped_trend"
+
+LEGACY_SEGMENT_METHOD: dict[str, str] = {
     classify.SMOOTH: "ewma",
     classify.ERRATIC: "moving_avg",
     classify.INTERMITTENT: "sba",
@@ -85,10 +117,15 @@ def method_for_segment(
     return method if method in _VALID_METHODS else _SAFE_DEFAULT
 
 
+def is_auto(forecast_method: str) -> bool:
+    return (forecast_method or AUTO).lower() not in _FORCED_METHODS
+
+
 def select_method(
     series: list[float],
     forecast_method: str,
     segment_method: dict[str, str] | None = None,
+    scope: str = SCOPE_CLIENT,
 ) -> tuple[str, str]:
     """Resolve the method for one series given the configured MODE.
 
@@ -100,4 +137,26 @@ def select_method(
     segment = classify.classify(series)
     if mode in _FORCED_METHODS:
         return mode, segment
+    if segment_method is None and segment in SEGMENT_TSB.get(scope, {}):
+        return "tsb", segment
     return method_for_segment(segment, segment_method), segment
+
+
+def auto_rate(series: list[float], segment: str, scope: str = SCOPE_CLIENT) -> tuple[float, str]:
+    if scope not in SEGMENT_EWMA_ALPHA:
+        raise ValueError(f"unknown forecast scope: {scope}")
+    constants = SEGMENT_TSB[scope].get(segment)
+    if constants is not None:
+        alpha, beta = constants
+        return demand.tsb_rate(series, alpha, beta), f"tsb_a{alpha:g}_b{beta:g}"
+    alpha = SEGMENT_EWMA_ALPHA[scope].get(segment, demand.EWMA_ALPHA)
+    return demand.ewma_rate(series, alpha), method_label("ewma", alpha)
+
+
+def horizon_shape(forecast_method: str) -> str:
+    mode = (forecast_method or AUTO).lower()
+    return HORIZON_DAMPED_TREND if mode == "damped_trend" else HORIZON_FLAT
+
+
+def method_label(method: str, ewma_alpha: float) -> str:
+    return f"ewma_a{ewma_alpha:g}" if method == "ewma" else method

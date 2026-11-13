@@ -17,6 +17,12 @@ from app.services.eval import baselines
 from app.services.recommendations import als, copurchase, recommender
 
 
+@pytest.fixture(autouse=True)
+def no_basket_no_siblings(monkeypatch):
+    monkeypatch.setattr(recommender.repo, "open_order_product_ids", lambda *args: frozenset())
+    monkeypatch.setattr(recommender.repo, "sibling_articles", lambda: {})
+
+
 def _result(*recommendations: ProductRec, segment: str = "COPURCHASE") -> RecommendationResult:
     return RecommendationResult(
         customer_id=7,
@@ -59,10 +65,11 @@ def test_primary_recommender_labels_history_and_similar_client_paths(monkeypatch
         repurchase_count=1,
         max_per_group=10,
         ubiquity_exclude_pct=0.99,
+        discovery_source="similar_clients",
     )
     monkeypatch.setattr(recommender, "get_settings", lambda: settings)
     monkeypatch.setattr(recommender, "classify", lambda customer_id, as_of: Segment.LIGHT)
-    monkeypatch.setattr(recommender.repo, "ubiquitous_product_ids", lambda pct: frozenset())
+    monkeypatch.setattr(recommender.repo, "ubiquitous_product_ids", lambda *args: frozenset())
     monkeypatch.setattr(recommender.cache, "get_negatives", lambda customer_id: frozenset())
     monkeypatch.setattr(
         recommender.repo,
@@ -207,7 +214,7 @@ def test_global_backfill_excludes_any_owned_catalog_generation(monkeypatch):
 def test_copurchase_labels_owned_and_new_products(monkeypatch):
     settings = SimpleNamespace(ubiquity_exclude_pct=0.99)
     monkeypatch.setattr(copurchase, "get_settings", lambda: settings)
-    monkeypatch.setattr(copurchase.repo, "ubiquitous_product_ids", lambda pct: frozenset())
+    monkeypatch.setattr(copurchase.repo, "ubiquitous_product_ids", lambda *args: frozenset())
     monkeypatch.setattr(copurchase.cache, "get_negatives", lambda customer_id: frozenset())
     monkeypatch.setattr(
         copurchase.repo,
@@ -254,7 +261,7 @@ def test_copurchase_labels_owned_and_new_products(monkeypatch):
 def test_copurchase_discovery_excludes_owned_product_after_live_remap(monkeypatch):
     settings = SimpleNamespace(ubiquity_exclude_pct=0.99)
     monkeypatch.setattr(copurchase, "get_settings", lambda: settings)
-    monkeypatch.setattr(copurchase.repo, "ubiquitous_product_ids", lambda pct: frozenset())
+    monkeypatch.setattr(copurchase.repo, "ubiquitous_product_ids", lambda *args: frozenset())
     monkeypatch.setattr(copurchase.cache, "get_negatives", lambda customer_id: frozenset())
     monkeypatch.setattr(
         copurchase.repo,
@@ -313,3 +320,23 @@ def test_als_labels_owned_and_collaborative_products(monkeypatch):
         (1, RecSource.REPURCHASE, RecSourceDetail.REPURCHASE_HISTORY),
         (2, RecSource.DISCOVERY, RecSourceDetail.SIMILAR_CLIENTS),
     ]
+
+
+def test_failed_copurchase_backfill_is_reported_as_degraded(monkeypatch):
+    from app.services.recommendations import copurchase as cop
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("co-occurrence unavailable")
+
+    monkeypatch.setattr(cop, "recommend", boom)
+    monkeypatch.setattr(recommender.repo, "in_stock_product_ids", lambda ids, **kw: set(ids))
+    monkeypatch.setattr(recommender.live_remap, "live_product_map", lambda ids: {i: i for i in ids})
+    from app.services.eval import baselines
+
+    monkeypatch.setattr(baselines, "global_popular", lambda as_of, n, exclude=None: [501, 502])
+    degraded: list[str] = []
+    filled = recommender._backfill(
+        [], 7, "2026-03-01", 2, recommender.Segment.LIGHT, frozenset(), frozenset(), degraded=degraded,
+    )
+    assert degraded == ["copurchase_backfill"]
+    assert [item.product_id for item in filled] == [501, 502]

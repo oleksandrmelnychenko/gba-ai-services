@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import inspect
 
+import pytest
+
+from app.data import source_rules as rules
 from app.data import supply_repository as repo
 from app.services.replenishment import worker
 
@@ -19,7 +22,8 @@ def _src(fn) -> str:
 
 def test_product_daily_demand_filters_valid_sales_and_excludes_synthetic():
     src = _src(repo.product_daily_demand)
-    assert "IsValidForCurrentSale" in src
+    assert "rules.demand_lines()" in src
+    assert "IsValidForCurrentSale = 1" in rules.demand_lines()
     assert ":syn" in src
 
 
@@ -36,26 +40,29 @@ def test_producer_name_reads_client_suppliername_not_organization():
 
 
 def test_producer_dimension_keyed_on_clientid_not_organizationid():
-    for fn in (repo.producer_lead_times, repo.products_for_producer, repo.all_producers):
+    for fn in (repo.producer_lead_times_all, repo.products_by_producer_all, repo.all_producers):
         src = _src(fn)
         assert "ClientID" in src, fn.__name__
         assert "OrganizationID" not in src, fn.__name__
 
 
 def test_producer_lead_times_uses_datefrom_not_created_for_datediff():
-    src = _src(repo.producer_lead_times)
+    src = _src(repo.producer_lead_times_all)
     assert "DateFrom" in src
     assert "so.Created" not in src
     assert "SupplyOrder.Created" not in src
 
 
 def test_producer_lead_times_uses_factual_invoice_to_receipt_lifecycle():
-    src = _src(repo.producer_lead_times)
+    src = _src(repo.producer_lead_times_all)
     assert "SupplyInvoiceOrderItem" in src
     assert "PackingListPackageOrderItem" in src
     assert "ProductIncomeItem" in src
     assert "ProductIncome" in src
-    assert "COALESCE(si.DateFrom, so.DateFrom)" in src
+    assert "si.DateFrom AS ordered_at" in src
+    assert "COALESCE(si.DateFrom, so.DateFrom)" not in src
+    assert "WHEN so.DateFrom > MAX(pinc.FromDate)" in src
+    assert "GROUP BY so.ClientID, si.ID, si.DateFrom, so.DateFrom" in src
     assert "DATEDIFF(day, ordered_at, received_at)" in src
     assert "so.OrderArrivedDate" not in src
     assert "so.IsOrderArrived" not in src
@@ -64,7 +71,7 @@ def test_producer_lead_times_uses_factual_invoice_to_receipt_lifecycle():
 def test_producer_lead_times_keeps_archived_parent_when_factual_rows_are_active():
     """Arrived SupplyOrder parents are archived (Deleted=1), while their invoice/receipt
     facts remain active. The history must gate on those facts, never the parent flag."""
-    src = _src(repo.producer_lead_times)
+    src = _src(repo.producer_lead_times_all)
     assert "si.Deleted = 0" in src
     assert "sioi.Deleted = 0" in src
     assert "pinc.Deleted = 0" in src
@@ -73,7 +80,7 @@ def test_producer_lead_times_keeps_archived_parent_when_factual_rows_are_active(
 
 
 def test_producer_lead_times_unions_ua_receipt_history():
-    src = _src(repo.producer_lead_times)
+    src = _src(repo.producer_lead_times_all)
     assert "UNION ALL" in src
     assert "SupplyOrderUkraineItem" in src
     assert "pii.SupplyOrderUkraineItemID = soui.ID" in src
@@ -83,7 +90,7 @@ def test_producer_lead_times_unions_ua_receipt_history():
 def test_candidate_windows_use_factual_document_dates_not_created_sync_stamp():
     """Candidates use SupplyInvoice.DateFrom / SupplyOrderUkraine.FromDate, never the
     SupplyOrder.Created sync stamp that is rewritten to ~now."""
-    for fn in (repo.all_producers, repo.products_for_producer):
+    for fn in (repo.all_producers, repo.products_by_producer_all):
         src = _src(fn)
         assert "so.Created" not in src, fn.__name__
         assert "si.DateFrom AS source_date" in src, fn.__name__
@@ -94,7 +101,7 @@ def test_candidate_windows_use_factual_document_dates_not_created_sync_stamp():
 
 def test_candidates_use_active_invoice_facts_even_when_parent_is_archived():
     """After rekey, real products live in active invoice lines under SupplyOrder.Deleted=1."""
-    for fn in (repo.all_producers, repo.products_for_producer):
+    for fn in (repo.all_producers, repo.products_by_producer_all):
         src = _src(fn)
         assert "dbo.SupplyInvoice si" in src, fn.__name__
         assert "dbo.SupplyInvoiceOrderItem sioi" in src, fn.__name__
@@ -106,7 +113,7 @@ def test_candidates_use_active_invoice_facts_even_when_parent_is_archived():
 
 
 def test_candidates_union_active_ua_real_product_lines():
-    for fn in (repo.all_producers, repo.products_for_producer):
+    for fn in (repo.all_producers, repo.products_by_producer_all):
         src = _src(fn)
         assert "UNION ALL" in src, fn.__name__
         assert "dbo.SupplyOrderUkraine sou" in src, fn.__name__
@@ -114,6 +121,52 @@ def test_candidates_union_active_ua_real_product_lines():
         assert "sou.Deleted = 0" in src, fn.__name__
         assert "soui.Deleted = 0" in src, fn.__name__
         assert "COALESCE(soui.SupplierID, sou.SupplierID)" in src, fn.__name__
+
+
+def test_candidates_include_real_lines_of_open_console_orders():
+    for fn in (repo.all_producers, repo.products_by_producer_all, repo.procurement_source_readiness):
+        src = _src(fn)
+        assert "dbo.SupplyOrder co" in src, fn.__name__
+        assert "dbo.SupplyOrderItem coi" in src, fn.__name__
+        assert "coi.Deleted = 0" in src, fn.__name__
+        assert "co.Deleted = 0" in src, fn.__name__
+        assert "co.IsOrderArrived = 0" in src, fn.__name__
+        assert "co.ClientID IS NOT NULL" in src, fn.__name__
+        assert "co.DateFrom AS source_date" in src, fn.__name__
+        assert "co.Created" not in src, fn.__name__
+
+
+def test_console_order_candidates_share_the_on_order_predicate():
+    on_order = _src(repo._on_order_chunk)
+    assert "so.Deleted = 0 AND so.IsOrderArrived = 0" in on_order
+    assert "soi.Deleted = 0" in on_order
+
+
+@pytest.mark.order_units
+def test_ukraine_order_price_is_read_as_stored_eur(monkeypatch):
+    captured = []
+
+    def fake_query(statement, params):
+        captured.append(statement)
+        return [
+            {"producer_id": 7, "product_id": 1, "cost_eur": 12.5},
+            {"producer_id": 7, "product_id": 2, "cost_eur": None},
+        ]
+
+    monkeypatch.setattr(repo, "query", fake_query)
+    monkeypatch.setattr(repo, "synthetic_product_id", lambda: 99)
+    assert repo.last_document_costs_eur("2026-06-15", [1, 2]) == {(7, 1): 12.5}
+    statement = " ".join(captured[0].split())
+    international, ukraine = statement.split("UNION ALL")
+    ukraine, ranked = ukraine.split("Ranked AS")
+    assert "ISNULL(a.CurrencyID, 2) AS currency_id, CAST(0 AS bit) AS stored_in_eur" in international
+    assert "soui.UnitPrice, CAST(NULL AS bigint), CAST(1 AS bit)," in ukraine
+    assert "Agreement" not in ukraine
+    assert "CurrencyID" not in ukraine
+    assert (
+        "CASE WHEN stored_in_eur = 1 THEN unit_price "
+        "ELSE dbo.GetExchangedToEuroValue(unit_price, currency_id, source_date) END AS cost_eur"
+    ) in ranked
 
 
 def test_open_cockpit_draft_never_self_learns_as_factual_supply():
@@ -124,9 +177,9 @@ def test_open_cockpit_draft_never_self_learns_as_factual_supply():
     """
     predicate = "NOT (sou.IsFromCockpit = 1 AND sou.IsPlaced = 0)"
     for fn in (
-        repo.producer_lead_times,
-        repo.producer_agreement_currency,
-        repo.products_for_producer,
+        repo.producer_lead_times_all,
+        repo.producer_agreement_currencies_all,
+        repo.products_by_producer_all,
         repo.derive_moq_terms,
         repo.all_producers,
         repo.procurement_source_readiness,
@@ -143,12 +196,12 @@ def test_worker_active_producers_uses_repository_source_path_not_created():
 
 
 def test_synthetic_product_is_excluded_across_candidate_queries():
-    for fn in (repo.products_for_producer, repo.all_producers, repo._on_order_chunk):
+    for fn in (repo.products_by_producer_all, repo.all_producers, repo._on_order_chunk):
         assert ":syn" in _src(fn), fn.__name__
 
 
 def test_agreement_currency_uses_factual_intl_and_ua_documents():
-    src = _src(repo.producer_agreement_currency)
+    src = _src(repo.producer_agreement_currencies_all)
     assert "dbo.SupplyInvoice si" in src
     assert "dbo.SupplyInvoiceOrderItem sioi" in src
     assert "si.Deleted = 0" in src
@@ -180,13 +233,49 @@ def test_synthetic_product_id_resolved_dynamically_not_hardcoded():
     assert synthetic.FALLBACK_SYNTHETIC_PRODUCT_ID == 29555414
 
 
-def test_on_order_does_not_source_from_synthetic_supplyorderitem_placeholder():
-    """on_order MUST NOT read SupplyOrderItem (synthetic placeholder for not-yet-arrived orders)
-    nor filter on SupplyOrder.Created (the 1C-sync stamp ~now) -- those made it always empty."""
+def test_on_order_reads_supplyorderitem_only_on_open_console_orders():
+    """1C-imported orders carry placeholder SupplyOrderItem rows and arrive with
+    IsOrderArrived = 1; only an open console order has real ordered lines."""
     src = _src(repo._on_order_chunk)
-    assert "SupplyOrderItem" not in src  # synthetic-placeholder table
-    assert "so.Created" not in src  # rewritten sync timestamp
-    assert "IsOrderArrived" not in src  # boolean had no per-item received granularity
+    assert "JOIN dbo.SupplyOrder so" in src
+    assert "ON so.ID = soi.SupplyOrderID AND so.Deleted = 0 AND so.IsOrderArrived = 0" in src
+    assert "soi.ProductID <> :syn" in src
+    assert "so.DateFrom >= :history_start" in src
+    assert "so.DateFrom < :asof" in src
+    assert "so.Created" not in src
+
+
+def test_on_order_counts_only_the_unpacked_part_of_an_open_order_line():
+    """The packed part of a console order line is already on the packing-list spine."""
+    src = _src(repo._on_order_chunk)
+    assert "WHERE sioi.SupplyOrderItemID = soi.ID" in src
+    assert "CASE WHEN soi.Qty > ISNULL(packed.qty, 0)" in src
+    assert "THEN soi.Qty - ISNULL(packed.qty, 0) ELSE 0 END" in src
+
+
+def test_on_order_scopes_every_spine_to_the_requested_products(monkeypatch):
+    statements = []
+
+    def fake_query(statement, params):
+        statements.append(statement)
+        return [{"pid": 5, "qty": 60}]
+
+    monkeypatch.setattr(repo, "query", fake_query)
+    monkeypatch.setattr(repo, "synthetic_product_id", lambda: 99)
+    assert repo._on_order_chunk([5, 6], "2026-06-15") == {5: 60.0}
+    assert statements[0].count("soi.ProductID IN (") == 1
+    assert statements[0].count("sioi.ProductID IN (") == 2
+    assert repo._on_order_chunk(None, "2026-06-15") == {5: 60.0}
+    assert " IN (" not in statements[1]
+
+
+def test_reconciliation_on_order_mirrors_the_open_console_order_leg():
+    from app.services import reconciliation
+
+    src = _src(reconciliation._collect_on_order)
+    assert "so.Deleted = 0 AND so.IsOrderArrived = 0" in src
+    assert "WHERE sioi.SupplyOrderItemID = soi.ID" in src
+    assert "WHERE line.open_qty > 0" in src
 
 
 def test_on_order_reconstructs_open_minus_received_over_real_product_spine():
@@ -208,12 +297,79 @@ def test_on_order_reconstructs_open_minus_received_over_real_product_spine():
     assert "> 0.001" in src
 
 
-def test_on_order_chunks_in_list_under_param_cap():
-    """The IN list is referenced 4x in one statement; on_order must chunk to stay under
-    MSSQL's 2100-param cap rather than passing the whole product set in one shot."""
-    src = _src(repo.on_order)
-    assert "_ON_ORDER_IN_CHUNK" in src
-    assert repo._ON_ORDER_IN_CHUNK * 4 < 2100
+def test_on_order_reads_one_set_based_pass_without_in_list(monkeypatch):
+    calls = []
+
+    def fake_query(statement, params):
+        calls.append((statement, params))
+        return [{"pid": 5, "qty": 2}, {"pid": 6, "qty": 3}]
+
+    monkeypatch.setattr(repo, "query", fake_query)
+    monkeypatch.setattr(repo, "synthetic_product_id", lambda: 99)
+    assert repo.on_order([5, 99], "2026-06-15") == {5: 2.0}
+    assert repo.on_order_all("2026-06-15") == {5: 2.0, 6: 3.0}
+    assert len(calls) == 2
+    for statement, params in calls:
+        assert " IN (" not in statement
+        assert set(params) == {"asof", "history_start", "syn"}
+
+
+def test_set_based_readers_scope_one_producer_only_when_named(monkeypatch):
+    captured = []
+
+    def fake_query(statement, params):
+        captured.append((statement, params))
+        return []
+
+    monkeypatch.setattr(repo, "query", fake_query)
+    monkeypatch.setattr(repo, "synthetic_product_id", lambda: 99)
+    repo.producer_lead_times_all("2026-06-15")
+    repo.producer_lead_times(7, "2026-06-15")
+    repo.producer_agreement_currencies_all("2026-06-15")
+    repo.producer_agreement_currency(7, "2026-06-15")
+    repo.products_by_producer_all("2026-06-15", 120)
+    repo.products_for_producer(7, "2026-06-15", 120)
+    for index, (statement, params) in enumerate(captured):
+        named = index % 2 == 1
+        assert ("producer_id = :pid" in statement) is named
+        assert ("producer_id IS NOT NULL" in statement) is not named
+        assert (params.get("pid") == 7) is named
+
+
+def test_set_based_readers_group_rows_like_the_single_producer_readers(monkeypatch):
+    monkeypatch.setattr(repo, "synthetic_product_id", lambda: 99)
+    monkeypatch.setattr(
+        repo,
+        "query",
+        lambda statement, params: [
+            {"producer_id": 1, "lead_days": 9},
+            {"producer_id": 2, "lead_days": 4},
+            {"producer_id": 1, "lead_days": 3},
+        ],
+    )
+    assert repo.producer_lead_times_all("2026-06-15") == {1: [3.0, 9.0], 2: [4.0]}
+    monkeypatch.setattr(
+        repo,
+        "query",
+        lambda statement, params: [
+            {"producer_id": 1, "ccy": 4, "n": 2},
+            {"producer_id": 1, "ccy": 2, "n": 2},
+            {"producer_id": 1, "ccy": 3, "n": 1},
+            {"producer_id": 2, "ccy": 3, "n": 1},
+        ],
+    )
+    assert repo.producer_agreement_currencies_all("2026-06-15") == {1: 2, 2: 3}
+    monkeypatch.setattr(
+        repo,
+        "query",
+        lambda statement, params: [
+            {"producer_id": 1, "pid": 8},
+            {"producer_id": 1, "pid": 5},
+            {"producer_id": 2, "pid": 5},
+        ],
+    )
+    assert repo.products_by_producer_all("2026-06-15", 120) == {1: [5, 8], 2: [5]}
+    assert repo.products_for_producer(3, "2026-06-15", 120) == []
 
 
 def test_on_hand_and_reserved_restrict_to_sellable_storages():
@@ -320,3 +476,15 @@ def test_cost_repository_passes_exact_exclusive_asof_to_verified_cohort(monkeypa
 
     with pytest.raises(NativePurchaseCostError):
         cost_repository.producer_unit_costs_eur(7, [1], "2026-06-16", cohort=cohort)
+
+
+def test_on_order_drops_binary_float_noise_from_summed_quantities(monkeypatch):
+    monkeypatch.setattr(repo, "query", lambda statement, params: [{"pid": 5, "qty": 400.19999999999993}])
+    monkeypatch.setattr(repo, "synthetic_product_id", lambda: 99)
+    assert repo.on_order_all("2026-06-15") == {5: 400.2}
+
+
+def test_readiness_fingerprint_follows_open_console_order_lines():
+    src = _src(repo.procurement_source_readiness)
+    assert "SELECT CAST(4 AS tinyint), soi.ID, soi.ProductID, soi.Qty, soi.Updated" in src
+    assert "ON so.ID = soi.SupplyOrderID AND so.Deleted = 0 AND so.IsOrderArrived = 0" in src

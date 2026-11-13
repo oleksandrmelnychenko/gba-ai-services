@@ -70,26 +70,15 @@ def _cache_watchdog_job(as_of: str | None = None) -> dict:
     source = worker.require_source_readiness(as_of, force=True)
     source_fingerprint = source.get("source_fingerprint")
     cart_key = worker.cart_cache_key(as_of)
-    cached_cart = cache.get(cart_key)
-    if not worker.canonical_cart_payload_is_ready(
-        cached_cart,
-        source_fingerprint=source_fingerprint,
-    ):
-        if cached_cart is not None:
-            cache.delete(cart_key)
-        worker.warm_cart(as_of=as_of, cart_limit=worker.CART_LIMIT)
-
     charts_key = cache.make_key("charts", f"all:{worker.CHARTS_TOP_N}", as_of)
-    cached_charts = cache.get(charts_key)
-    if not worker.canonical_charts_payload_is_ready(
-        cached_charts,
+    canonical_ready = worker.canonical_cart_payload_is_ready(
+        cache.get(cart_key),
         source_fingerprint=source_fingerprint,
-    ):
-        if cached_charts is not None:
-            cache.delete(charts_key)
-        worker.warm_charts(as_of=as_of, top_n=worker.CHARTS_TOP_N)
-
-    stats = worker.run(as_of=as_of, warm_cart_key=False, skip_existing=True)
+    ) and worker.canonical_charts_payload_is_ready(
+        cache.get(charts_key),
+        source_fingerprint=source_fingerprint,
+    )
+    stats = worker.run(as_of=as_of, warm_cart_key=not canonical_ready, skip_existing=True)
     if stats["failed"]:
         raise RuntimeError(f"producers_failed:{stats['failed']}")
     result = {

@@ -1,7 +1,9 @@
 """Sales-forecast service — turns a monthly EUR history into the console response contract.
 
-Output points are { "SaleAmount": <float EUR>, "MonthNameUK": "<Укр short month + year>" }
-(PascalCase, exactly what the «Прогноз продажів» reader expects after the gba-server proxy).
+Output points are { "SaleAmount": <float EUR>, "MonthNameUK": "<Укр short month + year>",
+"SaleAmountLow": <float EUR>, "SaleAmountHigh": <float EUR> } (PascalCase, what the
+«Прогноз продажів» reader expects after the gba-server proxy). Low and High bound the range
+that held about 80% of past months for series of the same scope, class and size.
 """
 
 from __future__ import annotations
@@ -12,7 +14,7 @@ from math import isfinite
 
 from app.core.config import Settings
 from app.core.history import requested_history_start, resolve_history_window
-from app.services.forecasting import demand, selection
+from app.services.forecasting import demand, intervals, selection
 
 # month (1-12) -> Ukrainian short month label, per the spec mapping.
 MONTHS_UK = ["Січ", "Лют", "Бер", "Кві", "Тра", "Чер", "Лип", "Сер", "Вер", "Жов", "Лис", "Гру"]
@@ -111,7 +113,11 @@ def training_labels(as_of: date, cfg: Settings) -> list[str]:
 
 
 def forecast_points(
-    history: dict[str, float], as_of: date, cfg: Settings, horizon: int | None = None
+    history: dict[str, float],
+    as_of: date,
+    cfg: Settings,
+    horizon: int | None = None,
+    scope: str = selection.SCOPE_CLIENT,
 ) -> list[dict]:
     """Forecast the next N months from a {yyyy-MM: eur} history; shape into contract points.
 
@@ -119,24 +125,47 @@ def forecast_points(
     so the console renders «немає даних» instead of a meaningless flat line. Never raises on
     sparse data.
     """
+    return forecast_points_with_method(history, as_of, cfg, horizon, scope)[0]
+
+
+def forecast_points_with_method(
+    history: dict[str, float],
+    as_of: date,
+    cfg: Settings,
+    horizon: int | None = None,
+    scope: str = selection.SCOPE_CLIENT,
+) -> tuple[list[dict], dict[str, str] | None]:
     horizon = horizon if horizon is not None else cfg.forecast_horizon_months
     if horizon <= 0:
-        return []
+        return [], None
 
     labels = training_labels(as_of, cfg)
     series = series_from(history, labels)
     if _non_zero_months(series) < cfg.min_history_months:
-        return []
+        return [], None
 
-    # Resolve the concrete method per series: in "auto" mode the Syntetos-Boylan segment of
-    # this series picks the forecaster (smooth -> EWMA, erratic -> moving_avg, intermittent/
-    # lumpy -> SBA); a forced FORECAST_METHOD keeps the single-method behaviour. Contract is
-    # unchanged — EWMA is a flat level, damped_trend a per-step path; forecast_series handles both.
-    method, _segment = selection.select_method(series, cfg.forecast_method)
-    # The first step from the last closed month is the current month. The API
-    # promises months AFTER as_of's month, so skip that step (essential for trends).
-    projected = demand.forecast_series(series, horizon + 1, method, cfg.croston_alpha)[1:]
+    method, segment = selection.select_method(series, cfg.forecast_method, scope=scope)
+    if selection.is_auto(cfg.forecast_method):
+        rate, label = selection.auto_rate(series, segment, scope)
+        projected = [rate] * horizon
+    else:
+        projected = demand.forecast_series(
+            series, horizon + 1, method, cfg.croston_alpha, demand.EWMA_ALPHA
+        )[1:]
+        label = selection.method_label(method, demand.EWMA_ALPHA)
     points: list[dict] = []
-    for (y, m), amount in zip(future_months(as_of, horizon), projected, strict=True):
-        points.append({"SaleAmount": eur_cents(amount), "MonthNameUK": month_name_uk(y, m)})
-    return points
+    months = future_months(as_of, horizon)
+    for offset, ((y, m), amount) in enumerate(zip(months, projected, strict=True)):
+        sale_amount = eur_cents(amount)
+        low, high = intervals.multipliers(
+            scope, segment, sale_amount, intervals.FIRST_STEP + offset
+        )
+        points.append(
+            {
+                "SaleAmount": sale_amount,
+                "MonthNameUK": month_name_uk(y, m),
+                "SaleAmountLow": eur_cents(sale_amount * low),
+                "SaleAmountHigh": eur_cents(sale_amount * high),
+            }
+        )
+    return points, {"method": label, "segment": segment}

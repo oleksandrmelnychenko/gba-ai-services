@@ -30,3 +30,4 @@ app/risk/artifacts/*.joblib
 app/risk/artifacts/*.pkl
 app/risk/artifacts/*.png
 app/risk/artifacts/backup_*/
+.venv-*/

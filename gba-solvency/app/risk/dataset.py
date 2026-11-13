@@ -18,16 +18,20 @@ FEATURES — ~22, every one strictly as-of FEATURE_DATE (the leakage rule: only 
 DATA TRAPS honored (verified):
   - Buyers = role «Покупці Україна»: Client.Deleted=0 AND IsSubClient=0 AND EXISTS
     ClientInRole(Deleted=0, ClientTypeRoleID=1).
-  - Sale/Order/OrderItem are ALL Deleted=1 -> NEVER filter Deleted=0; validity via
-    OrderItem.IsValidForCurrentSale=1 and SaleReturn.IsCanceled=0.
+  - A sale is gba-server's confirmed sale (app.data.source_rules): Sale.Deleted=0, invoiced,
+    not an accounting carrier; lines OrderItem.Deleted=0, IsValidForCurrentSale=1, Qty>0.
+    A sale is dated by its invoice instant (Sale.ChangedToInvoice, UTC); sale windows are
+    complete Europe/Kyiv days [FD - window, FD) as UTC instants.
+  - Open debt lines need Debt.Total > 0; settled lines kept with Total = 0 are not debt.
   - Synthetic ProductID 25422404 («Ввід боргів з 1С») EXCLUDED from turnover/sales/RFM but
     KEPT in debt/exposure (real carried debt).
   - OrderItem.PricePerItem is ALREADY EUR (never wrap in FX).
   - Debt.Total is AGREEMENT currency -> EUR via dbo.GetExchangedToEuroValue(Total,
     Agreement.CurrencyID, AS_OF). Debt.Days is dead (always 0) -> ignored.
   - UNPAID ground truth = Debt/ClientInDebt table, NOT BaseSalePaymentStatus.
-  - Debt aging anchor = Debt.Created; overdue_days = DATEDIFF(day, Debt.Created, AS_OF) -
-    Agreement.NumberDaysDebt. Link: ClientInDebt(Deleted=0).DebtID->Debt(Deleted=0);
+  - Debt aging anchor = Debt.Created (UTC); overdue_days = days from its Europe/Kyiv date to
+    AS_OF - Agreement.NumberDaysDebt. Recency, tenure and the debt-trajectory windows and month
+    keys use Europe/Kyiv dates the same way. Link: ClientInDebt(Deleted=0).DebtID->Debt(Deleted=0);
     ClientInDebt.AgreementID->Agreement (verified 0 nulls on live debt rows).
 """
 from __future__ import annotations
@@ -38,8 +42,27 @@ from typing import Any
 import pandas as pd
 
 from app.core.config import get_settings
+from app.core.history import sales_window
 from app.data.db import in_clause, query
+from app.data.source_rules import (
+    debt_agreement,
+    confirmed_line,
+    confirmed_sale,
+    days_since,
+    local_date,
+    local_month,
+    months_since,
+    sold_at,
+)
 from app.data.synthetic_product import synthetic_product_ids
+
+_SOLD_AT = sold_at()
+_RECENCY_DAYS = days_since(f"MAX({_SOLD_AT})", ":fd")
+_TENURE_MONTHS = months_since(f"MIN({_SOLD_AT})", ":fd")
+_DEBT_AGE_FD = days_since("d.Created", ":fd")
+_DEBT_AGE_ASOF = days_since("d.Created", ":asof")
+_DEBT_DAY = local_date("d.Created")
+_DEBT_MONTH = local_month("d.Created")
 
 # SEV180 severity threshold (EUR). A buyer is a positive iff overdue 180+ EUR >= this.
 SEV180_MIN_EUR = 100.0
@@ -116,20 +139,22 @@ def buyer_ids() -> list[int]:
 def _sev180_eur_by_client(as_of: str) -> dict[int, float]:
     """SUM of overdue-180+ EUR exposure per buyer, as-of `as_of`.
 
-    A debt line counts iff DATEDIFF(day, Debt.Created, as_of) > Agreement.NumberDaysDebt + 180.
+    A debt line counts iff the days from the Kyiv date of Debt.Created to as_of exceed
+    Agreement.NumberDaysDebt + 180.
     EUR via GetExchangedToEuroValue revalued at `as_of`. Created <= as_of (no future leak).
     """
     rows = query(
-        """
+        f"""
         SELECT cid.ClientID AS client_id,
                SUM(dbo.GetExchangedToEuroValue(d.Total, a.CurrencyID, :asof)) AS sev180_eur
         FROM dbo.ClientInDebt cid
         JOIN dbo.Debt d ON d.ID = cid.DebtID
-        JOIN dbo.Agreement a ON a.ID = cid.AgreementID
+        {debt_agreement(":asof")}
         WHERE cid.Deleted = 0
               AND d.Deleted = 0
+              AND d.Total > 0
               AND d.Created <= :asof
-              AND DATEDIFF(day, d.Created, :asof) > a.NumberDaysDebt + 180
+              AND {_DEBT_AGE_ASOF} > a.NumberDaysDebt + 180
         GROUP BY cid.ClientID
         """,
         {"asof": as_of},
@@ -151,16 +176,17 @@ def label_sev180(as_of: str, clients: list[int] | None = None) -> dict[int, int]
 def label_sev180_one(client_id: int, as_of: str) -> int:
     """Single-client SEV180 label (used by the smoke test)."""
     rows = query(
-        """
+        f"""
         SELECT ISNULL(SUM(dbo.GetExchangedToEuroValue(d.Total, a.CurrencyID, :asof)), 0) AS sev180_eur
         FROM dbo.ClientInDebt cid
         JOIN dbo.Debt d ON d.ID = cid.DebtID
-        JOIN dbo.Agreement a ON a.ID = cid.AgreementID
+        {debt_agreement(":asof")}
         WHERE cid.Deleted = 0
               AND d.Deleted = 0
+              AND d.Total > 0
               AND d.Created <= :asof
               AND cid.ClientID = :cid
-              AND DATEDIFF(day, d.Created, :asof) > a.NumberDaysDebt + 180
+              AND {_DEBT_AGE_ASOF} > a.NumberDaysDebt + 180
         """,
         {"asof": as_of, "cid": client_id},
     )
@@ -173,13 +199,13 @@ def label_sev180_one(client_id: int, as_of: str) -> int:
 def feat_debt_aging(feature_date: str) -> pd.DataFrame:
     """Per-buyer aging buckets, totals, max overdue days, open-line count.
 
-    overdue_days = DATEDIFF(day, Debt.Created, FD) - Agreement.NumberDaysDebt.
+    overdue_days = days from the Kyiv date of Debt.Created to FD - Agreement.NumberDaysDebt.
       > 0   -> past grace (split into 1-30 / 31-60 / 61-90 / 91-180 / 180+)
       <= 0  -> not yet past grace -> current_debt_eur
     All debt lines (incl. synthetic 1С ProductID) count — exposure is real carried debt.
     """
     rows = query(
-        """
+        f"""
         SELECT client_id,
             SUM(CASE WHEN od > 180 THEN e ELSE 0 END) AS overdue_eur_180plus,
             SUM(CASE WHEN od BETWEEN 91 AND 180 THEN e ELSE 0 END) AS overdue_eur_91_180,
@@ -192,13 +218,14 @@ def feat_debt_aging(feature_date: str) -> pd.DataFrame:
             COUNT(*) AS n_open_debt_lines
         FROM (
             SELECT cid.ClientID AS client_id,
-                   DATEDIFF(day, d.Created, :fd) - a.NumberDaysDebt AS od,
+                   {_DEBT_AGE_FD} - a.NumberDaysDebt AS od,
                    dbo.GetExchangedToEuroValue(d.Total, a.CurrencyID, :fd) AS e
             FROM dbo.ClientInDebt cid
             JOIN dbo.Debt d ON d.ID = cid.DebtID
-            JOIN dbo.Agreement a ON a.ID = cid.AgreementID
+            {debt_agreement(":fd")}
             WHERE cid.Deleted = 0
                   AND d.Deleted = 0
+                  AND d.Total > 0
                   AND d.Created <= :fd
         ) t
         GROUP BY client_id
@@ -230,27 +257,32 @@ def feat_debt_aging(feature_date: str) -> pd.DataFrame:
 # FEATURE GROUP 2 — trajectory
 # --------------------------------------------------------------------------------------------
 def feat_debt_trajectory(feature_date: str) -> pd.DataFrame:
-    """debt_growth_3mo, months_with_debt_last12, new_debt_eur_3mo (by Debt.Created window).
+    """debt_growth_3mo, months_with_debt_last12, new_debt_eur_3mo (by the Kyiv day of
+    Debt.Created).
 
-    new_debt_eur_3mo   = EUR of debt Created in (FD-3mo, FD].
-    debt_growth_3mo    = new_debt_eur_3mo / EUR of debt Created in (FD-6mo, FD-3mo], capped [0,10].
-                         When the prior window is empty: 10.0 if recent>0 else 0.0.
-    months_with_debt_last12 = distinct yyyy-MM with a debt Created in (FD-12mo, FD].
+    new_debt_eur_3mo   = EUR of debt created on Kyiv days [FD-3mo, FD].
+    debt_growth_3mo    = new_debt_eur_3mo / EUR of debt created on [FD-6mo, FD-3mo), capped
+                         [0,10]. When the prior window is empty: 10.0 if recent>0 else 0.0.
+    months_with_debt_last12 = distinct Kyiv yyyy-MM with a debt created on [FD-12mo, FD].
     """
     rows = query(
-        """
+        f"""
         SELECT cid.ClientID AS client_id,
-               SUM(CASE WHEN d.Created > DATEADD(month, -3, :fd) THEN e ELSE 0 END) AS new3,
-               SUM(CASE WHEN d.Created > DATEADD(month, -6, :fd)
-                         AND d.Created <= DATEADD(month, -3, :fd) THEN e ELSE 0 END) AS prev3,
-               COUNT(DISTINCT CASE WHEN d.Created > DATEADD(month, -12, :fd)
-                                   THEN FORMAT(d.Created, 'yyyy-MM') END) AS months12
+               SUM(CASE WHEN created_day >= DATEADD(month, -3, :fd) THEN e ELSE 0 END) AS new3,
+               SUM(CASE WHEN created_day >= DATEADD(month, -6, :fd)
+                         AND created_day < DATEADD(month, -3, :fd) THEN e ELSE 0 END) AS prev3,
+               COUNT(DISTINCT CASE WHEN created_day >= DATEADD(month, -12, :fd)
+                                   THEN CONVERT(char(7), created_day, 126) END) AS months12
         FROM dbo.ClientInDebt cid
         JOIN dbo.Debt d ON d.ID = cid.DebtID
-        JOIN dbo.Agreement a ON a.ID = cid.AgreementID
-        CROSS APPLY (SELECT dbo.GetExchangedToEuroValue(d.Total, a.CurrencyID, :fd) AS e) x
+        {debt_agreement(":fd")}
+        CROSS APPLY (
+            SELECT dbo.GetExchangedToEuroValue(d.Total, a.CurrencyID, :fd) AS e,
+                   {_DEBT_DAY} AS created_day
+        ) x
         WHERE cid.Deleted = 0
               AND d.Deleted = 0
+              AND d.Total > 0
               AND d.Created >= :history_start
               AND d.Created <= :fd
         GROUP BY cid.ClientID
@@ -346,8 +378,8 @@ def feat_rfm(feature_date: str, window_months: int = 12) -> pd.DataFrame:
     up to FD; turnover/order_count use the (FD-window, FD] window.
     """
     ph, syn = _synthetic_not_in()
-    history_start = _history_start()
-    # turnover + order_count windowed by Sale.Created
+    window = sales_window(feature_date, window_months)
+    # turnover + order_count windowed by the invoice instant
     rows_win = query(
         f"""
         SELECT ca.ClientID AS client_id,
@@ -357,17 +389,17 @@ def feat_rfm(feature_date: str, window_months: int = 12) -> pd.DataFrame:
         JOIN dbo.[Order] o ON o.ID = s.OrderID
         JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
         JOIN dbo.ClientAgreement ca ON ca.ID = s.ClientAgreementID
-        WHERE oi.IsValidForCurrentSale = 1
+        WHERE {confirmed_sale()}
+              AND {confirmed_line()}
               AND oi.ProductID NOT IN {ph}
-              AND s.Created >= :history_start
-              AND s.Created <= :fd
-              AND s.Created >= DATEADD(month, :neg_months, :fd)
+              AND {_SOLD_AT} >= :history_start
+              AND {_SOLD_AT} >= :window_start
+              AND {_SOLD_AT} < :window_end
         GROUP BY ca.ClientID
         """,
         {
             "fd": feature_date,
-            "neg_months": -window_months,
-            "history_start": history_start,
+            **window.params(),
             **syn,
         },
     )
@@ -378,21 +410,22 @@ def feat_rfm(feature_date: str, window_months: int = 12) -> pd.DataFrame:
     rows_hist = query(
         f"""
         SELECT ca.ClientID AS client_id,
-               DATEDIFF(day, MAX(s.Created), :fd) AS recency_days,
-               DATEDIFF(month, MIN(s.Created), :fd) AS tenure_months
+               {_RECENCY_DAYS} AS recency_days,
+               {_TENURE_MONTHS} AS tenure_months
         FROM dbo.Sale s
         JOIN dbo.ClientAgreement ca ON ca.ID = s.ClientAgreementID
-        WHERE s.Created >= :history_start
-              AND s.Created <= :fd
+        WHERE {_SOLD_AT} >= :history_start
+              AND {_SOLD_AT} < :window_end
+              AND {confirmed_sale()}
               AND EXISTS (
                   SELECT 1 FROM dbo.OrderItem oi
                   WHERE oi.OrderID = s.OrderID
                         AND oi.ProductID NOT IN {ph}
-                        AND oi.IsValidForCurrentSale = 1
+                        AND {confirmed_line()}
               )
         GROUP BY ca.ClientID
         """,
-        {"fd": feature_date, "history_start": history_start, **syn},
+        {"fd": feature_date, **window.params(), **syn},
     )
     win = pd.DataFrame(rows_win)
     hist = pd.DataFrame(rows_hist)
@@ -421,10 +454,10 @@ def feat_returns(feature_date: str, window_months: int = 12) -> pd.DataFrame:
     rows instead of replacing them with the original OrderItem.Qty. Window on SaleReturn.FromDate;
     active returns only (sr.Deleted=0 AND sr.IsCanceled=0); oi.Deleted is not filtered; exclude the
     synthetic 1С product.
-    Sold qty: valid OrderItem.Qty (synthetic excluded) by buyer, windowed by Sale.Created<=FD.
+    Sold qty: valid OrderItem.Qty (synthetic excluded) by buyer, windowed by the invoice instant.
     """
     ph, syn = _synthetic_not_in()
-    history_start = _history_start()
+    window = sales_window(feature_date, window_months)
     sold = query(
         f"""
         SELECT ca.ClientID AS client_id, ISNULL(SUM(oi.Qty), 0) AS sold_qty
@@ -432,17 +465,17 @@ def feat_returns(feature_date: str, window_months: int = 12) -> pd.DataFrame:
         JOIN dbo.[Order] o ON o.ID = s.OrderID
         JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
         JOIN dbo.ClientAgreement ca ON ca.ID = s.ClientAgreementID
-        WHERE oi.IsValidForCurrentSale = 1
+        WHERE {confirmed_sale()}
+              AND {confirmed_line()}
               AND oi.ProductID NOT IN {ph}
-              AND s.Created >= :history_start
-              AND s.Created <= :fd
-              AND s.Created >= DATEADD(month, :neg_months, :fd)
+              AND {_SOLD_AT} >= :history_start
+              AND {_SOLD_AT} >= :window_start
+              AND {_SOLD_AT} < :window_end
         GROUP BY ca.ClientID
         """,
         {
             "fd": feature_date,
-            "neg_months": -window_months,
-            "history_start": history_start,
+            **window.params(),
             **syn,
         },
     )
@@ -458,8 +491,8 @@ def feat_returns(feature_date: str, window_months: int = 12) -> pd.DataFrame:
             WHERE sri.Deleted = 0
                   AND oi.ProductID IS NOT NULL
                   AND oi.ProductID NOT IN {ph}
-                  AND sr.FromDate <= :fd
-                  AND sr.FromDate >= DATEADD(month, :neg_months, :fd)
+                  AND sr.FromDate < :window_end
+                  AND sr.FromDate >= :window_start
                   AND sr.FromDate >= :history_start
             GROUP BY sr.ClientID, sri.SaleReturnID, sri.OrderItemID
         ) line
@@ -467,8 +500,7 @@ def feat_returns(feature_date: str, window_months: int = 12) -> pd.DataFrame:
         """,
         {
             "fd": feature_date,
-            "neg_months": -window_months,
-            "history_start": history_start,
+            **window.params(),
             **syn,
         },
     )
@@ -563,6 +595,7 @@ def features_one(client_id: int, feature_date: str, window_months: int = 12) -> 
     """
     ph, syn = _synthetic_not_in()
     history_start = _history_start()
+    window = sales_window(feature_date, window_months)
     feats: dict[str, float] = {c: 0.0 for c in FEATURE_COLUMNS}
 
     # The 6 feature-group queries are mutually independent (each hits a different table set and
@@ -570,7 +603,7 @@ def features_one(client_id: int, feature_date: str, window_months: int = 12) -> 
     # pool and join. Pure latency win — identical SQL, identical params, identical results as the
     # former sequential path.
     _sql_aging = (
-        """
+        f"""
         SELECT
             SUM(CASE WHEN od > 180 THEN e ELSE 0 END) AS overdue_eur_180plus,
             SUM(CASE WHEN od BETWEEN 91 AND 180 THEN e ELSE 0 END) AS overdue_eur_91_180,
@@ -582,13 +615,14 @@ def features_one(client_id: int, feature_date: str, window_months: int = 12) -> 
             MAX(od) AS max_overdue_days,
             COUNT(*) AS n_open_debt_lines
         FROM (
-            SELECT DATEDIFF(day, d.Created, :fd) - a.NumberDaysDebt AS od,
+            SELECT {_DEBT_AGE_FD} - a.NumberDaysDebt AS od,
                    dbo.GetExchangedToEuroValue(d.Total, a.CurrencyID, :fd) AS e
             FROM dbo.ClientInDebt cid
             JOIN dbo.Debt d ON d.ID = cid.DebtID
-            JOIN dbo.Agreement a ON a.ID = cid.AgreementID
+            {debt_agreement(":fd")}
             WHERE cid.Deleted = 0
                   AND d.Deleted = 0
+                  AND d.Total > 0
                   AND cid.ClientID = :cid
                   AND d.Created <= :fd
         ) t
@@ -601,21 +635,23 @@ def features_one(client_id: int, feature_date: str, window_months: int = 12) -> 
     # runs once per debt line, instead of a CROSS APPLY that re-drives it; the windowed SUMs and
     # COUNT DISTINCT over those columns are bit-identical.
     _sql_traj = (
-        """
+        f"""
         SELECT
-            SUM(CASE WHEN created > DATEADD(month, -3, :fd) THEN e ELSE 0 END) AS new3,
-            SUM(CASE WHEN created > DATEADD(month, -6, :fd)
-                      AND created <= DATEADD(month, -3, :fd) THEN e ELSE 0 END) AS prev3,
-            COUNT(DISTINCT CASE WHEN created > DATEADD(month, -12, :fd) THEN mk END) AS months12
+            SUM(CASE WHEN created_day >= DATEADD(month, -3, :fd) THEN e ELSE 0 END) AS new3,
+            SUM(CASE WHEN created_day >= DATEADD(month, -6, :fd)
+                      AND created_day < DATEADD(month, -3, :fd) THEN e ELSE 0 END) AS prev3,
+            COUNT(DISTINCT CASE WHEN created_day >= DATEADD(month, -12, :fd) THEN mk END)
+                AS months12
         FROM (
-            SELECT d.Created AS created,
-                   FORMAT(d.Created, 'yyyy-MM') AS mk,
+            SELECT {_DEBT_DAY} AS created_day,
+                   {_DEBT_MONTH} AS mk,
                    dbo.GetExchangedToEuroValue(d.Total, a.CurrencyID, :fd) AS e
             FROM dbo.ClientInDebt cid
             JOIN dbo.Debt d ON d.ID = cid.DebtID
-            JOIN dbo.Agreement a ON a.ID = cid.AgreementID
+            {debt_agreement(":fd")}
             WHERE cid.Deleted = 0
                   AND d.Deleted = 0
+                  AND d.Total > 0
                   AND cid.ClientID = :cid
                   AND d.Created >= :history_start
                   AND d.Created <= :fd
@@ -656,40 +692,41 @@ def features_one(client_id: int, feature_date: str, window_months: int = 12) -> 
         JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
         JOIN dbo.ClientAgreement ca ON ca.ID = s.ClientAgreementID
         WHERE ca.ClientID = :cid
-              AND oi.IsValidForCurrentSale = 1
+              AND {confirmed_sale()}
+              AND {confirmed_line()}
               AND oi.ProductID NOT IN {ph}
-              AND s.Created >= :history_start
-              AND s.Created <= :fd
-              AND s.Created >= DATEADD(month, :neg_months, :fd)
+              AND {_SOLD_AT} >= :history_start
+              AND {_SOLD_AT} >= :window_start
+              AND {_SOLD_AT} < :window_end
         """,
         {
             "fd": feature_date,
             "cid": client_id,
-            "neg_months": -window_months,
-            "history_start": history_start,
+            **window.params(),
             **syn,
         },
     )
     _sql_rfm_hist = (
         f"""
-        SELECT DATEDIFF(day, MAX(s.Created), :fd) AS recency_days,
-               DATEDIFF(month, MIN(s.Created), :fd) AS tenure_months
+        SELECT {_RECENCY_DAYS} AS recency_days,
+               {_TENURE_MONTHS} AS tenure_months
         FROM dbo.Sale s
         JOIN dbo.ClientAgreement ca ON ca.ID = s.ClientAgreementID
         WHERE ca.ClientID = :cid
-              AND s.Created >= :history_start
-              AND s.Created <= :fd
+              AND {_SOLD_AT} >= :history_start
+              AND {_SOLD_AT} < :window_end
+              AND {confirmed_sale()}
               AND EXISTS (
                   SELECT 1 FROM dbo.OrderItem oi
                   WHERE oi.OrderID = s.OrderID
                         AND oi.ProductID NOT IN {ph}
-                        AND oi.IsValidForCurrentSale = 1
+                        AND {confirmed_line()}
               )
         """,
         {
             "fd": feature_date,
             "cid": client_id,
-            "history_start": history_start,
+            **window.params(),
             **syn,
         },
     )
@@ -710,8 +747,8 @@ def features_one(client_id: int, feature_date: str, window_months: int = 12) -> 
                       AND oi.ProductID IS NOT NULL
                       AND oi.ProductID NOT IN {ph}
                       AND sr.ClientID = :cid
-                      AND sr.FromDate <= :fd
-                      AND sr.FromDate >= DATEADD(month, :neg_months, :fd)
+                      AND sr.FromDate < :window_end
+                      AND sr.FromDate >= :window_start
                       AND sr.FromDate >= :history_start
                 GROUP BY sri.SaleReturnID, sri.OrderItemID
              ) line) AS return_qty,
@@ -721,17 +758,17 @@ def features_one(client_id: int, feature_date: str, window_months: int = 12) -> 
              JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
              JOIN dbo.ClientAgreement ca ON ca.ID = s.ClientAgreementID
              WHERE ca.ClientID = :cid
-                   AND oi.IsValidForCurrentSale = 1
+                   AND {confirmed_sale()}
+                   AND {confirmed_line()}
                    AND oi.ProductID NOT IN {ph}
-                   AND s.Created >= :history_start
-                   AND s.Created <= :fd
-                   AND s.Created >= DATEADD(month, :neg_months, :fd)) AS sold_qty
+                   AND {_SOLD_AT} >= :history_start
+                   AND {_SOLD_AT} >= :window_start
+                   AND {_SOLD_AT} < :window_end) AS sold_qty
         """,
         {
             "fd": feature_date,
             "cid": client_id,
-            "neg_months": -window_months,
-            "history_start": history_start,
+            **window.params(),
             **syn,
         },
     )
@@ -822,6 +859,7 @@ def features_many(
     """
     ph_syn, syn = _synthetic_not_in()
     history_start = _history_start()
+    window = sales_window(feature_date, window_months)
     ids = list(dict.fromkeys(int(c) for c in client_ids))  # de-dupe, preserve order
     out: dict[int, dict[str, float]] = {
         cid: {c: 0.0 for c in FEATURE_COLUMNS} for cid in ids
@@ -845,13 +883,14 @@ def features_many(
             COUNT(*) AS n_open_debt_lines
         FROM (
             SELECT cid.ClientID AS client_id,
-                   DATEDIFF(day, d.Created, :fd) - a.NumberDaysDebt AS od,
+                   {_DEBT_AGE_FD} - a.NumberDaysDebt AS od,
                    dbo.GetExchangedToEuroValue(d.Total, a.CurrencyID, :fd) AS e
             FROM dbo.ClientInDebt cid
             JOIN dbo.Debt d ON d.ID = cid.DebtID
-            JOIN dbo.Agreement a ON a.ID = cid.AgreementID
+            {debt_agreement(":fd")}
             WHERE cid.Deleted = 0
                   AND d.Deleted = 0
+                  AND d.Total > 0
                   AND cid.ClientID IN {ph_cid}
                   AND d.Created <= :fd
         ) t
@@ -878,17 +917,21 @@ def features_many(
     traj = query(
         f"""
         SELECT cid.ClientID AS client_id,
-               SUM(CASE WHEN d.Created > DATEADD(month, -3, :fd) THEN e ELSE 0 END) AS new3,
-               SUM(CASE WHEN d.Created > DATEADD(month, -6, :fd)
-                         AND d.Created <= DATEADD(month, -3, :fd) THEN e ELSE 0 END) AS prev3,
-               COUNT(DISTINCT CASE WHEN d.Created > DATEADD(month, -12, :fd)
-                                   THEN FORMAT(d.Created, 'yyyy-MM') END) AS months12
+               SUM(CASE WHEN created_day >= DATEADD(month, -3, :fd) THEN e ELSE 0 END) AS new3,
+               SUM(CASE WHEN created_day >= DATEADD(month, -6, :fd)
+                         AND created_day < DATEADD(month, -3, :fd) THEN e ELSE 0 END) AS prev3,
+               COUNT(DISTINCT CASE WHEN created_day >= DATEADD(month, -12, :fd)
+                                   THEN CONVERT(char(7), created_day, 126) END) AS months12
         FROM dbo.ClientInDebt cid
         JOIN dbo.Debt d ON d.ID = cid.DebtID
-        JOIN dbo.Agreement a ON a.ID = cid.AgreementID
-        CROSS APPLY (SELECT dbo.GetExchangedToEuroValue(d.Total, a.CurrencyID, :fd) AS e) x
+        {debt_agreement(":fd")}
+        CROSS APPLY (
+            SELECT dbo.GetExchangedToEuroValue(d.Total, a.CurrencyID, :fd) AS e,
+                   {_DEBT_DAY} AS created_day
+        ) x
         WHERE cid.Deleted = 0
               AND d.Deleted = 0
+              AND d.Total > 0
               AND cid.ClientID IN {ph_cid}
               AND d.Created >= :history_start
               AND d.Created <= :fd
@@ -950,17 +993,17 @@ def features_many(
         JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
         JOIN dbo.ClientAgreement ca ON ca.ID = s.ClientAgreementID
         WHERE ca.ClientID IN {ph_cid}
-              AND oi.IsValidForCurrentSale = 1
+              AND {confirmed_sale()}
+              AND {confirmed_line()}
               AND oi.ProductID NOT IN {ph_syn}
-              AND s.Created >= :history_start
-              AND s.Created <= :fd
-              AND s.Created >= DATEADD(month, :neg_months, :fd)
+              AND {_SOLD_AT} >= :history_start
+              AND {_SOLD_AT} >= :window_start
+              AND {_SOLD_AT} < :window_end
         GROUP BY ca.ClientID
         """,
         {
             "fd": feature_date,
-            "neg_months": -window_months,
-            "history_start": history_start,
+            **window.params(),
             **cid_params,
             **syn,
         },
@@ -976,24 +1019,25 @@ def features_many(
     rfm_hist = query(
         f"""
         SELECT ca.ClientID AS client_id,
-               DATEDIFF(day, MAX(s.Created), :fd) AS recency_days,
-               DATEDIFF(month, MIN(s.Created), :fd) AS tenure_months
+               {_RECENCY_DAYS} AS recency_days,
+               {_TENURE_MONTHS} AS tenure_months
         FROM dbo.Sale s
         JOIN dbo.ClientAgreement ca ON ca.ID = s.ClientAgreementID
         WHERE ca.ClientID IN {ph_cid}
-              AND s.Created >= :history_start
-              AND s.Created <= :fd
+              AND {_SOLD_AT} >= :history_start
+              AND {_SOLD_AT} < :window_end
+              AND {confirmed_sale()}
               AND EXISTS (
                   SELECT 1 FROM dbo.OrderItem oi
                   WHERE oi.OrderID = s.OrderID
                         AND oi.ProductID NOT IN {ph_syn}
-                        AND oi.IsValidForCurrentSale = 1
+                        AND {confirmed_line()}
               )
         GROUP BY ca.ClientID
         """,
         {
             "fd": feature_date,
-            "history_start": history_start,
+            **window.params(),
             **cid_params,
             **syn,
         },
@@ -1018,17 +1062,17 @@ def features_many(
         JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
         JOIN dbo.ClientAgreement ca ON ca.ID = s.ClientAgreementID
         WHERE ca.ClientID IN {ph_cid}
-              AND oi.IsValidForCurrentSale = 1
+              AND {confirmed_sale()}
+              AND {confirmed_line()}
               AND oi.ProductID NOT IN {ph_syn}
-              AND s.Created >= :history_start
-              AND s.Created <= :fd
-              AND s.Created >= DATEADD(month, :neg_months, :fd)
+              AND {_SOLD_AT} >= :history_start
+              AND {_SOLD_AT} >= :window_start
+              AND {_SOLD_AT} < :window_end
         GROUP BY ca.ClientID
         """,
         {
             "fd": feature_date,
-            "neg_months": -window_months,
-            "history_start": history_start,
+            **window.params(),
             **cid_params,
             **syn,
         },
@@ -1046,8 +1090,8 @@ def features_many(
                   AND sri.Deleted = 0
                   AND oi.ProductID IS NOT NULL
                   AND oi.ProductID NOT IN {ph_syn}
-                  AND sr.FromDate <= :fd
-                  AND sr.FromDate >= DATEADD(month, :neg_months, :fd)
+                  AND sr.FromDate < :window_end
+                  AND sr.FromDate >= :window_start
                   AND sr.FromDate >= :history_start
             GROUP BY sr.ClientID, sri.SaleReturnID, sri.OrderItemID
         ) line
@@ -1055,8 +1099,7 @@ def features_many(
         """,
         {
             "fd": feature_date,
-            "neg_months": -window_months,
-            "history_start": history_start,
+            **window.params(),
             **cid_params,
             **syn,
         },

@@ -133,14 +133,22 @@ def test_policy_passes_effective_days_to_xyz_and_forecasting():
 
 
 def test_rolling_and_full_history_sql_are_floor_bounded():
-    rolling_sources = (
+    demand_sources = (
         supply_repo.product_daily_demand,
         supply_repo.product_daily_demand_bulk,
-        supply_repo.products_for_producer,
-        supply_repo.all_producers,
         supply_repo.procurement_source_readiness,
         supply_repo.all_products_revenue_eur,
         cost_repo.sale_prices_eur,
+    )
+    for fn in demand_sources:
+        source = _src(fn)
+        assert "rules.trailing_window(as_of, history_days)" in source, fn.__name__
+        assert "rules.demand_lines(" in source, fn.__name__
+
+    rolling_sources = (
+        supply_repo.products_by_producer_all,
+        supply_repo.all_producers,
+        supply_repo.procurement_source_readiness,
     )
     for fn in rolling_sources:
         source = _src(fn)
@@ -148,9 +156,10 @@ def test_rolling_and_full_history_sql_are_floor_bounded():
         assert ":history_start" in source, fn.__name__
 
     full_history_sources = (
-        supply_repo.producer_lead_times,
-        supply_repo.producer_agreement_currency,
+        supply_repo.producer_lead_times_all,
+        supply_repo.producer_agreement_currencies_all,
         supply_repo.derive_moq_terms,
+        supply_repo.supply_document_quantities,
         supply_repo._on_order_chunk,
     )
     for fn in full_history_sources:
@@ -214,5 +223,5 @@ def test_canonical_cache_rejects_history_metadata_drift():
 
 
 def test_cache_namespace_and_model_version_identify_the_floor():
-    assert "v11-verified-net-cost-h20250101" in cache.make_key("cart", "all", "2026-06-15")
+    assert "v17-placeholder-returns-h20250101" in cache.make_key("cart", "all", "2026-06-15")
     assert "floor20250101" in MODEL_VERSION

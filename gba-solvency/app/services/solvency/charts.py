@@ -19,9 +19,9 @@ from app.domain.models import (
     SolvencyCharts,
     TrendPoint,
     TurnoverExposurePoint,
+    UnconvertedDebt,
 )
 from app.domain.money import round_cent
-from app.services.solvency import score as scoring
 
 _AGING_ORDER = {"0-30": 0, "31-60": 1, "61-90": 2, "90+": 3}
 
@@ -29,9 +29,16 @@ _AGING_ORDER = {"0-30": 0, "31-60": 1, "61-90": 2, "90+": 3}
 _DIRECT_WORKERS = 6
 
 
-def _gauge(agreements: list[dict]) -> GaugeChart:
-    util = scoring.max_limit_utilization(agreements)
-    return GaugeChart(value=round(util, 4) if util is not None else 0.0)
+def _gauge(basis: list[dict]) -> GaugeChart:
+    if not basis:
+        return GaugeChart(value=None, status="no_limit", label="no_credit_limit")
+    worst = max(basis, key=lambda row: row["debt_amount"] / row["limit_amount"])
+    return GaugeChart(
+        value=round(float(worst["debt_amount"] / worst["limit_amount"]), 4),
+        debt_amount=float(round_cent(worst["debt_amount"])),
+        limit_amount=float(round_cent(worst["limit_amount"])),
+        currency_id=worst["currency_id"],
+    )
 
 
 def _donut(exposure: dict[str, int]) -> list[DonutSlice]:
@@ -63,15 +70,11 @@ def _aging_bars(buckets: list[dict]) -> list[AgingBar]:
 def _turnover_vs_exposure(
     monthly: list[dict],
     overdue_eur: float,
-    open_unpaid_count: int,
-    total_sales_count: int,
 ) -> list[TurnoverExposurePoint]:
     """Per-month turnover vs a flat current-exposure reference line (point-in-time exposure,
     since per-month historical exposure needs the Debt aging-over-time data that is still pending).
     """
     exposure = overdue_eur
-    if exposure <= 0 and total_sales_count > 0 and open_unpaid_count > 0:
-        exposure = 0.0
     return [
         TurnoverExposurePoint(
             period=m["period"],
@@ -120,13 +123,11 @@ def _build_charts_locked(
     with ThreadPoolExecutor(max_workers=_DIRECT_WORKERS) as pool:
         f_donut = pool.submit(repo.debt_exposure_donut_truth, client_id, as_of, window_months,
                               fx_date)
-        f_agreements = pool.submit(repo.credit_limit_utilization, client_id)
+        f_agreements = pool.submit(repo.limit_utilization_basis, client_id, as_of)
         f_aging = pool.submit(repo.debt_aging_buckets_truth, client_id, as_of, fx_date)
         f_monthly = pool.submit(repo.monthly_turnover_series, client_id, as_of, window_months,
                                 fx_date)
         f_sync = pool.submit(repo.debt_sync_is_live)
-        f_open = pool.submit(repo.open_unpaid_stats, client_id, as_of, window_months)
-        f_total = pool.submit(repo.total_sales_count, client_id, as_of, window_months)
 
         sync_live = f_sync.result()
         overdue = (
@@ -137,17 +138,18 @@ def _build_charts_locked(
         agreements = f_agreements.result()
         aging = f_aging.result()
         monthly = f_monthly.result()
-        open_stats = f_open.result()
-        total_sales = f_total.result()
 
     return SolvencyCharts(
         client_id=client_id,
         limit_utilization_gauge=_gauge(agreements),
         payment_discipline_donut=_donut(exposure),
+        donut_outside_window_lines=int(exposure.get("outside_window_lines", 0)),
+        unconverted_debt=[
+            UnconvertedDebt(**row)
+            for row in repo.unconverted_debt([client_id], as_of, fx_date).get(client_id, [])
+        ],
         open_invoice_aging_bars=_aging_bars(aging),
-        turnover_vs_exposure=_turnover_vs_exposure(
-            monthly, overdue, int(open_stats.get("open_count", 0)), total_sales
-        ),
+        turnover_vs_exposure=_turnover_vs_exposure(monthly, overdue),
         score_sparkline=[],
         score_sparkline_status="unavailable",
         score_sparkline_reason_code="historical_state_not_recorded",

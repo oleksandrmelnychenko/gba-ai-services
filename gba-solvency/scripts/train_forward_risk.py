@@ -174,6 +174,9 @@ def info_value(bins, ytr) -> float:
     return float(iv)
 
 
+_L1_RATIO = {"l2": 0.0, "l1": 1.0}
+
+
 def fit_scorecard(Xtr, ytr, feat_cols, C: float = 1.0, penalty: str = "l2"):
     ytr = np.asarray(ytr).astype(int)
     bins_map, iv_map = {}, {}
@@ -184,7 +187,7 @@ def fit_scorecard(Xtr, ytr, feat_cols, C: float = 1.0, penalty: str = "l2"):
         bins_map[c] = bins
         woe_tr[:, j] = apply_woe(Xtr[c], bins)
     solver = "liblinear" if penalty == "l1" else "lbfgs"
-    lr = LogisticRegression(max_iter=4000, C=C, penalty=penalty, solver=solver)
+    lr = LogisticRegression(max_iter=4000, C=C, l1_ratio=_L1_RATIO[penalty], solver=solver)
     lr.fit(woe_tr, ytr)
     return {"bins": bins_map, "lr": lr, "feat_cols": feat_cols, "iv": iv_map,
             "C": C, "penalty": penalty}

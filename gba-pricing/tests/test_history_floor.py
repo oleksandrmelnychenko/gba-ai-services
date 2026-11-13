@@ -87,15 +87,15 @@ def test_all_behavioral_repository_sql_is_clamped(monkeypatch):
 
     assert len(captured) == 5
     for sql, params in captured:
-        assert "Created >= :source_history_start" in sql
-        assert params["source_history_start"] == "2025-01-01"
-        assert params["asof"] == "2025-06-15"
-        assert params["neg_months"] == -12
+        assert "s.ChangedToInvoice >= :window_from AND s.ChangedToInvoice < :window_to" in sql
+        assert "Created" not in sql.replace("FORMAT(s.Created", "")
+        assert params["window_from"] == datetime(2024, 12, 31, 22, 0)
+        assert params["window_to"] == datetime(2025, 6, 14, 21, 0)
 
     group_sql = captured[-1][0]
     assert "JOIN dbo.Sale s2 ON s2.OrderID = o2.ID" in group_sql
-    assert "s2.Created >= :source_history_start" in group_sql
-    assert group_sql.count(">= :source_history_start") == 2
+    assert "s2.ChangedToInvoice >= :window_from AND s2.ChangedToInvoice < :window_to" in group_sql
+    assert group_sql.count(">= :window_from") == 2
 
 
 def test_repository_rejects_pre_floor_as_of_before_query(monkeypatch):
@@ -145,7 +145,7 @@ def test_source_readiness_exposes_and_applies_history_floor(monkeypatch):
     assert readiness["business_ready"] is True
 
 
-def test_backtest_queries_obey_the_same_floor(monkeypatch):
+def test_backtest_queries_use_the_serving_sale_definition(monkeypatch):
     captured: list[tuple[str, dict]] = []
 
     def fake_query(sql, params=None):
@@ -153,16 +153,40 @@ def test_backtest_queries_obey_the_same_floor(monkeypatch):
         return []
 
     monkeypatch.setattr(elasticity_backtest, "query", fake_query)
+    monkeypatch.setattr(repo, "query", fake_query)
+    monkeypatch.setattr(repo, "synthetic_product_id", lambda: 999)
     assert elasticity_backtest._estimable_products("2025-06-15", 12, 100, 10) == []
     assert elasticity_backtest._pre_panel(7, "2025-06-15", 12) == []
-    assert elasticity_backtest._period_aggregate(7, "2024-01-01", "2025-02-01") is None
+    assert (
+        elasticity_backtest._period_aggregate(7, date(2024, 1, 1), date(2025, 2, 1)) is None
+    )
 
     assert len(captured) == 3
     for sql, params in captured:
-        assert "s.Created >= :source_history_start" in sql
-        assert params["source_history_start"] == "2025-01-01"
+        assert repo.CONFIRMED_SALE in sql
+        assert repo.KEPT_LINE in sql
+        assert "s.ChangedToInvoice >= :window_from AND s.ChangedToInvoice < :window_to" in sql
+        assert "Created" not in sql.replace("FORMAT(s.Created", "")
+        assert "25422404" not in sql
+        assert params["synthetic"] == 999
+        assert params["window_from"] == datetime(2024, 12, 31, 22, 0)
+    assert captured[0][1]["window_to"] == datetime(2025, 6, 14, 21, 0)
+    assert captured[1][1]["window_to"] == datetime(2025, 6, 14, 21, 0)
+    assert captured[2][1]["window_to"] == datetime(2025, 1, 31, 22, 0)
     with pytest.raises(ValueError, match="as_of_date_before_source_history_start"):
-        elasticity_backtest._history_query_params("2024-12-31", 12)
+        elasticity_backtest._estimable_products("2024-12-31", 12, 100, 10)
+
+
+def test_backtest_pre_panel_maps_serving_panel_rows(monkeypatch):
+    monkeypatch.setattr(
+        repo,
+        "product_panel",
+        lambda pid, as_of, months: [
+            {"agreement_id": 5, "month": "2025-03", "qty": 4, "price": 12.5}
+        ],
+    )
+    cells = elasticity_backtest._pre_panel(7, "2025-06-15", 12)
+    assert cells == [elasticity_backtest.el.PanelCell(5, "2025-03", 4.0, 12.5)]
 
 
 def test_backtest_rejects_pre_floor_as_of_before_data_access(monkeypatch, capsys):

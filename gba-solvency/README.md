@@ -49,7 +49,7 @@ See [the exact model card](app/risk/artifacts/MODEL_CARD.md) and
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 cp .env.example .env   # fill DB_PASSWORD with the read-only login
-.venv/bin/uvicorn app.api.main:app --host 0.0.0.0 --port 8003
+.venv/bin/uvicorn app.api.main:app --host 127.0.0.1 --port 8003
 ```
 
 ## API

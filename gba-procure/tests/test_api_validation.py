@@ -364,9 +364,10 @@ def test_current_evaluated_zero_cart_is_cached_as_a_valid_plan(monkeypatch, queu
     result = main.plan_cart(CartPlanRequest())
 
     assert result.item_count == 0
-    assert len(writes) == 1
+    assert [(":cart:all:" in key, ttl) for key, _, ttl in writes] == [(True, 691200), (False, 172800)]
+    assert ":cartlast:all:" in writes[1][0] and writes[1][1] == writes[0][1]
     assert writes[0][1]["_source_fingerprint"] == "source-fp"
-    assert writes[0][2] == 691200
+    assert writes[0][1]["stale"] is False and writes[0][1]["built_at"].endswith("Z")
 
 
 def test_user_filtered_historical_empty_cart_remains_valid(monkeypatch, queued_warms):

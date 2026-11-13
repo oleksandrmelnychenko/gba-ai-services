@@ -104,6 +104,43 @@ def product_terms_for(producer_id: int, product_ids: list[int], *, required: boo
         return {}
 
 
+def producer_profiles_all(*, required: bool = False) -> dict[int, dict]:
+    try:
+        coll = _producer_profiles()
+        if coll is None:
+            if required:
+                raise MastersReadError("masters_store_unavailable")
+            return {}
+        return {int(d["producer_id"]): d for d in coll.find({}, {"_id": 0}, max_time_ms=10000)}
+    except MastersReadError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        if required:
+            raise MastersReadError("masters_profile_read_failed") from exc
+        log.warning("producer_profiles_read_failed", error_type=type(exc).__name__)
+        return {}
+
+
+def product_terms_all(*, required: bool = False) -> dict[int, dict[int, dict]]:
+    try:
+        coll = _product_terms()
+        if coll is None:
+            if required:
+                raise MastersReadError("masters_store_unavailable")
+            return {}
+        out: dict[int, dict[int, dict]] = {}
+        for d in coll.find({}, {"_id": 0}, max_time_ms=10000):
+            out.setdefault(int(d["producer_id"]), {})[int(d["product_id"])] = d
+        return out
+    except MastersReadError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        if required:
+            raise MastersReadError("masters_terms_read_failed") from exc
+        log.warning("product_terms_read_failed", error_type=type(exc).__name__)
+        return {}
+
+
 def require_read_access() -> None:
     """Bounded collection permission checks, including valid empty collections.
 

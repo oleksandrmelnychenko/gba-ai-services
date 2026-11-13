@@ -353,12 +353,21 @@ def plan_cart(req: CartPlanRequest) -> CartReplenishmentPlan:
                 _save_captured(key, plan, source, 3600)
                 return plan
             _queue_canonical_cart(as_of)
+            last_good = worker.last_good_canonical_cart(as_of)
+            if last_good is not None:
+                log.info("stale_cart_served", as_of=as_of, built_at=last_good.built_at)
+                if canonical:
+                    return last_good
+                return policy.captured_cart_variant(
+                    last_good, budget_eur=budget, method=req.method, limit=req.limit
+                )
         else:
 
             def build() -> None:
                 current = (
                     worker.require_source_readiness(as_of, force=True) if req.as_of_date is None else None
                 )
+                products_by_producer, inputs = worker.cart_inputs(as_of, req.active_days)
                 plan = policy.build_cart_plan(
                     as_of,
                     only_needed=req.only_needed,
@@ -367,6 +376,8 @@ def plan_cart(req: CartPlanRequest) -> CartReplenishmentPlan:
                     method=req.method,
                     active_days=req.active_days,
                     source_fingerprint=current.get("source_fingerprint") if current else None,
+                    products_by_producer=products_by_producer,
+                    **({"inputs": inputs} if inputs is not None else {}),
                 )
                 _save_captured(key, plan, current, 3600)
 

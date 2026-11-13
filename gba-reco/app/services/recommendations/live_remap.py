@@ -8,11 +8,13 @@ the gba-server hydration filters Deleted=0, so the client sees an empty list.
 The natural key across generations is VendorCode — map every recommended id to the
 newest live row with the same VendorCode (identity for ids that are already live),
 drop the ones with no live counterpart, and dedupe generations that collapse onto
-the same live row (first/highest-ranked wins).
+the same live row (first/highest-ranked wins). Sibling cards of one article (gba-server's
+sibling rule) collapse the same way: one card per article.
 """
 from __future__ import annotations
 
 from app.core.logging import get_logger
+from app.data import sales_repository as repo
 from app.data.db import in_clause, query
 from app.domain.models import ProductRec
 
@@ -45,13 +47,15 @@ def remap_recs_to_live(recs: list[ProductRec]) -> list[ProductRec]:
     if not recs:
         return recs
     mapping = live_product_map([r.product_id for r in recs])
+    articles = repo.sibling_articles()
     seen: set[int] = set()
     kept: list[ProductRec] = []
     for rec in recs:
         live_id = mapping.get(rec.product_id)
-        if live_id is None or live_id in seen:
+        article = articles.get(live_id, live_id)
+        if live_id is None or article in seen:
             continue
-        seen.add(live_id)
+        seen.add(article)
         rec.product_id = live_id
         rec.rank = len(kept) + 1
         kept.append(rec)

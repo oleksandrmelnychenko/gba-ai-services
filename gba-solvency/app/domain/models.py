@@ -62,6 +62,9 @@ class CapType(StrEnum):
     UTILIZATION_SOFT_60 = "utilization_soft_60"
     BLOCKED_HALF = "blocked_half"
     CURRENT_SEV180_PD_FLOOR = "current_sev180_pd_floor"
+    HOPELESS_DEBT_ROLE = "hopeless_debt_role"
+    OVERDUE_90_PLUS = "overdue_90_plus"
+    OVERDUE_30_PLUS = "overdue_30_plus"
 
 
 class SubFactor(BaseModel):
@@ -116,6 +119,20 @@ class ForwardRisk(BaseModel):
     pd: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
 
 
+class UnconvertedDebt(BaseModel):
+    """Open debt lines kept out of every EUR figure: the currency has no rate on fx_date."""
+
+    currency_id: int | None
+    currency: str | None
+    lines: int = Field(ge=1)
+    amount: float = Field(ge=0.0, allow_inf_nan=False)
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def _round_amount(cls, value):
+        return float(round_cent(value))
+
+
 class Risk90dBand(StrEnum):
     LOW = "low"
     MEDIUM = "medium"
@@ -138,8 +155,13 @@ class Risk90d(BaseModel):
     band: Risk90dBand
     exposure_eur: float = Field(ge=0.0, allow_inf_nan=False)
     reason_code: Risk90dReason
+    overdue_91_plus_eur: float = Field(ge=0.0, allow_inf_nan=False)
+    overdue_1_90_eur: float = Field(ge=0.0, allow_inf_nan=False)
+    total_debt_eur: float = Field(ge=0.0, allow_inf_nan=False)
 
-    @field_validator("exposure_eur", mode="before")
+    @field_validator(
+        "exposure_eur", "overdue_91_plus_eur", "overdue_1_90_eur", "total_debt_eur", mode="before"
+    )
     @classmethod
     def _round_exposure(cls, value):
         return float(round_cent(value))
@@ -172,7 +194,13 @@ class Risk90d(BaseModel):
                 )
             )
         )
-        if not valid:
+        shown = {
+            Risk90dBand.LOW: 0.0,
+            Risk90dBand.MEDIUM: self.total_debt_eur,
+            Risk90dBand.HIGH: self.overdue_1_90_eur,
+            Risk90dBand.CRITICAL: self.overdue_91_plus_eur,
+        }[self.band]
+        if not valid or self.exposure_eur != shown:
             raise ValueError("risk_90d operational fields are inconsistent")
         return self
 
@@ -220,6 +248,7 @@ class SolvencyScore(CurrentObservation):
         default=None, description="weighted sum * 100 before caps/rounding"
     )
     currency_breakdown: list[CurrencyExposure] | None = None
+    unconverted_debt: list[UnconvertedDebt] = Field(default_factory=list)
     data_sufficiency: DataSufficiency = DataSufficiency.OK
     data_sufficiency_reason: str | None = None
     source_history_start: str = "2025-01-01"
@@ -229,13 +258,67 @@ class SolvencyScore(CurrentObservation):
     window_months: int = Field(default=12, ge=12, le=12, strict=True)
     model_version: str = "creditscore-v3"
     current_model_run_id: str | None = None
+    policy_reason_code: str | None = Field(
+        default=None,
+        description="set when a deterministic policy, not the scorecard, decided the rating",
+    )
+    policy_reason: str | None = None
+
+
+class SolvencyScoreSlim(BaseModel):
+    """List-view projection of SolvencyScore (opt-in `slim` batch mode).
+
+    Carries only what a clients-list gauge renders; the explainability payload
+    (contributions, currency breakdown, deprecated fields) and the per-row copies of the
+    request-wide metadata are left out. The shared metadata is returned once as batch `meta`.
+    """
+    client_id: int
+    applicable: bool
+    score: int | None
+    rating: Rating | None
+    pd: float | None
+    risk_90d: Risk90d | None
+    data_sufficiency: DataSufficiency
+    data_sufficiency_reason: str | None
+    caps_applied: list[CapType]
+    policy_reason_code: str | None
+    policy_reason: str | None
+
+
+class BatchMeta(BaseModel):
+    state_basis: str
+    business_timezone: str
+    fx_date: str
+    as_of_date: str
+    window_months: int
+    model_version: str
+    source_history_start: str
+    effective_start: str | None
+    history_complete: bool
 
 
 class GaugeChart(BaseModel):
-    value: float = Field(ge=0.0, allow_inf_nan=False)
+    """Open debt / credit limit of the agreement with the highest utilisation.
+
+    status="ok": value is the ratio; debt_amount and limit_amount are in the currency
+    currency_id (the agreement currency). status="no_limit": the buyer has no amount-controlled
+    agreement with a limit, value is null. status="not_applicable": not a buyer, value is null.
+    """
+
+    value: float | None = Field(ge=0.0, allow_inf_nan=False)
+    status: Literal["ok", "no_limit", "not_applicable"] = "ok"
+    debt_amount: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    limit_amount: float | None = Field(default=None, gt=0.0, allow_inf_nan=False)
+    currency_id: int | None = None
     threshold_soft: float = Field(default=0.9, ge=0.0, allow_inf_nan=False)
     threshold_hard: float = Field(default=1.0, ge=0.0, allow_inf_nan=False)
     label: str = "limit_utilization"
+
+    @model_validator(mode="after")
+    def _value_matches_status(self) -> Self:
+        if (self.value is None) != (self.status != "ok"):
+            raise ValueError("gauge value must be present exactly when status is ok")
+        return self
 
 
 class DonutSlice(BaseModel):
@@ -285,6 +368,8 @@ class SolvencyCharts(CurrentObservation):
     applicable: bool = True
     limit_utilization_gauge: GaugeChart
     payment_discipline_donut: list[DonutSlice]
+    donut_outside_window_lines: int = Field(default=0, ge=0)
+    unconverted_debt: list[UnconvertedDebt] = Field(default_factory=list)
     open_invoice_aging_bars: list[AgingBar]
     turnover_vs_exposure: list[TurnoverExposurePoint]
     score_sparkline: list[ScorePoint] = Field(max_length=0)
@@ -347,6 +432,7 @@ class BatchScoreRequest(BaseModel):
     as_of_date: date | None = None
     window_months: int = Field(default=12, ge=12, le=12, strict=True)
     use_cache: bool = True
+    slim: bool = False
 
     @field_validator("client_ids")
     @classmethod

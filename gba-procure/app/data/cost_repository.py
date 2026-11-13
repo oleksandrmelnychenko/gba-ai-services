@@ -8,8 +8,8 @@ from __future__ import annotations
 from decimal import ROUND_HALF_UP, Decimal
 from statistics import median
 
-from app.core.history import history_start_iso
 from app.core.logging import get_logger
+from app.data import source_rules as rules
 from app.data.db import in_clause, query
 from app.data.purchase_cost_cohort import PurchaseCostCohort, read_purchase_cost_cohort
 from app.data.synthetic import synthetic_product_id
@@ -79,26 +79,15 @@ def sale_prices_eur(
     for start in range(0, len(ids), _IN_CHUNK):
         chunk = ids[start : start + _IN_CHUNK]
         ph, params = in_clause("p", chunk)
-        params.update(
-            {
-                "asof": as_of,
-                "days": history_days,
-                "history_start": history_start_iso(),
-                "syn": syn,
-            }
-        )
+        params.update({"syn": syn, **rules.trailing_window(as_of, history_days)})
         rows = query(
             f"""
-            SELECT oi.ProductID AS pid, oi.PricePerItem AS price
-            FROM dbo.[Order] o
-            JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-            WHERE oi.IsValidForCurrentSale = 1
-                  AND oi.PricePerItem > 0
-                  AND oi.ProductID <> :syn
-                  AND oi.ProductID IN {ph}
-                  AND o.Created < :asof
-                  AND o.Created >= DATEADD(day, -:days, :asof)
-                  AND o.Created >= :history_start
+            SELECT d.product_id AS pid, d.price AS price
+            FROM {rules.demand_lines()}
+            WHERE d.price > 0
+                  AND d.units > 0
+                  AND d.product_id <> :syn
+                  AND d.product_id IN {ph}
             """,
             params,
         )

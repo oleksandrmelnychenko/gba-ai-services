@@ -121,6 +121,17 @@ def test_base_list_markup_extra_charge_from_agreement_pricing_in_sql():
     assert "PricingProductGroupDiscount" in src
 
 
+def test_base_list_markup_uses_the_agreement_worlds_source_definition():
+    import inspect
+
+    src = inspect.getsource(repo.base_list_price_and_markup)
+    assert "psd.PricingID = agr_pr.ID AND psd.ImportedForAmg = world.for_amg" in src
+    assert "{AGREEMENT_WORLD}" in src
+    assert "ELSE org.PriceSourceIsAmg" in repo.AGREEMENT_WORLD
+    assert src.index("ppgd.CalculatedExtraCharge IS NOT NULL") < src.index("world_def.CalculatedExtraCharge IS NOT NULL")
+    assert src.index("world_def.CalculatedExtraCharge IS NOT NULL") < src.index("ELSE agr_pr.CalculatedExtraCharge")
+
+
 def test_segment_discount_distribution_shape(monkeypatch):
     monkeypatch.setattr(repo, "query", lambda *a, **k: [
         {"p75": 12.0, "p90": 18.0, "n": 40}])
@@ -173,3 +184,97 @@ def test_repository_money_aggregates_remain_decimal(monkeypatch):
         lambda *a, **k: [{"baseline_price": 1.005}],
     )
     assert repo.baseline_price("p", "ca", "uk", True) == Decimal("1.005")
+
+
+def test_segment_discount_distribution_cached_per_segment_and_generation(monkeypatch):
+    calls = []
+
+    def fake_query(sql, params=None):
+        calls.append(dict(params))
+        return [{"p75": 12.0, "p90": 18.0, "n": 40}]
+
+    generation = {"value": "daily-2026-11-12"}
+    monkeypatch.setattr(repo, "query", fake_query)
+    monkeypatch.setattr(repo, "refresh_generation", lambda: generation["value"])
+
+    first = repo.segment_discount_distribution(106, 849, "uk")
+    first["p75"] = -1.0
+    second = repo.segment_discount_distribution(106, 849, "uk")
+    assert second == {"p75": 12.0, "p90": 18.0, "n": 40}
+    assert len(calls) == 1
+
+    repo.segment_discount_distribution(107, 849, "uk")
+    repo.segment_discount_distribution(106, 850, "uk")
+    repo.segment_discount_distribution(106, 849, "pl")
+    assert len(calls) == 4
+
+    generation["value"] = "daily-2026-11-13"
+    repo.segment_discount_distribution(106, 849, "uk")
+    assert len(calls) == 5
+    assert all(key[3] == "daily-2026-11-13" for key in repo._segment_cache)
+
+
+def test_segment_discount_distribution_caches_empty_segment(monkeypatch):
+    calls = []
+
+    def fake_query(sql, params=None):
+        calls.append(1)
+        return []
+
+    monkeypatch.setattr(repo, "query", fake_query)
+    assert repo.segment_discount_distribution(1, 2, "uk") == {"p75": None, "p90": None, "n": 0}
+    assert repo.segment_discount_distribution(1, 2, "uk") == {"p75": None, "p90": None, "n": 0}
+    assert len(calls) == 1
+
+
+def test_segment_discount_distribution_resolves_tier_family_once_not_per_row():
+    import inspect
+
+    src = inspect.getsource(repo.segment_discount_distribution)
+    assert "dbo.GetBasePricingId(p.ID) = :base_pricing_id" in src
+    assert "GetBasePricingId(a.PricingID)" not in src
+    assert "JOIN fam ON fam.ID = a.PricingID" in src
+    assert "pr.ID = :base_pricing_id AND pr.Culture = :culture" in src
+
+
+def test_synthetic_product_lookup_failure_never_falls_back_to_a_configured_id(monkeypatch):
+    from app.core.config import Settings
+
+    def boom(*a, **k):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(repo, "query", boom)
+    monkeypatch.setattr(repo, "_synthetic_id", None)
+    monkeypatch.setattr(repo, "_synthetic_expires_at", 0.0)
+    assert repo.synthetic_product_id() == 0
+    assert "synthetic_line_product_id" not in Settings.model_fields
+
+
+def test_synthetic_product_keeps_last_resolved_id_when_lookup_fails(monkeypatch):
+    monkeypatch.setattr(repo, "_synthetic_id", None)
+    monkeypatch.setattr(repo, "_synthetic_expires_at", 0.0)
+    monkeypatch.setattr(repo, "query", lambda *a, **k: [{"ID": 38774381}])
+    assert repo.synthetic_product_id() == 38774381
+    monkeypatch.setattr(repo, "_synthetic_expires_at", 0.0)
+
+    def boom(*a, **k):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(repo, "query", boom)
+    assert repo.synthetic_product_id() == 38774381
+
+
+def test_peer_band_reads_sale_lines_once_into_a_session_scoped_table(monkeypatch):
+    captured = {}
+
+    def fake_query(sql, params=None):
+        captured["sql"] = sql
+        return []
+
+    monkeypatch.setattr(repo, "query", fake_query)
+    monkeypatch.setattr(repo, "synthetic_product_id", lambda: 1)
+    assert repo.peer_band(7, "2026-06-15", 12, "2026-06-15")["n"] == 0
+    sql = captured["sql"]
+    assert sql.count("FROM dbo.OrderItem oi") == 1
+    assert sql.index("DROP TABLE IF EXISTS #priced") < sql.index("INTO #priced")
+    assert "WITH priced AS (SELECT ca_id, eur_price FROM #priced)" in sql

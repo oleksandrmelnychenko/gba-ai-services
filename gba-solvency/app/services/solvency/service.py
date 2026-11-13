@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from pydantic import ValidationError
@@ -31,10 +30,13 @@ from app.domain.models import (
     Risk90dReason,
     SolvencyCharts,
     SolvencyScore,
+    UnconvertedDebt,
 )
 from app.domain.money import round_cent
 from app.risk import dataset as risk_dataset
+from app.risk import payment_behaviour
 from app.risk.score_current import score_current
+from app.risk.score_index import INDEX_MODEL_VERSION, score_index
 from app.services.solvency import charts as charts_builder
 
 log = get_logger("solvency_service")
@@ -44,6 +46,9 @@ _BAND_TO_RATING = {"A": Rating.A, "B": Rating.B, "C": Rating.C, "D": Rating.D}
 
 _NO_SALES_24MO_DAYS = 730.0
 _OPERATIONAL_RISK_MIN_EUR = 100.0
+
+HOPELESS_DEBT_REASON_CODE = CapType.HOPELESS_DEBT_ROLE.value
+HOPELESS_DEBT_REASON = "Клієнт у групі безнадійної заборгованості"
 
 
 def _data_sufficiency(features: dict[str, float]) -> tuple[DataSufficiency, str | None]:
@@ -72,6 +77,14 @@ def _data_sufficiency(features: dict[str, float]) -> tuple[DataSufficiency, str 
             f"{history_start}",
         )
     return DataSufficiency.OK, None
+
+
+def _uses_index(settings) -> bool:
+    return settings.model_version == INDEX_MODEL_VERSION
+
+
+def _engine_score(features: dict[str, float], settings) -> dict:
+    return score_index(features) if _uses_index(settings) else score_current(features)
 
 
 def _resolve_client_id(client_id: int | None, client_net_uid: str | None) -> int:
@@ -181,6 +194,11 @@ def _hydrate_charts(
     return result
 
 
+def _policy_matches(result: SolvencyScore, hopeless_debt: bool) -> bool:
+    """A cached entry is only valid while the client's policy group is unchanged."""
+    return (result.policy_reason_code == HOPELESS_DEBT_REASON_CODE) == hopeless_debt
+
+
 def _risk_90d(features: dict[str, float]) -> Risk90d:
     """Classify exact open exposure by what can happen within the next 90 days.
 
@@ -214,35 +232,60 @@ def _risk_90d(features: dict[str, float]) -> Risk90d:
         )
     )
 
+    amounts = {
+        "overdue_91_plus_eur": overdue_90_plus,
+        "overdue_1_90_eur": overdue_1_90,
+        "total_debt_eur": total_debt,
+    }
     if overdue_90_plus >= _OPERATIONAL_RISK_MIN_EUR:
         return Risk90d(
             band=Risk90dBand.CRITICAL,
             exposure_eur=overdue_90_plus,
             reason_code=Risk90dReason.ALREADY_90_PLUS,
+            **amounts,
         )
     if overdue_1_90 >= _OPERATIONAL_RISK_MIN_EUR:
         return Risk90d(
             band=Risk90dBand.HIGH,
             exposure_eur=overdue_1_90,
             reason_code=Risk90dReason.WILL_CROSS_90_DAYS,
+            **amounts,
         )
     if total_debt > 0.0:
         return Risk90d(
             band=Risk90dBand.MEDIUM,
             exposure_eur=total_debt,
             reason_code=Risk90dReason.CURRENT_DEBT,
+            **amounts,
         )
     return Risk90d(
         band=Risk90dBand.LOW,
         exposure_eur=0.0,
         reason_code=Risk90dReason.NO_DEBT,
+        **amounts,
     )
+
+
+def _unconverted(rows: list[dict] | None) -> list[UnconvertedDebt]:
+    return [UnconvertedDebt(**row) for row in rows or []]
 
 
 def _currency_breakdown(
     client_id: int, as_of: str, window_months: int, fx_date: str
 ) -> list[CurrencyExposure] | None:
-    rows = repo.turnover_eur_by_currency(client_id, as_of, window_months, fx_date)
+    return _currency_exposures(
+        repo.turnover_eur_by_currency(client_id, as_of, window_months, fx_date)
+    )
+
+
+def _currency_breakdowns(
+    client_ids: list[int], as_of: str, window_months: int, fx_date: str
+) -> dict[int, list[CurrencyExposure] | None]:
+    rows_by_cid = repo.turnover_eur_by_currency_many(client_ids, as_of, window_months, fx_date)
+    return {cid: _currency_exposures(rows_by_cid.get(cid, [])) for cid in client_ids}
+
+
+def _currency_exposures(rows: list[dict]) -> list[CurrencyExposure] | None:
     if len(rows) <= 1:
         return None
     return [
@@ -305,7 +348,7 @@ def _not_applicable_charts(cid: int, as_of: str, window_months: int) -> Solvency
     return SolvencyCharts(
         client_id=cid,
         applicable=False,
-        limit_utilization_gauge=GaugeChart(value=0.0),
+        limit_utilization_gauge=GaugeChart(value=None, status="not_applicable"),
         payment_discipline_donut=[],
         open_invoice_aging_bars=[],
         turnover_vs_exposure=[],
@@ -333,14 +376,50 @@ def _build_score(
     as_of: str,
     window_months: int,
     settings,
+    hopeless_debt: bool = False,
 ) -> SolvencyScore:
     """Assemble the applicable-buyer SolvencyScore from a feature dict.
 
     This is the single shared code path for the score math so the per-client (/score) and
     set-based batch (/score/batch) routes are guaranteed bit-identical: same score_current,
     same operational 90-day control, same rounding.
+
+    A client in the hopeless-debt group gets a fixed policy result (0 / D / PD 1.0) whatever
+    the features say: that debt is not in the imported open-debt tables, so the scorecard and
+    the sufficiency flag would both describe a clean or empty buyer.
     """
     history = coverage(as_of, window_months)
+    if hopeless_debt:
+        return SolvencyScore(
+            client_id=cid,
+            client_net_uid=client_net_uid,
+            applicable=True,
+            score=0,
+            rating=Rating.D,
+            pd=1.0,
+            contributions=[],
+            risk_90d=_risk_90d(features),
+            forward_risk=None,
+            forward_risk_status=ForwardRiskStatus.NOT_APPLICABLE,
+            forward_risk_reason="replaced_by_operational_90d",
+            sub_factors=None,
+            caps_applied=[CapType.HOPELESS_DEBT_ROLE],
+            debt_load_source=None,
+            raw_score=None,
+            currency_breakdown=currency,
+            data_sufficiency=DataSufficiency.OK,
+            data_sufficiency_reason=None,
+            source_history_start=history.source_history_start.isoformat(),
+            effective_start=history.effective_start.isoformat(),
+            history_complete=history.history_complete,
+            as_of_date=as_of,
+            **observation_fields(as_of),
+            window_months=window_months,
+            model_version=settings.model_version,
+            current_model_run_id=_engine_score(features, settings)["model_version"],
+            policy_reason_code=HOPELESS_DEBT_REASON_CODE,
+            policy_reason=HOPELESS_DEBT_REASON,
+        )
     sufficiency, sufficiency_reason = _data_sufficiency(features)
     if sufficiency == DataSufficiency.INSUFFICIENT:
         return SolvencyScore(
@@ -372,7 +451,7 @@ def _build_score(
             current_model_run_id=None,
         )
 
-    current = score_current(features)
+    current = _engine_score(features, settings)
     return SolvencyScore(
         client_id=cid,
         client_net_uid=client_net_uid,
@@ -442,13 +521,14 @@ def score_client(
         log.info("score_not_applicable", client_id=cid, latency_ms=round(latency, 2))
         return result
 
+    hopeless_debt = repo.has_hopeless_debt_role(cid)
     key = cache.make_key(cid, as_of, window_months)
 
     if use_cache:
         cached = cache.get(key)
         if cached is not None:
             result = _hydrate_score(cached, cid, as_of, window_months)
-            if result is not None:
+            if result is not None and _policy_matches(result, hopeless_debt):
                 if client_net_uid is not None:
                     result = result.model_copy(
                         update={"client_net_uid": client_net_uid.lower()}
@@ -459,6 +539,8 @@ def score_client(
     error = False
     try:
         features = risk_dataset.features_one(cid, as_of, window_months)
+        if _uses_index(settings):
+            features.update(payment_behaviour.behaviour_many([cid], as_of)[cid])
         fx_date = context.fx_date
         currency = _currency_breakdown(cid, as_of, window_months, fx_date)
         result = _build_score(
@@ -469,7 +551,11 @@ def score_client(
             as_of,
             window_months,
             settings,
+            hopeless_debt=hopeless_debt,
         )
+        result = result.model_copy(update={
+            "unconverted_debt": _unconverted(repo.unconverted_debt([cid], as_of, fx_date).get(cid))
+        })
     except Exception:
         error = True
         METRICS.record_request((datetime.now() - started).total_seconds() * 1000, error=True)
@@ -511,7 +597,9 @@ def score_batch(
       1. unknown client_id -> error (LookupError text), isolated.
       2. non-buyer -> applicable=false result (the gate).
       3. cache hit (when use_cache) -> hydrate cached result.
-      4. else -> set-based features -> _build_score -> cache.set.
+      4. else -> set-based features -> _build_score -> cache.set_many.
+    The gate (exists / buyer / hopeless-debt group) and the cache read are one statement and
+    one MGET for the whole list, not a round trip per id.
 
     Returns (results, errors) where errors is [{client_id, error}]. Per-client errors are
     isolated so one bad id never fails the batch.
@@ -527,60 +615,63 @@ def score_batch(
     # preserve caller order; de-dupe so a repeated id isn't scored twice
     ordered_ids = list(dict.fromkeys(int(c) for c in client_ids))
 
-    # Phase 1 — resolve gate + cache per id (cheap point lookups). Collect the ids that still
-    # need a fresh feature pull, keyed so we can reassemble in caller order at the end.
+    # Phase 1 — one set-based gate query and one MGET for the whole id list. Collect the ids
+    # that still need a fresh feature pull, keyed so we can reassemble in caller order.
     pending: list[int] = []
     resolved: dict[int, SolvencyScore] = {}
+    gates = repo.client_gates(ordered_ids)
+    hopeless: set[int] = set()
+    candidates: list[int] = []
     for cid in ordered_ids:
-        try:
-            if not repo.client_exists(cid):
-                raise LookupError(f"client_id not found: {cid}")
-            if not repo.has_buyer_role(cid):
-                resolved[cid] = _not_applicable(
-                    cid, None, as_of, window_months, settings
-                )
-                continue
-            if use_cache:
-                cached = cache.get(cache.make_key(cid, as_of, window_months))
-                if cached is not None:
-                    hydrated = _hydrate_score(cached, cid, as_of, window_months)
-                    if hydrated is not None:
-                        resolved[cid] = hydrated
-                        continue
-            pending.append(cid)
-        except LookupError as exc:
-            errors.append({"client_id": cid, "error": str(exc)})
-        except Exception as exc:  # noqa: BLE001
-            err_id = uuid.uuid4().hex
-            log.error("score_batch_item_failed", client_id=cid, error_id=err_id, error=str(exc))
-            errors.append({"client_id": cid, "error": f"internal error (ref {err_id})"})
+        gate = gates.get(cid)
+        if gate is None:
+            errors.append({"client_id": cid, "error": f"client_id not found: {cid}"})
+        elif not gate.is_buyer:
+            resolved[cid] = _not_applicable(cid, None, as_of, window_months, settings)
+        else:
+            candidates.append(cid)
+            if gate.hopeless_debt:
+                hopeless.add(cid)
+    if use_cache and candidates:
+        cached_entries = cache.get_many(
+            [cache.make_key(cid, as_of, window_months) for cid in candidates]
+        )
+        for cid, cached in zip(candidates, cached_entries, strict=True):
+            hydrated = (
+                _hydrate_score(cached, cid, as_of, window_months)
+                if cached is not None else None
+            )
+            if hydrated is not None and _policy_matches(hydrated, cid in hopeless):
+                resolved[cid] = hydrated
+            else:
+                pending.append(cid)
+    else:
+        pending = candidates
 
-    # Phase 2 — ONE set-based feature pull for every applicable, uncached buyer.
+    # Phase 2 — ONE set-based feature pull and ONE per-currency turnover query for every
+    # applicable, uncached buyer.
     if pending:
         features_by_cid = risk_dataset.features_many(pending, as_of, window_months)
-        # Per-currency breakdown is still a per-client query; fan out over a thread pool so it
-        # doesn't reintroduce an N-serial bottleneck.
-        with ThreadPoolExecutor(max_workers=min(8, len(pending))) as pool:
-            currency_by_cid = dict(
-                zip(
-                    pending,
-                    pool.map(
-                        lambda c: _currency_breakdown(c, as_of, window_months, fx_date),
-                        pending,
-                    ),
-                    strict=True,
-                )
-            )
+        if _uses_index(settings):
+            behaviour_by_cid = payment_behaviour.behaviour_many(pending, as_of)
+            for cid in pending:
+                features_by_cid[cid].update(behaviour_by_cid[cid])
+        currency_by_cid = _currency_breakdowns(pending, as_of, window_months, fx_date)
+        unconverted_by_cid = repo.unconverted_debt(pending, as_of, fx_date)
+        fresh: dict[str, dict] = {}
         for cid in pending:
             try:
                 result = _build_score(
                     cid, None, features_by_cid[cid], currency_by_cid[cid],
                     as_of, window_months, settings,
+                    hopeless_debt=cid in hopeless,
                 )
+                result = result.model_copy(update={
+                    "unconverted_debt": _unconverted(unconverted_by_cid.get(cid))
+                })
                 if use_cache:
-                    cache.set(
-                        cache.make_key(cid, as_of, window_months),
-                        result.model_dump(mode="json"),
+                    fresh[cache.make_key(cid, as_of, window_months)] = result.model_dump(
+                        mode="json"
                     )
                 resolved[cid] = result
             except Exception as exc:  # noqa: BLE001
@@ -589,6 +680,7 @@ def score_batch(
                     "score_batch_item_failed", client_id=cid, error_id=err_id, error=str(exc)
                 )
                 errors.append({"client_id": cid, "error": f"internal error (ref {err_id})"})
+        cache.set_many(fresh)
 
     # reassemble in caller order
     for cid in ordered_ids:

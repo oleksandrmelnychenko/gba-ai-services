@@ -52,7 +52,8 @@ class Settings(BaseSettings):
     default_top_n: int = 25
     repurchase_count: int = 20
     discovery_count: int = 5
-    max_per_group: int = 3
+    max_per_group: int = 12
+    discovery_source: str = "similar_clients"
     # Earliest complete transactional history imported from 1C. Every recommendation,
     # training and evaluation query is bounded by this date; rolling windows are additionally
     # clamped to it.
@@ -75,8 +76,12 @@ class Settings(BaseSettings):
     # Look-back window (days) defining the "active client" set the worker precomputes for.
     active_client_days: int = 365
     # TTL (seconds) for warmed reco:* entries — must outlive the daily warm interval so a
-    # warmed client stays a cache hit until the next refresh (8 days = 7-day window + slack).
-    warm_cache_ttl: int = 691200
+    # warmed client stays a cache hit until the next refresh (36 h = one day + slack).
+    warm_cache_ttl: int = 129600
+    refresh_engine: str = "snapshot"
+    serve_latest_fallback: bool = False
+    latest_fallback_max_age_days: int = Field(default=2, ge=0)
+    open_order_days: int = Field(default=30, ge=0)
     # Hour (local tz) the daily warm job fires; mirrors gba-nba's daily-generate cron.
     daily_warm_hour: int = 5
     timezone: str = "Europe/Kyiv"

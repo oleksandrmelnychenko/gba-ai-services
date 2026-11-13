@@ -4,11 +4,12 @@ Verified columns (ConcordDb_V5):
   SupplyOrder(OrganizationID, DateFrom, Created, OrderArrivedDate, IsOrderArrived, ...)
     FK_SupplyOrder_Organization_OrganizationID -> dbo.Organization(ID, Name)
     DateFrom = real placement date; Created = 1C sync timestamp (rewritten to ~now)
-  SupplyOrderItem(SupplyOrderID, ProductID, Qty)  -- technical placeholder, not product facts
+  SupplyOrderItem(SupplyOrderID, ProductID, Qty)  -- placeholder on 1C-imported orders;
+    real ordered lines only on open console orders (SupplyOrder.IsOrderArrived = 0)
   Organization(ID, Name)  -- supplier names (NOT dbo.SupplyOrganization, 0 overlap)
   ProductAvailability(ProductID, StorageID, Amount)
   ProductReservation(ProductAvailabilityID, Qty)  -- links to product via ProductAvailability
-  Order/OrderItem -- demand history (sales); filter oi.IsValidForCurrentSale=1
+  Sale/Order/OrderItem/SaleReturn -- demand history; defined once in app.data.source_rules
   Synthetic debt product («Ввід боргів», ID resolved dynamically — re-minted over time)
   excluded from sales/demand/supply candidates
 
@@ -32,6 +33,7 @@ from app.core.history import (
     rolling_coverage,
 )
 from app.core.logging import get_logger
+from app.data import source_rules as rules
 from app.data.db import in_clause, query
 from app.data.synthetic import synthetic_product_id
 from app.domain.models import MODEL_VERSION
@@ -43,31 +45,23 @@ log = get_logger("supply_repository")
 def product_daily_demand(product_id: int, as_of: str, history_days: int) -> list[dict]:
     """Per-day units sold for a product within the history window (for forecasting)."""
     return query(
-        """
-        SELECT CAST(o.Created AS date) AS d, SUM(oi.Qty) AS units
-        FROM dbo.[Order] o
-        JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-        WHERE oi.ProductID = :pid
-              AND oi.IsValidForCurrentSale = 1
-              AND oi.ProductID <> :syn
-              AND o.Created < :asof
-              AND o.Created >= DATEADD(day, -:days, :asof)
-              AND o.Created >= :history_start
-        GROUP BY CAST(o.Created AS date)
+        f"""
+        SELECT d.sold_day AS d, SUM(d.units) AS units
+        FROM {rules.demand_lines()}
+        WHERE d.product_id = :pid
+              AND d.product_id <> :syn
+        GROUP BY d.sold_day
+        HAVING SUM(d.units) > 0
         ORDER BY d
         """,
         {
             "pid": product_id,
-            "asof": as_of,
-            "days": history_days,
-            "history_start": history_start_iso(),
             "syn": synthetic_product_id(),
+            **rules.trailing_window(as_of, history_days),
         },
     )
 
 
-# MSSQL caps a statement at 2100 parameters; the IN list shares the budget with
-# the 2 window params (asof, days), so chunk well under the limit.
 _DEMAND_IN_CHUNK = 1000
 
 
@@ -79,7 +73,7 @@ def product_daily_demand_bulk(
     Returns {product_id: [{"d": date, "units": float}, ...]} with each product's series
     ordered by day. Products with no sales in the window are absent from the result (the
     caller treats a missing key as an empty series, identical to product_daily_demand).
-    Same filters as product_daily_demand: IsValidForCurrentSale=1, synthetic excluded, no o.Deleted.
+    Same demand rule as product_daily_demand; the synthetic product is excluded.
     """
     out: dict[int, list[dict]] = {}
     if not product_ids:
@@ -91,23 +85,17 @@ def product_daily_demand_bulk(
         ph, params = in_clause("p", chunk)
         rows = query(
             f"""
-            SELECT oi.ProductID AS pid, CAST(o.Created AS date) AS d, SUM(oi.Qty) AS units
-            FROM dbo.[Order] o
-            JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-            WHERE oi.ProductID IN {ph}
-                  AND oi.IsValidForCurrentSale = 1
-                  AND oi.ProductID <> :syn
-                  AND o.Created < :asof
-                  AND o.Created >= DATEADD(day, -:days, :asof)
-                  AND o.Created >= :history_start
-            GROUP BY oi.ProductID, CAST(o.Created AS date)
-            ORDER BY oi.ProductID, CAST(o.Created AS date)
+            SELECT d.product_id AS pid, d.sold_day AS d, SUM(d.units) AS units
+            FROM {rules.demand_lines()}
+            WHERE d.product_id IN {ph}
+                  AND d.product_id <> :syn
+            GROUP BY d.product_id, d.sold_day
+            HAVING SUM(d.units) > 0
+            ORDER BY d.product_id, d.sold_day
             """,
             {
-                "asof": as_of,
-                "days": history_days,
-                "history_start": history_start_iso(),
                 "syn": syn,
+                **rules.trailing_window(as_of, history_days),
                 **params,
             },
         )
@@ -118,24 +106,48 @@ def product_daily_demand_bulk(
 
 # --- lead time per producer (factual invoice/order -> factual receipt) ---
 
+def _producer_scope(producer_id: int | None) -> tuple[str, dict]:
+    if producer_id is None:
+        return "producer_id IS NOT NULL", {}
+    return "producer_id = :pid", {"pid": int(producer_id)}
+
+
 def producer_lead_times(
     producer_id: int, as_of: str, min_days: int = 1, max_days: int = 120
 ) -> list[float]:
-    """Plausible lead times from factual supply documents to their actual receipts.
+    leads = producer_lead_times_all(as_of, min_days, max_days, producer_id=producer_id).get(
+        int(producer_id), []
+    )
+    log.debug("producer_lead_times", producer_id=producer_id, sample_count=len(leads))
+    return leads
+
+
+def producer_lead_times_all(
+    as_of: str, min_days: int = 1, max_days: int = 120, *, producer_id: int | None = None
+) -> dict[int, list[float]]:
+    """Days from the supplier's document date to the posting of the receipt document.
+
+    SupplyInvoice.DateFrom is the date on the supplier's document; SupplyOrder.DateFrom is
+    the posting date of the 1C receipt document.  ProductIncome.FromDate repeats the
+    supplier date, so measuring to it yields zero days for every document.  The interval
+    covers transit, customs and posting, not the time from placing the order to dispatch;
+    Settings.lead_time_order_processing_days adds that leg.
 
     Arrived international orders are archived with SupplyOrder.Deleted=1 during the 1C
     lifecycle.  The active SupplyInvoice/SupplyInvoiceOrderItem and ProductIncome rows are
     therefore the authority; filtering the parent SupplyOrder by Deleted silently erases
-    virtually all useful history.
+    virtually all useful history.  One pass serves every producer unless one is named.
     """
+    scope, scope_params = _producer_scope(producer_id)
     require_supported_as_of(as_of)
     rows = query(
-        """
+        f"""
         WITH ReceiptHistory AS (
             SELECT so.ClientID AS producer_id,
                    si.ID AS document_id,
-                   COALESCE(si.DateFrom, so.DateFrom) AS ordered_at,
-                   MAX(pinc.FromDate) AS received_at
+                   si.DateFrom AS ordered_at,
+                   CASE WHEN so.DateFrom > MAX(pinc.FromDate)
+                        THEN so.DateFrom ELSE MAX(pinc.FromDate) END AS received_at
             FROM dbo.SupplyInvoice si
             JOIN dbo.SupplyOrder so ON so.ID = si.SupplyOrderID
             JOIN dbo.SupplyInvoiceOrderItem sioi
@@ -154,7 +166,7 @@ def producer_lead_times(
                   AND so.ClientID IS NOT NULL
                   AND sioi.ProductID IS NOT NULL
                   AND sioi.ProductID <> :syn
-            GROUP BY so.ClientID, si.ID, COALESCE(si.DateFrom, so.DateFrom)
+            GROUP BY so.ClientID, si.ID, si.DateFrom, so.DateFrom
 
             UNION ALL
 
@@ -176,9 +188,9 @@ def producer_lead_times(
                   AND soui.ProductID <> :syn
             GROUP BY COALESCE(soui.SupplierID, sou.SupplierID), sou.ID, sou.FromDate
         )
-        SELECT DATEDIFF(day, ordered_at, received_at) AS lead_days
+        SELECT producer_id, DATEDIFF(day, ordered_at, received_at) AS lead_days
         FROM ReceiptHistory
-        WHERE producer_id = :pid
+        WHERE {scope}
               AND ordered_at IS NOT NULL
               AND received_at IS NOT NULL
               AND ordered_at < :asof
@@ -188,24 +200,33 @@ def producer_lead_times(
               AND DATEDIFF(day, ordered_at, received_at) BETWEEN :lmin AND :lmax
         """,
         {
-            "pid": producer_id,
             "asof": as_of,
             "history_start": history_start_iso(),
             "lmin": min_days,
             "lmax": max_days,
             "syn": synthetic_product_id(),
+            **scope_params,
         },
     )
-    leads = [float(r["lead_days"]) for r in rows]
-    log.info("producer_lead_times", producer_id=producer_id, sample_count=len(leads))
-    return leads
+    out: dict[int, list[float]] = {}
+    for r in rows:
+        out.setdefault(int(r["producer_id"]), []).append(float(r["lead_days"]))
+    for samples in out.values():
+        samples.sort()
+    return out
 
 
-def producer_agreement_currency(producer_id: int, as_of: str) -> int | None:
-    """Modal currency over factual international/UA supply documents (geography proxy)."""
+def producer_agreement_currencies_all(
+    as_of: str, *, producer_id: int | None = None
+) -> dict[int, int]:
+    """Modal currency over factual international/UA supply documents (geography proxy).
+
+    One pass serves every producer unless one is named; ties resolve to the lowest id.
+    """
+    scope, scope_params = _producer_scope(producer_id)
     require_supported_as_of(as_of)
     rows = query(
-        """
+        f"""
         WITH FactualAgreement AS (
             SELECT DISTINCT si.ID AS document_id,
                    so.ClientID AS producer_id,
@@ -247,20 +268,28 @@ def producer_agreement_currency(producer_id: int, as_of: str) -> int | None:
                   AND sou.FromDate >= :history_start
                   AND sou.FromDate < :asof
         )
-        SELECT TOP 1 ccy
+        SELECT producer_id, ccy, COUNT(*) AS n
         FROM FactualAgreement
-        WHERE producer_id = :pid
-        GROUP BY ccy
-        ORDER BY COUNT(*) DESC, ccy
+        WHERE {scope}
+        GROUP BY producer_id, ccy
         """,
         {
-            "pid": producer_id,
             "asof": as_of,
             "history_start": history_start_iso(),
             "syn": synthetic_product_id(),
+            **scope_params,
         },
     )
-    return int(rows[0]["ccy"]) if rows else None
+    best: dict[int, tuple[int, int]] = {}
+    for r in rows:
+        producer, candidate = int(r["producer_id"]), (-int(r["n"]), int(r["ccy"]))
+        if producer not in best or candidate < best[producer]:
+            best[producer] = candidate
+    return {producer: ccy for producer, (_, ccy) in best.items()}
+
+
+def producer_agreement_currency(producer_id: int, as_of: str) -> int | None:
+    return producer_agreement_currencies_all(as_of, producer_id=producer_id).get(int(producer_id))
 
 
 def producer_name(producer_id: int) -> str | None:
@@ -269,6 +298,20 @@ def producer_name(producer_id: int) -> str | None:
         {"pid": producer_id},
     )
     return rows[0]["SupplierName"] if rows else None
+
+
+def producer_names_raw(producer_ids: list[int]) -> dict[int, str | None]:
+    """Unfiltered SupplierName per existing client row, as producer_name returns it."""
+    out: dict[int, str | None] = {}
+    for start in range(0, len(producer_ids), 1000):
+        chunk = producer_ids[start : start + 1000]
+        ph, params = in_clause("p", chunk)
+        rows = query(
+            f"SELECT ID AS pid, SupplierName AS name FROM dbo.Client WHERE ID IN {ph}",
+            params,
+        )
+        out.update({int(r["pid"]): r["name"] for r in rows})
+    return out
 
 
 def producer_names(producer_ids: list[int]) -> dict[int, str]:
@@ -318,10 +361,138 @@ def product_meta(product_ids: list[int]) -> dict[int, dict]:
     return meta
 
 
+def product_measure_units(product_ids: list[int]) -> dict[int, str]:
+    """Sale measure-unit name per product; ids are re-minted, so callers key on the name."""
+    out: dict[int, str] = {}
+    for start in range(0, len(product_ids), 1000):
+        chunk = product_ids[start : start + 1000]
+        ph, params = in_clause("p", chunk)
+        rows = query(
+            f"""
+            SELECT p.ID AS pid, mu.Name AS unit
+            FROM dbo.Product p
+            JOIN dbo.MeasureUnit mu ON mu.ID = p.MeasureUnitID
+            WHERE p.ID IN {ph}
+            """,
+            params,
+        )
+        out.update({int(r["pid"]): str(r["unit"]) for r in rows if r["unit"]})
+    return out
+
+
+def last_document_costs_eur(
+    as_of: str, product_ids: list[int] | None = None
+) -> dict[tuple[int, int], float]:
+    """Latest supply-document unit price per (producer, product), in EUR at the document date.
+
+    An uncertified estimate only: document prices carry no verified tax basis and never
+    enter the receipt-certified cost fields.
+    """
+    require_supported_as_of(as_of)
+    if product_ids is not None and not product_ids:
+        return {}
+    chunks: list[list[int] | None] = (
+        [None]
+        if product_ids is None
+        else [product_ids[i : i + 800] for i in range(0, len(product_ids), 800)]
+    )
+    out: dict[tuple[int, int], float] = {}
+    for chunk in chunks:
+        if chunk is None:
+            scope_sioi = scope_soui = ""
+            params: dict = {}
+        else:
+            ph, params = in_clause("p", chunk)
+            scope_sioi = f"AND sioi.ProductID IN {ph}"
+            scope_soui = f"AND soui.ProductID IN {ph}"
+        rows = query(
+            f"""
+            WITH DocumentLine AS (
+                SELECT so.ClientID AS producer_id,
+                       sioi.ProductID AS product_id,
+                       sioi.UnitPrice AS unit_price,
+                       ISNULL(a.CurrencyID, 2) AS currency_id,
+                       CAST(0 AS bit) AS stored_in_eur,
+                       si.DateFrom AS source_date,
+                       sioi.ID AS line_id
+                FROM dbo.SupplyInvoice si
+                JOIN dbo.SupplyInvoiceOrderItem sioi
+                  ON sioi.SupplyInvoiceID = si.ID AND sioi.Deleted = 0
+                JOIN dbo.SupplyOrder so ON so.ID = si.SupplyOrderID
+                LEFT JOIN dbo.ClientAgreement ca ON ca.ID = so.ClientAgreementID
+                LEFT JOIN dbo.Agreement a ON a.ID = ca.AgreementID
+                WHERE si.Deleted = 0
+                      AND so.ClientID IS NOT NULL
+                      AND sioi.UnitPrice > 0
+                      AND sioi.ProductID <> :syn
+                      {scope_sioi}
+                      AND si.DateFrom >= :history_start
+                      AND si.DateFrom < :asof
+
+                UNION ALL
+
+                SELECT COALESCE(soui.SupplierID, sou.SupplierID),
+                       soui.ProductID,
+                       soui.UnitPrice,
+                       CAST(NULL AS bigint),
+                       CAST(1 AS bit),
+                       sou.FromDate,
+                       soui.ID
+                FROM dbo.SupplyOrderUkraine sou
+                JOIN dbo.SupplyOrderUkraineItem soui
+                  ON soui.SupplyOrderUkraineID = sou.ID AND soui.Deleted = 0
+                WHERE sou.Deleted = 0
+                      AND NOT (sou.IsFromCockpit = 1 AND sou.IsPlaced = 0)
+                      AND COALESCE(soui.SupplierID, sou.SupplierID) IS NOT NULL
+                      AND soui.UnitPrice > 0
+                      AND soui.ProductID <> :syn
+                      {scope_soui}
+                      AND sou.FromDate >= :history_start
+                      AND sou.FromDate < :asof
+            ),
+            Ranked AS (
+                SELECT *, ROW_NUMBER() OVER (
+                           PARTITION BY producer_id, product_id
+                           ORDER BY source_date DESC, line_id DESC
+                       ) AS rn
+                FROM DocumentLine
+            )
+            SELECT producer_id, product_id,
+                   CASE WHEN stored_in_eur = 1 THEN unit_price
+                        ELSE dbo.GetExchangedToEuroValue(unit_price, currency_id, source_date)
+                   END AS cost_eur
+            FROM Ranked
+            WHERE rn = 1
+            """,
+            {
+                "asof": as_of,
+                "history_start": history_start_iso(),
+                "syn": synthetic_product_id(),
+                **params,
+            },
+        )
+        for r in rows:
+            if r["cost_eur"] is not None and float(r["cost_eur"]) > 0:
+                out[(int(r["producer_id"]), int(r["product_id"]))] = float(r["cost_eur"])
+    return out
+
+
 def products_for_producer(producer_id: int, as_of: str, history_days: int) -> list[int]:
-    """Real products this producer supplied through international or UA documents."""
+    return products_by_producer_all(as_of, history_days, producer_id=producer_id).get(
+        int(producer_id), []
+    )
+
+
+def products_by_producer_all(
+    as_of: str, history_days: int, *, producer_id: int | None = None
+) -> dict[int, list[int]]:
+    """Real products on international invoices, UA orders or open console orders, per producer.
+
+    One pass serves every producer unless one is named.
+    """
+    scope, scope_params = _producer_scope(producer_id)
     rows = query(
-        """
+        f"""
         WITH FactualSupply AS (
             SELECT so.ClientID AS producer_id,
                    sioi.ProductID AS product_id,
@@ -348,23 +519,40 @@ def products_for_producer(producer_id: int, as_of: str, history_days: int) -> li
                   AND COALESCE(soui.SupplierID, sou.SupplierID) IS NOT NULL
                   AND soui.ProductID IS NOT NULL
                   AND soui.ProductID <> :syn
+
+            UNION ALL
+
+            SELECT co.ClientID AS producer_id,
+                   coi.ProductID AS product_id,
+                   co.DateFrom AS source_date
+            FROM dbo.SupplyOrder co
+            JOIN dbo.SupplyOrderItem coi
+              ON coi.SupplyOrderID = co.ID AND coi.Deleted = 0
+            WHERE co.Deleted = 0
+                  AND co.IsOrderArrived = 0
+                  AND co.ClientID IS NOT NULL
+                  AND coi.ProductID IS NOT NULL
+                  AND coi.ProductID <> :syn
         )
-        SELECT DISTINCT product_id AS pid
+        SELECT DISTINCT producer_id, product_id AS pid
         FROM FactualSupply
-        WHERE producer_id = :pid
+        WHERE {scope}
               AND source_date >= DATEADD(day, -:days, :asof)
               AND source_date >= :history_start
               AND source_date < :asof
         """,
         {
-            "pid": producer_id,
             "asof": as_of,
             "days": history_days,
             "history_start": history_start_iso(),
             "syn": synthetic_product_id(),
+            **scope_params,
         },
     )
-    return sorted(int(r["pid"]) for r in rows)
+    out: dict[int, list[int]] = {}
+    for r in rows:
+        out.setdefault(int(r["producer_id"]), []).append(int(r["pid"]))
+    return {producer: sorted(ids) for producer, ids in out.items()}
 
 
 def derive_moq_terms(as_of: str, min_orders: int = 3) -> list[dict]:
@@ -442,8 +630,116 @@ def derive_moq_terms(as_of: str, min_orders: int = 3) -> list[dict]:
     ]
 
 
+def supply_document_quantities(
+    as_of: str, min_documents: int = 3, *, producer_id: int | None = None
+) -> dict[tuple[int, int], dict]:
+    """Per producer and product: the quantity on each supply document, and the card's pack.
+
+    The same documents derive_moq_terms reads, one row per document instead of the minimum,
+    so a derived minimum can be checked against the documents it came from. Only pairs with
+    at least `min_documents` documents are returned.
+    """
+    require_supported_as_of(as_of)
+    scope, scope_params = _producer_scope(producer_id)
+    rows = query(
+        f"""
+        WITH FactualSupplyLine AS (
+            SELECT CAST(0 AS tinyint) AS source_kind,
+                   si.ID AS document_id,
+                   si.DateFrom AS document_date,
+                   so.ClientID AS producer_id,
+                   sioi.ProductID AS product_id,
+                   sioi.Qty AS qty
+            FROM dbo.SupplyInvoice si
+            JOIN dbo.SupplyInvoiceOrderItem sioi
+              ON sioi.SupplyInvoiceID = si.ID AND sioi.Deleted = 0
+            JOIN dbo.SupplyOrder so ON so.ID = si.SupplyOrderID
+            WHERE si.Deleted = 0
+                  AND so.ClientID IS NOT NULL
+                  AND sioi.ProductID IS NOT NULL
+                  AND sioi.ProductID <> :syn
+                  AND sioi.Qty > 0
+                  AND si.DateFrom >= :history_start
+                  AND si.DateFrom < :asof
+
+            UNION ALL
+
+            SELECT CAST(1 AS tinyint) AS source_kind,
+                   sou.ID AS document_id,
+                   sou.FromDate AS document_date,
+                   COALESCE(soui.SupplierID, sou.SupplierID) AS producer_id,
+                   soui.ProductID AS product_id,
+                   soui.Qty AS qty
+            FROM dbo.SupplyOrderUkraine sou
+            JOIN dbo.SupplyOrderUkraineItem soui
+              ON soui.SupplyOrderUkraineID = sou.ID AND soui.Deleted = 0
+            WHERE sou.Deleted = 0
+                  AND NOT (sou.IsFromCockpit = 1 AND sou.IsPlaced = 0)
+                  AND COALESCE(soui.SupplierID, sou.SupplierID) IS NOT NULL
+                  AND soui.ProductID IS NOT NULL
+                  AND soui.ProductID <> :syn
+                  AND soui.Qty > 0
+                  AND sou.FromDate >= :history_start
+                  AND sou.FromDate < :asof
+        ),
+        DocumentProductQty AS (
+            SELECT source_kind, document_id, producer_id, product_id,
+                   MAX(document_date) AS document_date, SUM(qty) AS qty,
+                   COUNT(*) OVER (PARTITION BY producer_id, product_id) AS documents
+            FROM FactualSupplyLine
+            WHERE {scope}
+            GROUP BY source_kind, document_id, producer_id, product_id
+        )
+        SELECT dpq.producer_id, dpq.product_id, dpq.document_id,
+               CONVERT(varchar(10), dpq.document_date, 23) AS document_date,
+               CAST(dpq.qty AS float) AS qty,
+               TRY_CONVERT(decimal(18,3), p.PackingStandard) AS pack
+        FROM DocumentProductQty dpq
+        LEFT JOIN dbo.Product p ON p.ID = dpq.product_id
+        WHERE dpq.documents >= :n
+        """,
+        {
+            "n": min_documents,
+            "asof": as_of,
+            "history_start": history_start_iso(),
+            "syn": synthetic_product_id(),
+            **scope_params,
+        },
+    )
+    out: dict[tuple[int, int], dict] = {}
+    for r in rows:
+        entry = out.setdefault(
+            (int(r["producer_id"]), int(r["product_id"])),
+            {"pack": float(r["pack"]) if r["pack"] is not None else None, "documents": []},
+        )
+        entry["documents"].append((str(r["document_date"]), int(r["document_id"]), float(r["qty"])))
+    for entry in out.values():
+        entry["documents"].sort()
+    return out
+
+
+def net_units_sold(product_ids: list[int], as_of: str, window_days: int) -> dict[int, float]:
+    """Confirmed units sold net of sellable returns per product over the trailing window."""
+    out: dict[int, float] = {}
+    syn = synthetic_product_id()
+    ids = [int(p) for p in product_ids if int(p) != syn]
+    for start in range(0, len(ids), _DEMAND_IN_CHUNK):
+        ph, params = in_clause("p", ids[start : start + _DEMAND_IN_CHUNK])
+        rows = query(
+            f"""
+            SELECT d.product_id AS pid, SUM(d.units) AS units
+            FROM {rules.demand_lines()}
+            WHERE d.product_id IN {ph}
+            GROUP BY d.product_id
+            """,
+            {**rules.trailing_window(as_of, window_days), **params},
+        )
+        out.update({int(r["pid"]): float(r["units"] or 0.0) for r in rows})
+    return out
+
+
 def all_producers(as_of: str, history_days: int) -> list[int]:
-    """Producers with factual international/UA supply inside the history window."""
+    """Producers with factual international/UA supply or an open console order in the window."""
     rows = query(
         """
         WITH FactualSupply AS (
@@ -472,6 +768,20 @@ def all_producers(as_of: str, history_days: int) -> list[int]:
                   AND COALESCE(soui.SupplierID, sou.SupplierID) IS NOT NULL
                   AND soui.ProductID IS NOT NULL
                   AND soui.ProductID <> :syn
+
+            UNION ALL
+
+            SELECT co.ClientID AS producer_id,
+                   coi.ProductID AS product_id,
+                   co.DateFrom AS source_date
+            FROM dbo.SupplyOrder co
+            JOIN dbo.SupplyOrderItem coi
+              ON coi.SupplyOrderID = co.ID AND coi.Deleted = 0
+            WHERE co.Deleted = 0
+                  AND co.IsOrderArrived = 0
+                  AND co.ClientID IS NOT NULL
+                  AND coi.ProductID IS NOT NULL
+                  AND coi.ProductID <> :syn
         )
         SELECT DISTINCT producer_id AS pid
         FROM FactualSupply
@@ -609,6 +919,31 @@ def procurement_source_readiness(as_of: str, history_days: int) -> dict:
                   AND sou.FromDate >= @history_start
                   AND sou.FromDate < @asof
 
+            UNION ALL
+
+            SELECT CAST(2 AS tinyint) AS source_kind,
+                   coi.ID AS source_line_id,
+                   co.ClientID AS producer_id,
+                   coi.ProductID AS product_id,
+                   co.DateFrom AS source_date,
+                   coi.Qty AS source_qty,
+                   NULL AS unit_price,
+                   NULL AS source_currency_id,
+                   coi.Updated AS source_updated,
+                   CAST(NULL AS bigint) AS international_document_id,
+                   CAST(NULL AS bigint) AS ukraine_document_id
+            FROM dbo.SupplyOrder co
+            JOIN dbo.SupplyOrderItem coi
+              ON coi.SupplyOrderID = co.ID AND coi.Deleted = 0
+            WHERE co.Deleted = 0
+                  AND co.IsOrderArrived = 0
+                  AND co.ClientID IS NOT NULL
+                  AND coi.ProductID IS NOT NULL
+                  AND coi.ProductID <> @syn
+                  AND co.DateFrom >= DATEADD(day, -@days, @asof)
+                  AND co.DateFrom >= @history_start
+                  AND co.DateFrom < @asof
+
         ) AS materialized;
 
         SELECT * INTO #CandidatePairs FROM (
@@ -624,23 +959,18 @@ def procurement_source_readiness(as_of: str, history_days: int) -> dict:
         ) AS materialized;
 
         SELECT * INTO #CandidateDemand FROM (
-            SELECT oi.ProductID AS product_id,
-                   MAX(o.Created) AS latest_sale_date,
-                   MAX(oi.ID) AS max_order_item_id,
-                   MAX(oi.Updated) AS latest_order_item_update,
-                   SUM(CAST(oi.Qty AS decimal(38, 6))) AS demand_qty,
+            SELECT d.product_id,
+                   MAX(d.sold_at) AS latest_sale_date,
+                   MAX(d.line_id) AS max_order_item_id,
+                   MAX(d.line_updated) AS latest_order_item_update,
+                   SUM(d.units) AS demand_qty,
                    CHECKSUM_AGG(BINARY_CHECKSUM(
-                       oi.ID, oi.ProductID, oi.Qty, oi.PricePerItem,
-                       oi.IsValidForCurrentSale, oi.Updated
+                       d.line_id, d.product_id, d.units, d.price,
+                       d.sold_at, d.line_updated, d.return_updated
                    )) AS demand_checksum
-            FROM dbo.[Order] o
-            JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-            JOIN #CandidateProducts cp ON cp.product_id = oi.ProductID
-            WHERE oi.IsValidForCurrentSale = 1
-                  AND o.Created >= DATEADD(day, -@days, @asof)
-                  AND o.Created >= @history_start
-                  AND o.Created < @asof
-            GROUP BY oi.ProductID
+            FROM {rules.demand_lines("@")}
+            JOIN #CandidateProducts cp ON cp.product_id = d.product_id
+            GROUP BY d.product_id
 
         ) AS materialized;
 
@@ -769,6 +1099,17 @@ def procurement_source_readiness(as_of: str, history_days: int) -> dict:
                   AND pinc.FromDate >= @history_start
                   AND pinc.FromDate < @asof
 
+            UNION ALL
+
+            SELECT CAST(4 AS tinyint), soi.ID, soi.ProductID, soi.Qty, soi.Updated
+            FROM dbo.SupplyOrderItem soi
+            JOIN dbo.SupplyOrder so
+              ON so.ID = soi.SupplyOrderID AND so.Deleted = 0 AND so.IsOrderArrived = 0
+            JOIN #CandidateProducts cp ON cp.product_id = soi.ProductID
+            WHERE soi.Deleted = 0
+                  AND so.DateFrom >= @history_start
+                  AND so.DateFrom < @asof
+
         ) AS materialized;
 
         SELECT * INTO #CandidateCosts FROM (
@@ -861,8 +1202,10 @@ def procurement_source_readiness(as_of: str, history_days: int) -> dict:
     rows = query(
         """
         EXEC sys.sp_executesql :statement,
-            N'@asof date, @days int, @history_start date, @syn bigint',
-            @asof=:asof, @days=:days, @history_start=:history_start, @syn=:syn
+            N'@asof date, @days int, @history_start date, @syn bigint,
+              @demand_from datetime2, @demand_to datetime2',
+            @asof=:asof, @days=:days, @history_start=:history_start, @syn=:syn,
+            @demand_from=:demand_from, @demand_to=:demand_to
         """,
         {
             "statement": statement,
@@ -870,6 +1213,7 @@ def procurement_source_readiness(as_of: str, history_days: int) -> dict:
             "days": history_days,
             "history_start": history_start_iso(),
             "syn": synthetic_product_id(),
+            **rules.trailing_window(as_of, history_days),
         },
         isolation_level="SNAPSHOT",
     )
@@ -996,23 +1340,16 @@ def procurement_source_readiness(as_of: str, history_days: int) -> dict:
 def all_products_revenue_eur(as_of: str, history_days: int) -> dict[int, float]:
     """Trailing realized revenue (EUR) per product. PricePerItem is already EUR."""
     rows = query(
-        """
-        SELECT oi.ProductID AS pid, SUM(oi.Qty * oi.PricePerItem) AS rev
-        FROM dbo.[Order] o
-        JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-        WHERE oi.IsValidForCurrentSale = 1
-              AND oi.ProductID <> :syn
-              AND oi.PricePerItem > 0
-              AND o.Created < :asof
-              AND o.Created >= DATEADD(day, -:days, :asof)
-              AND o.Created >= :history_start
-        GROUP BY oi.ProductID
+        f"""
+        SELECT d.product_id AS pid, SUM(d.units * d.price) AS rev
+        FROM {rules.demand_lines()}
+        WHERE d.product_id <> :syn
+              AND d.price > 0
+        GROUP BY d.product_id
         """,
         {
-            "asof": as_of,
-            "days": history_days,
-            "history_start": history_start_iso(),
             "syn": synthetic_product_id(),
+            **rules.trailing_window(as_of, history_days),
         },
     )
     return {int(r["pid"]): float(r["rev"] or 0) for r in rows}
@@ -1020,10 +1357,7 @@ def all_products_revenue_eur(as_of: str, history_days: int) -> dict[int, float]:
 
 # --- inventory position ---
 
-_SELLABLE_STORAGE = (
-    "st.Deleted = 0 AND st.ForDefective = 0 "
-    "AND (st.AvailableForReSale = 1 OR st.IsResale = 1)"
-)
+_SELLABLE_STORAGE = rules.sellable_storage("st")
 
 
 def on_hand(product_ids: list[int]) -> dict[int, float]:
@@ -1060,6 +1394,17 @@ def on_hand(product_ids: list[int]) -> dict[int, float]:
     return {int(r["pid"]): float(r["amt"] or 0) for r in rows}
 
 
+def inventory_bulk(product_ids: list[int]) -> tuple[dict[int, float], dict[int, float]]:
+    """on_hand and reserved for a large product set, chunked under the parameter cap."""
+    hand: dict[int, float] = {}
+    held: dict[int, float] = {}
+    for start in range(0, len(product_ids), 1000):
+        chunk = product_ids[start : start + 1000]
+        hand.update(on_hand(chunk))
+        held.update(reserved(chunk))
+    return hand, held
+
+
 def reserved(product_ids: list[int]) -> dict[int, float]:
     """Current reserved qty; history-window filtering is not applicable."""
     if not product_ids:
@@ -1078,12 +1423,6 @@ def reserved(product_ids: list[int]) -> dict[int, float]:
         params,
     )
     return {int(r["pid"]): float(r["qty"] or 0) for r in rows}
-
-
-# on_order references the IN list 4x in one statement (2 ordered + 2 received sub-selects);
-# chunk well under MSSQL's 2100-param cap and to keep the query-processor plan tractable:
-# 4 * 400 + 1 (asof) << 2100.
-_ON_ORDER_IN_CHUNK = 400
 
 
 def on_order(product_ids: list[int], as_of: str) -> dict[int, float]:
@@ -1105,6 +1444,11 @@ def on_order(product_ids: list[int], as_of: str) -> dict[int, float]:
         ordered  = SupplyOrderUkraineItem.Qty -> SupplyOrderUkraine(FromDate)
         received = ProductIncomeItem.Qty -> SupplyOrderUkraineItemID, ProductIncome(FromDate)
 
+      OPEN GBA ORDERS (placed in the console, SupplyOrder.IsOrderArrived = 0): the part of a
+      SupplyOrderItem line that no packing list covers yet is on order too; the packed part
+      is already counted on the international spine. 1C-imported orders arrive with
+      IsOrderArrived = 1 and their SupplyOrderItem placeholder rows are never read.
+
     Why the rewrite was needed: the old query filtered dbo.SupplyOrder.Created < :asof, but
     Created is the 1C-sync timestamp (rewritten to ~now on every sync) -- so the filter excluded
     every row and on_order was always {}. It also read the synthetic SupplyOrderItem detail.
@@ -1118,16 +1462,25 @@ def on_order(product_ids: list[int], as_of: str) -> dict[int, float]:
     if not product_ids:
         return {}
     syn = synthetic_product_id()
-    ids = [int(p) for p in product_ids if int(p) != syn]
-    out: dict[int, float] = {}
-    for start in range(0, len(ids), _ON_ORDER_IN_CHUNK):
-        chunk = ids[start : start + _ON_ORDER_IN_CHUNK]
-        out.update(_on_order_chunk(chunk, as_of))
-    return out
+    wanted = {int(p) for p in product_ids if int(p) != syn}
+    return {pid: qty for pid, qty in on_order_all(as_of).items() if pid in wanted}
 
 
-def _on_order_chunk(product_ids: list[int], as_of: str) -> dict[int, float]:
-    ph, params = in_clause("p", product_ids)
+def on_order_all(as_of: str) -> dict[int, float]:
+    """Open quantity for every product in one set-based pass (no IN list)."""
+    require_supported_as_of(as_of)
+    return _on_order_chunk(None, as_of)
+
+
+def _on_order_chunk(product_ids: list[int] | None, as_of: str) -> dict[int, float]:
+    if product_ids is None:
+        scope_sioi = scope_soui = scope_soi = ""
+        params: dict = {}
+    else:
+        ph, params = in_clause("p", product_ids)
+        scope_sioi = f"AND sioi.ProductID IN {ph}"
+        scope_soui = f"AND soui.ProductID IN {ph}"
+        scope_soi = f"AND soi.ProductID IN {ph}"
     rows = query(
         f"""
         WITH ordered AS (
@@ -1140,7 +1493,7 @@ def _on_order_chunk(product_ids: list[int], as_of: str) -> dict[int, float]:
             JOIN dbo.SupplyInvoice si ON si.ID = pl.SupplyInvoiceID AND si.Deleted = 0
             WHERE plpoi.Deleted = 0
                   AND sioi.ProductID <> :syn
-                  AND sioi.ProductID IN {ph}
+                  {scope_sioi}
                   AND si.DateFrom >= :history_start
                   AND si.DateFrom < :asof
             GROUP BY sioi.ProductID
@@ -1153,10 +1506,36 @@ def _on_order_chunk(product_ids: list[int], as_of: str) -> dict[int, float]:
             WHERE soui.Deleted = 0
                   AND NOT (sou.IsFromCockpit = 1 AND sou.IsPlaced = 0)
                   AND soui.ProductID <> :syn
-                  AND soui.ProductID IN {ph}
+                  {scope_soui}
                   AND sou.FromDate >= :history_start
                   AND sou.FromDate < :asof
             GROUP BY soui.ProductID
+            UNION ALL
+            SELECT soi.ProductID AS pid,
+                   SUM(CASE WHEN soi.Qty > ISNULL(packed.qty, 0)
+                            THEN soi.Qty - ISNULL(packed.qty, 0) ELSE 0 END) AS qty
+            FROM dbo.SupplyOrderItem soi
+            JOIN dbo.SupplyOrder so
+                 ON so.ID = soi.SupplyOrderID AND so.Deleted = 0 AND so.IsOrderArrived = 0
+            OUTER APPLY (
+                SELECT SUM(plpoi.Qty) AS qty
+                FROM dbo.SupplyInvoiceOrderItem sioi
+                JOIN dbo.SupplyInvoice si ON si.ID = sioi.SupplyInvoiceID AND si.Deleted = 0
+                JOIN dbo.PackingListPackageOrderItem plpoi
+                     ON plpoi.SupplyInvoiceOrderItemID = sioi.ID AND plpoi.Deleted = 0
+                JOIN dbo.PackingList pl ON pl.ID = plpoi.PackingListID AND pl.Deleted = 0
+                WHERE sioi.SupplyOrderItemID = soi.ID
+                      AND sioi.Deleted = 0
+                      AND si.DateFrom >= :history_start
+                      AND si.DateFrom < :asof
+            ) packed
+            WHERE soi.Deleted = 0
+                  AND soi.ProductID IS NOT NULL
+                  AND soi.ProductID <> :syn
+                  {scope_soi}
+                  AND so.DateFrom >= :history_start
+                  AND so.DateFrom < :asof
+            GROUP BY soi.ProductID
         ),
         received AS (
             -- international spine: receipts netted via the packing-list line
@@ -1170,7 +1549,7 @@ def _on_order_chunk(product_ids: list[int], as_of: str) -> dict[int, float]:
                  ON sioi.ID = plpoi.SupplyInvoiceOrderItemID AND sioi.Deleted = 0
             WHERE pii.Deleted = 0
                   AND sioi.ProductID <> :syn
-                  AND sioi.ProductID IN {ph}
+                  {scope_sioi}
                   AND pinc.FromDate >= :history_start
                   AND pinc.FromDate < :asof
             GROUP BY sioi.ProductID
@@ -1184,7 +1563,7 @@ def _on_order_chunk(product_ids: list[int], as_of: str) -> dict[int, float]:
                  ON soui.ID = pii.SupplyOrderUkraineItemID AND soui.Deleted = 0
             WHERE pii.Deleted = 0
                   AND soui.ProductID <> :syn
-                  AND soui.ProductID IN {ph}
+                  {scope_soui}
                   AND pinc.FromDate >= :history_start
                   AND pinc.FromDate < :asof
             GROUP BY soui.ProductID
@@ -1203,4 +1582,4 @@ def _on_order_chunk(product_ids: list[int], as_of: str) -> dict[int, float]:
             **params,
         },
     )
-    return {int(r["pid"]): float(r["qty"] or 0) for r in rows}
+    return {int(r["pid"]): round(float(r["qty"] or 0), 6) for r in rows}

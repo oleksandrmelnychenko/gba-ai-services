@@ -13,7 +13,7 @@ from __future__ import annotations
 from zoneinfo import ZoneInfo
 
 import os
-from datetime import UTC, datetime
+from datetime import datetime
 
 import pytest
 
@@ -155,11 +155,18 @@ def test_uah_turnover_bucket_is_not_divided_by_fx_rate(
         JOIN dbo.Agreement a ON a.ID = ca.AgreementID
         WHERE ca.ClientID = :cid
               AND a.CurrencyID = :uah
+              AND s.Deleted = 0
+              AND s.ChangedToInvoice IS NOT NULL
+              AND oi.Deleted = 0
               AND oi.IsValidForCurrentSale = 1
+              AND oi.Qty > 0
               AND oi.ProductID NOT IN {placeholder}
-              AND s.Created >= :history_start
-              AND s.Created <= :asof
-              AND s.Created >= DATEADD(month, -12, :asof)
+              AND CAST(s.ChangedToInvoice AT TIME ZONE 'UTC' AT TIME ZONE 'FLE Standard Time'
+                       AS datetime2) >= :history_start
+              AND CAST(s.ChangedToInvoice AT TIME ZONE 'UTC' AT TIME ZONE 'FLE Standard Time'
+                       AS datetime2) < :asof
+              AND CAST(s.ChangedToInvoice AT TIME ZONE 'UTC' AT TIME ZONE 'FLE Standard Time'
+                       AS datetime2) >= DATEADD(month, -12, :asof)
         """,
         {
             "cid": uah_client,
@@ -209,20 +216,24 @@ def test_real_uah_client_scores_in_band(service, uah_client):
     assert result.client_id == uah_client
     assert 0 <= result.score <= 100
     assert result.rating in {"A", "B", "C", "D"}
-    # v3 contract: explainable contributions plus a 6mo signal only inside that model's
-    # declared population (positive debt, not already SEV180); sub_factors are deprecated.
+    # v3 contract: explainable contributions plus the operational 90-day control derived from
+    # this client's own open-debt features; the 6-month forward model is retired for every
+    # population and sub_factors are deprecated.
     assert result.pd is not None and 0.0 <= result.pd <= 1.0
     assert result.contributions and len(result.contributions) > 0
-    if (
-        features["total_debt_eur"] <= 0
-        or features["overdue_eur_180plus"] >= service.risk_dataset.SEV180_MIN_EUR
-    ):
-        assert result.forward_risk is None
-        assert result.forward_risk_status == "not_applicable"
-    else:
-        assert result.forward_risk is None
-        assert result.forward_risk_status == "model_unavailable"
-        assert "3 < 30" in result.forward_risk_reason
+    assert result.forward_risk is None
+    assert result.forward_risk_status == "not_applicable"
+    assert result.forward_risk_reason == "replaced_by_operational_90d"
+    assert result.risk_90d == service._risk_90d(features)
+    expected_reason = (
+        "already_90_plus"
+        if features["overdue_eur_91_180"] + features["overdue_eur_180plus"] >= 100
+        else "will_cross_90_days"
+        if features["overdue_eur_1_30"] + features["overdue_eur_31_60"]
+        + features["overdue_eur_61_90"] >= 100
+        else "current_debt" if features["total_debt_eur"] > 0 else "no_debt"
+    )
+    assert result.risk_90d.reason_code == expected_reason
     assert result.sub_factors is None
     assert result.model_version == "creditscore-v3"
 
@@ -430,3 +441,119 @@ def test_current_severe_no_limit_buyer_is_band_d(service, severe_no_limit_buyer)
     assert result.score is not None and result.score < 65
     assert result.pd is not None and result.pd > 0.15  # band D threshold
     assert result.forward_risk is None
+
+
+# --- set-based batch path must equal the per-client path on live data ---
+
+
+@pytest.fixture(scope="module")
+def mixed_live_ids() -> list[int]:
+    """Buyers with recent sales, buyers without, non-buyers and two ids that do not exist."""
+    from app.data.db import query_scalars
+
+    active = query_scalars(
+        """
+        SELECT TOP 120 ca.ClientID
+        FROM dbo.Sale s
+        JOIN dbo.ClientAgreement ca ON ca.ID = s.ClientAgreementID
+        WHERE s.Created >= DATEADD(month, -6, :asof)
+        GROUP BY ca.ClientID
+        ORDER BY COUNT(*) DESC, ca.ClientID
+        """,
+        {"asof": _AS_OF},
+    )
+    spread = query_scalars(
+        "SELECT TOP 80 c.ID FROM dbo.Client c WHERE c.Deleted = 0 ORDER BY c.NetUID"
+    )
+    missing = query_scalars("SELECT MAX(ID) FROM dbo.Client")[0]
+    ids = list(dict.fromkeys(int(c) for c in [*active, *spread]))
+    if len(ids) < 50:
+        pytest.skip("not enough live clients for the set-based equality cohort")
+    return [*ids, int(missing) + 1001, int(missing) + 1002]
+
+
+@skip_no_db
+def test_client_gates_equal_per_client_helpers(repo, mixed_live_ids):
+    gates = repo.client_gates(mixed_live_ids)
+    for client_id in mixed_live_ids:
+        exists = repo.client_exists(client_id)
+        assert (client_id in gates) is exists
+        if exists:
+            assert gates[client_id] == repo.ClientGate(
+                is_buyer=repo.has_buyer_role(client_id),
+                hopeless_debt=repo.has_hopeless_debt_role(client_id),
+            )
+    assert len(gates) == len(mixed_live_ids) - 2
+    assert any(g.is_buyer for g in gates.values())
+    assert any(not g.is_buyer for g in gates.values())
+
+
+@skip_no_db
+def test_turnover_by_currency_many_equals_per_client(repo, mixed_live_ids):
+    many = repo.turnover_eur_by_currency_many(mixed_live_ids, _AS_OF, 12, _AS_OF)
+    assert set(many) == set(mixed_live_ids)
+    for client_id in mixed_live_ids:
+        assert many[client_id] == repo.turnover_eur_by_currency(client_id, _AS_OF, 12, _AS_OF)
+    assert any(len(rows) > 0 for rows in many.values())
+
+
+def _assert_same_score(batch_row, single_row) -> None:
+    """Exact equality, except the float feature values echoed in contributions.
+
+    turnover_eur_12mo is a float SUM computed by SQL Server; its last bits depend on the
+    aggregation order of the plan, so the set-based and per-client statements can differ in
+    the 15th significant digit. Points, score, PD and every other field must match exactly.
+    """
+    batch, single = batch_row.model_dump(mode="json"), single_row.model_dump(mode="json")
+    batch_values = [c.pop("value") for c in batch["contributions"] or []]
+    single_values = [c.pop("value") for c in single["contributions"] or []]
+    assert batch == single
+    assert batch_values == pytest.approx(single_values, rel=1e-9, abs=1e-9)
+
+
+@skip_no_db
+def test_batch_equals_single_on_live_cohort(service, mixed_live_ids):
+    results, errors = service.score_batch(mixed_live_ids, _AS_OF, 12, use_cache=False)
+    assert [e["client_id"] for e in errors] == mixed_live_ids[-2:]
+    assert [r.client_id for r in results] == mixed_live_ids[:-2]
+    for result in results:
+        single = service.score_client(result.client_id, None, _AS_OF, 12, use_cache=False)
+        _assert_same_score(result, single)
+    for error in errors:
+        with pytest.raises(LookupError) as raised:
+            service.score_client(error["client_id"], None, _AS_OF, 12, use_cache=False)
+        assert str(raised.value) == error["error"]
+
+
+@pytest.fixture(scope="module")
+def hopeless_debt_clients() -> list[int]:
+    from app.core.config import get_settings
+    from app.data.db import query_scalars
+
+    ids = query_scalars(
+        """
+        SELECT DISTINCT cir.ClientID
+        FROM dbo.ClientInRole cir
+        JOIN dbo.ClientTypeRole ctr ON ctr.ID = cir.ClientTypeRoleID
+        JOIN dbo.ClientType ct ON ct.ID = cir.ClientTypeID
+        WHERE cir.Deleted = 0 AND ct.[Type] = 0 AND ctr.Name = :role
+        """,
+        {"role": get_settings().hopeless_debt_role_name},
+    )
+    if not ids:
+        pytest.skip("no client in the hopeless-debt group")
+    return sorted(int(c) for c in ids)
+
+
+@skip_no_db
+def test_hopeless_debt_group_is_rated_d_by_policy(service, hopeless_debt_clients):
+    results, errors = service.score_batch(hopeless_debt_clients, _AS_OF, 12, use_cache=False)
+    assert errors == [] and len(results) == len(hopeless_debt_clients)
+    for result in results:
+        assert (result.applicable, result.score, result.rating, result.pd) == (True, 0, "D", 1.0)
+        assert result.policy_reason_code == "hopeless_debt_role"
+        assert result.policy_reason == "Клієнт у групі безнадійної заборгованості"
+        assert result.caps_applied == ["hopeless_debt_role"]
+        assert result.data_sufficiency == "ok"
+        single = service.score_client(result.client_id, None, _AS_OF, 12, use_cache=False)
+        _assert_same_score(result, single)

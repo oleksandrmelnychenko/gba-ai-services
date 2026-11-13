@@ -66,13 +66,22 @@ def _hydrate(
         baseline_source=data.get("baseline_source"),
         recommended_price=data.get("recommended_price"),
         price_floor=data.get("price_floor"),
+        floor_markup_pct=data.get("floor_markup_pct"),
+        floor_margin_pct=data.get("floor_margin_pct"),
+        floor_basis=data.get("floor_basis"),
         unit_cost_eur=data.get("unit_cost_eur"),
         suggested_discount_pct=data.get("suggested_discount_pct"),
+        discount_base_price=data.get("discount_base_price"),
         discount_band=DiscountBand(**band) if band else None,
         peer_band=PeerBand(**peer),
         confidence=Confidence(data.get("confidence", "low")),
         margin_pct_at_recommended=data.get("margin_pct_at_recommended"),
         rationale=data.get("rationale", ""),
+        constraints_conflict=bool(data.get("constraints_conflict", False)),
+        conflict_reason=data.get("conflict_reason"),
+        conflict_explanation=data.get("conflict_explanation"),
+        discount_cap_pct=data.get("discount_cap_pct"),
+        price_at_discount_cap=data.get("price_at_discount_cap"),
         elasticity=data.get("elasticity"),
         elasticity_source=data.get("elasticity_source"),
         elastic_optimal_price=data.get("elastic_optimal_price"),
@@ -102,7 +111,11 @@ def recommend_price(
 
     Resolves both entities (LookupError -> 404 at the API), pulls baseline/cost/peer/segment from
     the repository, then delegates the pure A+B math to the engine. Redis-cached on
-    (product, agreement, as_of, margin, vat, culture); graceful-degrade on cache failure.
+    (product, agreement, as_of, margin, culture); graceful-degrade on cache failure.
+
+    with_vat is accepted for contract compatibility and IGNORED: the live engine function never
+    reads @WithVat, so every price is "as invoiced" on the agreement's own VAT basis (gross on a
+    VAT agreement, net on a non-VAT one). It neither changes the numbers nor splits the cache.
 
     A NULL/non-positive engine baseline (e.g. inactive/deleted Agreement -> the live world
     resolver returns NULL) falls back to the client's recent same-Organization-world realized
@@ -122,7 +135,7 @@ def recommend_price(
         window,
         settings.source_history_start_date,
     )
-    coverage = _history_fields(history_window, settings)
+    coverage = {**_history_fields(history_window, settings), **engine.floor_terms(margin)}
     fx_date = settings.resolve_fx_date(as_of_date)
 
     product = repo.resolve_product(product_id, product_net_uid)
@@ -137,7 +150,7 @@ def recommend_price(
     pid = product["id"]
     p_net_uid = product["net_uid"]
     ca_net_uid = agreement["client_agreement_netuid"]
-    key = cache.make_key(pid, ca_net_uid, as_of, margin, with_vat, culture)
+    key = cache.make_key(pid, ca_net_uid, as_of, margin, culture)
 
     if use_cache:
         cached = cache.get(key)
@@ -152,7 +165,7 @@ def recommend_price(
             if hydrated is not None:
                 return hydrated
 
-    baseline = repo.baseline_price(p_net_uid, ca_net_uid, culture, with_vat)
+    baseline = repo.baseline_price(p_net_uid, ca_net_uid, culture, True)
     baseline_source = engine.BASELINE_SOURCE_AGREEMENT
     if baseline is None or baseline <= 0:
         fallback = repo.client_world_fallback_baseline(
@@ -194,7 +207,7 @@ def recommend_price(
     seg_culture = list_markup.get("culture") if list_markup else culture
     base_pricing_id = list_markup.get("base_pricing_id") if list_markup else None
 
-    pg_id = repo.product_group_id(pid)
+    pg_id = repo.product_group_id(pid, agreement["agreement_id"])
     group_disc = (
         (repo.active_group_discount(agreement["client_agreement_id"], pg_id) or 0.0)
         if pg_id is not None else 0.0

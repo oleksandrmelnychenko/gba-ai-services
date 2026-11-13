@@ -108,7 +108,7 @@ def test_actual_plan_and_json_keep_fractional_pack(monkeypatch):
         forecast_horizon_days=1,
     )
     monkeypatch.setattr(policy, "get_settings", lambda: cfg)
-    monkeypatch.setattr(policy.lead_time_svc, "producer_lead_time", lambda *a: (1.0, 0.0, "fixture"))
+    monkeypatch.setattr(policy.lead_time_svc, "producer_lead_time_evidence", lambda *a: (1.0, 0.0, "fixture", 0))
     monkeypatch.setattr(policy.masters, "producer_profile", lambda *a, **k: None)
     monkeypatch.setattr(policy.masters, "product_terms_for", lambda *a, **k: {1: {"order_multiple": 0.003}})
     monkeypatch.setattr(policy.repo, "products_for_producer", lambda *a: [1])

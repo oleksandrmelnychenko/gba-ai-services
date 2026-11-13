@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     cache_ttl: int = 3600
     redis_retry_interval_seconds: int = 30
 
-    api_host: str = "0.0.0.0"
+    api_host: str = "127.0.0.1"
     api_port: int = 8006
     log_level: str = "INFO"
 
@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     )
 
     # bump on any forecast-method change so outcomes can be sliced/A-B'd by version
-    model_version: str = "forecast-v2-closed-months"
+    model_version: str = "forecast-v7-tsb-sporadic"
 
     # Optional override for the synthetic «Ввід боргів» debt-entry ProductID. 0 = resolve it
     # dynamically from dbo.Product (the 1С sync re-mints the row, so a pinned ID goes stale).
@@ -63,10 +63,9 @@ class Settings(BaseSettings):
     # 1С/source synchronization for weeks.
     source_max_age_hours: int = 168
     # Mode selecting how the monthly EUR sale series is projected forward:
-    #   "auto"        — per-series method selection by Syntetos-Boylan demand quadrant
-    #                   (smooth -> EWMA, erratic -> moving_avg, intermittent/lumpy -> SBA);
-    #                   default, backtest-validated (on the corrected full-sales data) as
-    #                   lower-error than any single fixed method on 1000 real series.
+    #   "auto"        — per-series selection by scope and Syntetos-Boylan demand quadrant: EWMA
+    #                   level for regular series and pairs, TSB for sporadic clients and products
+    #                   (app/services/forecasting/selection.py).
     #   "moving_avg"  — force the trailing-window mean for every series (legacy / A-B baseline)
     #   "croston"     — force Croston's intermittent-demand rate (size / interval)
     #   "sba"         — force Syntetos-Boylan bias-corrected Croston

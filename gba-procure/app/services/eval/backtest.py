@@ -2,7 +2,7 @@
 
 Protocol (point-in-time, per product for a producer):
   1. At a historical as_of, compute inventory position + the policy's suggested_qty.
-  2. Look at ACTUAL demand over the next `eval_window` days (from Order/OrderItem > as_of).
+  2. Look at ACTUAL demand over the next `eval_window` days (app.data.source_rules).
   3. Outcomes (fill/stockout are unit/event based; overstock is MAGNITUDE based):
      - fill:            min(position + suggested_qty, demand) / demand              (unit-based)
      - stockout (event): position + suggested_qty < demand                          (under-ordered)
@@ -28,6 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.core.config import get_settings
+from app.data import source_rules as rules
 from app.data.db import in_clause, query
 from app.domain.models import Urgency
 from app.services.replenishment import policy
@@ -61,16 +62,12 @@ def _actual_demand(product_ids: list[int], as_of: str, window_days: int) -> dict
     ph, params = in_clause("p", product_ids)
     rows = query(
         f"""
-        SELECT oi.ProductID AS pid, SUM(oi.Qty) AS units
-        FROM dbo.[Order] o
-        JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-        WHERE o.Deleted = 0
-              AND o.Created >= :asof
-              AND o.Created < DATEADD(day, :win, :asof)
-              AND oi.ProductID IN {ph}
-        GROUP BY oi.ProductID
+        SELECT d.product_id AS pid, SUM(d.units) AS units
+        FROM {rules.demand_lines()}
+        WHERE d.product_id IN {ph}
+        GROUP BY d.product_id
         """,
-        {"asof": as_of, "win": window_days, **params},
+        {**rules.forward_window(as_of, window_days), **params},
     )
     return {int(r["pid"]): float(r["units"] or 0) for r in rows}
 

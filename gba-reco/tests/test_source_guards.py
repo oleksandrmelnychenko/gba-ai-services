@@ -1,87 +1,136 @@
-"""Always-on source guards — no DB/Redis, run in normal pytest/CI.
+"""Always-on source guards: no DB/Redis, run in normal pytest/CI.
 
-These read the repository/recommender source via inspect.getsource and assert the
-correctness-fix SQL patterns are present/absent. Mocked unit tests stayed green while
-real bugs shipped (only live smoke caught them); these guards make reintroducing a fix
-regression fail CI immediately, with no database required.
-
-Fixes guarded:
-- the validity filter migrated from the wrong/absent `o.Deleted = 0` order-level predicate
-  to the correct item-level `oi.IsValidForCurrentSale = 1` (the actual sales-spine validity
-  column) across every query that filters the rec population;
-- the synthetic accounting line (the debt-entry product «Ввід боргів») is excluded explicitly —
-  resolved by Name at runtime because catalog re-syncs re-mint its ProductID
-  (25422404 → 29555414 → ...) — not left to drift with the data-driven ubiquity threshold.
+They read the service source via inspect.getsource and assert that every purchase-history
+query is built from app.data.source_rules (gba-server's confirmed sale net of buyer returns),
+that the synthetic debt-entry line is resolved by name, and that the stock filter and the
+model namespace keep their contracts.
 """
 from __future__ import annotations
 
 import inspect
 import re
+from datetime import date, datetime
+from pathlib import Path
 
 from app.core import config
 from app.data import sales_repository
-from app.services.eval import baselines, harness
-from app.services.recommendations import als, copurchase, reranker, worker
+from app.data import source_rules as rules
+from app.services.eval import baselines, harness, holdout
+from app.services.recommendations import als, copurchase, snapshot, worker
 
-VALIDITY_MODULES = {
-    "copurchase": copurchase,
-    "als": als,
-    "baselines": baselines,
-    "worker": worker,
-    "harness": harness,
-    "reranker": reranker,
-    "sales_repository": sales_repository,
-}
+_APP = Path(sales_repository.__file__).resolve().parents[1]
+_PRIVATE_DEFINITION = re.compile(
+    r"o\.Created|IsValidForCurrentSale|ChangedToInvoice|dbo\.OrderItem|dbo\.\[Order\]|dbo\.Sale\b"
+)
 
-_DELETED_PATTERN = re.compile(r"o\.Deleted\s*=\s*0")
-_VALIDITY_PATTERN = re.compile(r"oi\.IsValidForCurrentSale\s*=\s*1")
-
-
-def test_no_order_deleted_predicate_anywhere():
-    for name, module in VALIDITY_MODULES.items():
-        src = inspect.getsource(module)
-        offenders = _DELETED_PATTERN.findall(src)
-        assert not offenders, (
-            f"{name}: order-level `o.Deleted = 0` validity predicate reintroduced "
-            f"(must use item-level oi.IsValidForCurrentSale = 1): {offenders}"
-        )
-
-
-def test_is_valid_for_current_sale_present_in_each_validity_query():
-    for name in ("copurchase", "als", "baselines", "worker", "harness", "reranker"):
-        src = inspect.getsource(VALIDITY_MODULES[name])
-        assert _VALIDITY_PATTERN.search(src), (
-            f"{name}: lost the `oi.IsValidForCurrentSale = 1` validity filter"
-        )
-
-
-def test_ubiquity_query_uses_valid_population_not_deleted_flag():
-    src = inspect.getsource(sales_repository._query_ubiquitous)
-    assert _VALIDITY_PATTERN.search(src), (
-        "ubiquity query must filter on oi.IsValidForCurrentSale = 1 (same valid "
-        "population the recommender uses), not an order-level deleted flag"
-    )
-    assert not _DELETED_PATTERN.search(src), "ubiquity query reintroduced o.Deleted = 0"
+HISTORY_QUERIES = (
+    sales_repository.source_readiness,
+    sales_repository._query_ubiquitous,
+    sales_repository.count_orders_before,
+    sales_repository.repurchase_rate,
+    sales_repository.product_frequency,
+    sales_repository.product_last_purchase,
+    sales_repository.owned_live_product_ids,
+    sales_repository.customer_products,
+    sales_repository.candidate_similar_customers,
+    sales_repository.customer_products_bulk,
+    sales_repository.collaborative_products,
+    copurchase._client_products_with_freq,
+    copurchase._cooccurring_products,
+    copurchase._product_degrees,
+    als._load_interactions,
+    baselines.most_frequent_for_client,
+    baselines.global_popular,
+    harness.build_cases,
+    holdout._truth,
+    worker.active_clients,
+    snapshot.load_data,
+)
 
 
-def test_every_live_recommendation_history_query_uses_item_validity():
-    functions = (
-        sales_repository.count_orders_before,
-        sales_repository.repurchase_rate,
-        sales_repository.product_frequency,
-        sales_repository.product_last_purchase,
-        sales_repository.owned_live_product_ids,
-        sales_repository.customer_products,
-        sales_repository.candidate_similar_customers,
-        sales_repository.customer_products_bulk,
-        sales_repository.collaborative_products,
-    )
-    for function in functions:
+def test_purchase_definition_lives_only_in_source_rules():
+    offenders = {}
+    for path in sorted(_APP.rglob("*.py")):
+        if path.name == "source_rules.py":
+            continue
+        found = _PRIVATE_DEFINITION.findall(path.read_text(encoding="utf-8"))
+        if found:
+            offenders[str(path.relative_to(_APP))] = sorted(set(found))
+    assert not offenders, f"purchase history defined outside app.data.source_rules: {offenders}"
+
+
+def test_every_history_query_uses_the_shared_rule_and_window():
+    for function in HISTORY_QUERIES:
         src = inspect.getsource(function)
-        assert _VALIDITY_PATTERN.search(src), (
-            f"{function.__name__}: recommendation history query lost "
-            "oi.IsValidForCurrentSale = 1"
+        name = f"{function.__module__}.{function.__name__}"
+        assert "{rules.SPINE}" in src, f"{name}: not built on source_rules.SPINE"
+        assert "{rules.PURCHASED}" in src, f"{name}: not filtered by source_rules.PURCHASED"
+        assert re.search(r"rules\.(window|trailing_window|forward_window)\(", src), (
+            f"{name}: window is not bound through source_rules"
         )
+
+
+def test_multi_population_queries_apply_the_rule_to_every_branch():
+    assert inspect.getsource(sales_repository.collaborative_products).count("{rules.PURCHASED}") == 2
+    assert inspect.getsource(copurchase._cooccurring_products).count("{rules.PURCHASED}") == 2
+
+
+def test_rule_is_the_gba_server_confirmed_sale_net_of_returns():
+    sql = rules.PURCHASED
+    for fragment in (
+        "s.Deleted = 0",
+        "s.ChangedToInvoice IS NOT NULL",
+        "NOT EXISTS (SELECT 1 FROM dbo.DataSyncAccountingSourceTarget carrier",
+        "carrier.TargetEntityType = N'Sale'",
+        "carrier.IsCurrent = 1 AND carrier.OwnershipType = 1",
+        "oi.Deleted = 0",
+        "oi.IsValidForCurrentSale = 1",
+        "oi.Qty > 0",
+        "oi.ProductID IS NOT NULL",
+        "s.ChangedToInvoice >= :sold_from",
+        "s.ChangedToInvoice < :sold_to",
+        "dbo.SaleReturnItem sri",
+        "sri.Deleted = 0",
+        "sr.Deleted = 0 AND sr.IsCanceled = 0",
+        "sr.FromDate < :sold_to",
+        "HAVING SUM(CAST(sri.Qty AS decimal(38, 6))) >= CAST(roi.Qty AS decimal(38, 6))",
+        "returned.line_id = oi.ID",
+    ):
+        assert fragment in sql, f"confirmed-sale rule lost `{fragment}`"
+    assert "NOT EXISTS (SELECT 1 FROM (SELECT sri.OrderItemID AS line_id" in sql
+    assert re.fullmatch(
+        r"\(CAST\(oi\.Qty AS decimal\(38, 6\)\) - ISNULL\(.*sri\.OrderItemID = oi\.ID.*, 0\)\)",
+        rules.KEPT_UNITS,
+    )
+    assert "o.Created" not in sql
+    assert "JOIN dbo.Sale" not in rules.SPINE and rules.SPINE.startswith("dbo.Sale s")
+    assert "AT TIME ZONE 'FLE Standard Time'" in rules.SOLD_AT
+
+
+def test_windows_are_whole_kyiv_days_as_utc_instants_clamped_to_the_floor():
+    assert rules.utc_instant("2026-07-01") == datetime(2026, 6, 30, 21, 0)
+    assert rules.utc_instant(date(2026, 11, 13)) == datetime(2026, 11, 12, 22, 0)
+    assert rules.utc_instant("2026-11-13 10:30:00") == datetime(2026, 11, 13, 8, 30)
+    assert rules.window("2026-11-13") == {
+        "sold_from": datetime(2024, 12, 31, 22, 0),
+        "sold_to": datetime(2026, 11, 12, 22, 0),
+    }
+    assert rules.trailing_window("2026-11-13", 365)["sold_from"] == datetime(2025, 11, 12, 22, 0)
+    assert rules.trailing_window("2025-03-01", 365)["sold_from"] == datetime(2024, 12, 31, 22, 0)
+    assert rules.window("2026-11-13", rules.trailing_year("2026-11-13"))["sold_from"] == datetime(
+        2025, 11, 12, 22, 0
+    )
+    assert rules.trailing_year("2028-02-29") == datetime(2027, 2, 28)
+    assert rules.forward_window("2026-10-13", 30) == {
+        "sold_from": datetime(2026, 10, 12, 21, 0),
+        "sold_to": datetime(2026, 11, 11, 22, 0),
+    }
+
+
+def test_default_as_of_is_the_kyiv_day():
+    for module in (sales_repository, worker):
+        assert "rules.today()" in inspect.getsource(module)
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", rules.today())
 
 
 def test_owned_history_is_compared_on_live_catalog_identity():
@@ -91,63 +140,6 @@ def test_owned_history_is_compared_on_live_catalog_identity():
     assert "ORDER BY current_product.ID DESC" in src
 
 
-def test_every_fixed_history_query_has_shared_lower_boundary():
-    functions = (
-        sales_repository.source_readiness,
-        sales_repository.count_orders_before,
-        sales_repository.repurchase_rate,
-        sales_repository.product_frequency,
-        sales_repository.product_last_purchase,
-        sales_repository.owned_live_product_ids,
-        sales_repository.customer_products,
-        sales_repository.candidate_similar_customers,
-        sales_repository.customer_products_bulk,
-        sales_repository.collaborative_products,
-        copurchase._client_products_with_freq,
-        copurchase._cooccurring_products,
-        copurchase._product_degrees,
-        als._load_interactions,
-        baselines.most_frequent_for_client,
-        baselines.global_popular,
-        harness.build_cases,
-        reranker.build_train_cases,
-        reranker._case_features,
-    )
-    for function in functions:
-        src = inspect.getsource(function)
-        assert "o.Created >= :history_start" in src, (
-            f"{function.__module__}.{function.__name__}: lost SOURCE_HISTORY_START_DATE floor"
-        )
-        assert "history_start" in src, (
-            f"{function.__module__}.{function.__name__}: floor parameter is not bound"
-        )
-
-
-def test_multi_population_queries_floor_every_history_branch():
-    assert inspect.getsource(
-        sales_repository.collaborative_products
-    ).count("o.Created >= :history_start") == 2
-    assert inspect.getsource(
-        copurchase._cooccurring_products
-    ).count("o.Created >= :history_start") == 2
-    assert inspect.getsource(reranker._case_features).count(
-        "o.Created >= :history_start"
-    ) == 4
-
-
-def test_rolling_windows_are_clamped_to_source_history_floor():
-    ubiquity = inspect.getsource(sales_repository._query_ubiquitous)
-    active_clients = inspect.getsource(worker.active_clients)
-    reranker_features = inspect.getsource(reranker._case_features)
-
-    assert "DATEADD(month, -12, GETDATE())" in ubiquity
-    assert "o.Created >= :history_start" in ubiquity
-    assert "DATEADD(day, -:days, :asof)" in active_clients
-    assert "o.Created >= :history_start" in active_clients
-    assert "DATEADD(day, -90, :asof)" in reranker_features
-    assert "o.Created >= :history_start" in reranker_features
-
-
 def test_model_and_cache_namespaces_include_history_floor():
     from app.data import cache
     from app.domain.models import RecommendationResult
@@ -155,14 +147,18 @@ def test_model_and_cache_namespaces_include_history_floor():
     assert "20250101" in cache._MODEL_VERSION
     assert "20250101" in RecommendationResult.model_fields["model_version"].default
     assert "source_history_start_iso()" in inspect.getsource(als.get_model)
-    assert "history_floor" in reranker._ARTIFACT.name
 
 
 def test_stock_filter_is_scoped_to_operational_resale_storages():
     src = inspect.getsource(sales_repository.in_stock_product_ids)
     assert "JOIN dbo.Storage" in src
-    assert "s.Deleted = 0" in src
-    assert "s.AvailableForReSale = 1 OR s.IsResale = 1" in src
+    assert 'rules.sellable_storage("s")' in src
+    sellable = rules.sellable_storage("s")
+    assert "s.Deleted = 0" in sellable
+    assert "s.ForDefective = 0" in sellable
+    assert "s.AvailableForReSale = 1 OR s.IsResale = 1" in sellable
+    agreement = inspect.getsource(sales_repository._agreement_stock_product_ids)
+    assert "s.ForDefective = 0" in agreement
     assert "CASE WHEN d.Deleted = 0 THEN d.ID ELSE MAX(l.ID) END" in src
 
 
@@ -194,6 +190,14 @@ def test_ubiquity_helper_references_synthetic_ids_resolver():
     )
 
 
+def test_service_cards_are_excluded_with_the_synthetic_line():
+    src = inspect.getsource(sales_repository.ubiquitous_product_ids)
+    assert re.search(r"synthetic_product_ids\(\)\s*\|\s*service_product_ids\(\)\s*\|", src)
+    lookup = inspect.getsource(sales_repository.service_product_ids)
+    assert "NativeIsService = 1" in lookup and "Послуг%" in lookup and "послуга" in lookup
+    assert "repo.service_product_ids()" in inspect.getsource(snapshot.load_data)
+
+
 def test_synthetic_exclusion_is_unconditional_in_ubiquity():
     src = inspect.getsource(sales_repository.ubiquitous_product_ids)
     assert re.search(r"synthetic_product_ids\(\)\s*\|", src), (
@@ -202,18 +206,29 @@ def test_synthetic_exclusion_is_unconditional_in_ubiquity():
     )
 
 
-def test_precision_estimate_is_not_the_fabricated_value():
-    """The contract's precision_estimate must NOT be the old hardcoded 0.754 (contradicted by the
-    harness by ~23x). It must be a harness-derived figure aligned with the committed baseline."""
+def test_precision_estimate_is_the_measured_value_for_the_served_model_version():
+    from app.data import cache
     from app.domain.models import RecommendationResult
-    from app.services.eval.harness import BASELINE_V32
+    from app.services.eval import measured
 
-    default = RecommendationResult.model_fields["precision_estimate"].default
-    assert abs(default - 0.754) > 1e-6, "fabricated precision_estimate 0.754 reintroduced"
-    assert abs(default - BASELINE_V32["precision"]) < 1e-6, (
-        "precision_estimate must equal the harness-derived baseline precision@10 "
-        f"({BASELINE_V32['precision']}); update both together when the model is re-measured"
+    stored = measured.load()
+    assert stored["model_version"] == cache._MODEL_VERSION, (
+        "measured.json was produced for another model version; rerun "
+        "`python -m app.services.eval.holdout --write-measured`"
     )
+    assert RecommendationResult.model_fields["model_version"].default == cache._MODEL_VERSION
+    for kind in ("personal", "copurchase"):
+        for k in (10, 25):
+            value = measured.precision(kind, k)
+            assert 0 < value < 1
+            assert value not in (0.754, 0.033)
+    assert measured.precision("personal", 7) == stored["precision"]["personal"]["10"]
+    assert measured.precision("personal", 50) == stored["precision"]["personal"]["25"]
+    result = RecommendationResult(
+        customer_id=1, recommendations=[], count=0, discovery_count=0, segment="LIGHT",
+        source_history_start="2025-01-01", effective_start="2025-01-01", history_complete=True,
+    )
+    assert result.precision_estimate == stored["precision"]["personal"]["25"]
 
 
 def test_region_scoping_uses_region_id_natural_key_not_per_client_code():

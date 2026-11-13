@@ -183,8 +183,9 @@ def test_elasticity_panel_uses_priceperitem_as_eur_not_fx_converted():
         assert "oi.PricePerItem" in code
         assert "GetExchangedToEuroValue" not in code
         assert ":synthetic" in code
-        assert "IsValidForCurrentSale = 1" in code
-        assert "Deleted" not in code or "Deleted = 0" in code  # only ProductProductGroup may filter
+        assert "{CONFIRMED_SALE}" in code
+        assert "{KEPT_LINE}" in code
+        assert "{SALE_WINDOW}" in code
 
 
 def test_elastic_price_is_secondary_never_replaces_recommended_price():
@@ -201,3 +202,73 @@ def test_elastic_price_is_secondary_never_replaces_recommended_price():
 
     gate = _code_without_docstring(engine.elasticity_outputs)
     assert "is_sane_elasticity" in gate
+
+
+def _rendered_behavioral_sql(monkeypatch):
+    captured: list[str] = []
+    monkeypatch.setattr(repo, "query", lambda sql, params=None: captured.append(sql) or [])
+    monkeypatch.setattr(repo, "synthetic_product_id", lambda: 999)
+    repo.client_world_fallback_baseline(7, 11, "2026-06-15", 12)
+    repo.peer_band(7, "2026-06-15", 12, "2026-06-15")
+    repo.product_line_count(7, "2026-06-15", 12)
+    repo.product_panel(7, "2026-06-15", 12)
+    repo.group_panel(106, "2026-06-15", 12)
+    return captured
+
+
+def test_realised_prices_come_from_confirmed_sales_only(monkeypatch):
+    rendered = _rendered_behavioral_sql(monkeypatch)
+    assert len(rendered) == 5
+    for sql in rendered:
+        assert "s.Deleted = 0 AND s.ChangedToInvoice IS NOT NULL" in sql
+        assert "carrier.OwnershipType = 1" in sql
+        assert "oi.Deleted = 0 AND oi.IsValidForCurrentSale = 1 AND oi.Qty > 0" in sql
+        assert "sr.IsCanceled = 0" in sql
+        assert "oi.PricePerItem > 0" in sql
+    pooled = rendered[-1]
+    assert "s2.Deleted = 0 AND s2.ChangedToInvoice IS NOT NULL" in pooled
+    assert "oi2.Deleted = 0 AND oi2.IsValidForCurrentSale = 1 AND oi2.Qty > 0" in pooled
+    assert "sri2.OrderItemID = oi2.ID" in pooled
+
+
+def test_fully_returned_line_is_not_a_realised_price():
+    assert "CAST(oi.Qty AS decimal(38, 6)) > ISNULL((" in repo.KEPT_LINE
+    assert "sri.OrderItemID = oi.ID" in repo.KEPT_LINE
+    assert "sri.Deleted = 0" in repo.KEPT_LINE
+    assert "sr.Deleted = 0 AND sr.IsCanceled = 0" in repo.KEPT_LINE
+
+
+def test_sale_window_is_whole_kyiv_days_as_utc_instants():
+    from datetime import date, datetime
+
+    assert repo.utc_instant(date(2026, 7, 1)) == datetime(2026, 6, 30, 21, 0)
+    assert repo.utc_instant(date(2026, 1, 15)) == datetime(2026, 1, 14, 22, 0)
+    params = repo._behavioral_history_params("2026-11-13", 12)
+    assert params == {
+        "window_from": datetime(2025, 11, 12, 22, 0),
+        "window_to": datetime(2026, 11, 12, 22, 0),
+    }
+
+
+def test_product_group_follows_the_engine_resolver_for_the_agreement_world(monkeypatch):
+    captured = {}
+
+    def fake_query(sql, params=None):
+        captured["sql"], captured["params"] = sql, params
+        return [{"ProductGroupID": 4381}]
+
+    monkeypatch.setattr(repo, "query", fake_query)
+    assert repo.product_group_id(38525933, 510000) == 4381
+    sql = captured["sql"]
+    assert "owner.ImportedForAmg = ISNULL(world.for_amg, 0)" in sql
+    assert "ORDER BY CASE WHEN owner.ProductProductGroupID IS NULL THEN 1 ELSE 0 END" in sql
+    assert "ELSE org.PriceSourceIsAmg" in sql
+    assert "a.ID = req.agreement_id AND a.Deleted = 0" in sql
+    assert "dbo.Get" not in sql
+    assert captured["params"] == {"pid": 38525933, "aid": 510000}
+    assert "{ENGINE_PRODUCT_GROUP}" in inspect.getsource(repo.base_list_price_and_markup)
+
+
+def test_product_group_is_none_without_an_assignment(monkeypatch):
+    monkeypatch.setattr(repo, "query", lambda sql, params=None: [])
+    assert repo.product_group_id(1, 2) is None

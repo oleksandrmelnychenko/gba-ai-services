@@ -1,4 +1,4 @@
-"""Parameterized read queries over the sales spine (ClientAgreement -> Order -> OrderItem).
+"""Parameterized read queries over confirmed purchases (app.data.source_rules).
 
 All SQL here is parameterized (:name) — no f-string interpolation (prototype anti-pattern).
 as_of_date enables point-in-time recommendations for time-split evaluation.
@@ -11,19 +11,26 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from app.core.config import get_settings
-from app.core.history import source_history_start_iso
+from app.data import source_rules as rules
 from app.data.db import in_clause, query
 
-_UBIQUITY_CACHE: dict[float, tuple[float, frozenset[int]]] = {}
+_UBIQUITY_CACHE: dict[tuple[float, str], tuple[float, frozenset[int]]] = {}
 _UBIQUITY_LOCK = threading.Lock()
 
 _SYNTHETIC_NAME = "Ввід боргів"
 _SYNTHETIC_TTL = 3600.0
 _SYNTHETIC_CACHE: tuple[float, frozenset[int]] | None = None
 _SYNTHETIC_LOCK = threading.Lock()
+_SERVICE_CACHE: tuple[float, frozenset[int]] | None = None
+_SERVICE_LOCK = threading.Lock()
 _READINESS_TTL = 60.0
 _READINESS_CACHE: dict[int, tuple[float, dict[str, Any]]] = {}
 _READINESS_LOCK = threading.Lock()
+_MEANINGFUL_VENDOR_CODE = r"%[^-./\_ *#+,;:()]%"
+_MAX_SIBLING_GROUP = 4
+_SIBLING_TTL = 3600.0
+_SIBLING_CACHE: tuple[float, dict[int, int]] | None = None
+_SIBLING_LOCK = threading.Lock()
 
 
 def synthetic_product_ids() -> frozenset[int]:
@@ -58,6 +65,32 @@ def synthetic_product_ids() -> frozenset[int]:
     return result
 
 
+def service_product_ids() -> frozenset[int]:
+    """Live cards that are services, not goods (delivery and the like): flagged by the native
+    service marker, named «Послуг…» or measured in «послуга». They can carry a stock balance
+    and sell often, so stock and popularity filters do not remove them."""
+    global _SERVICE_CACHE
+    now = time.monotonic()
+    with _SERVICE_LOCK:
+        if _SERVICE_CACHE is not None and now - _SERVICE_CACHE[0] < _SYNTHETIC_TTL:
+            return _SERVICE_CACHE[1]
+    rows = query(
+        """
+        SELECT p.ID AS pid
+        FROM dbo.Product p
+        LEFT JOIN dbo.MeasureUnit mu ON mu.ID = p.MeasureUnitID
+        WHERE p.Deleted = 0
+              AND (p.NativeIsService = 1 OR LTRIM(p.Name) LIKE :service_name
+                   OR LTRIM(RTRIM(mu.Name)) = :service_unit)
+        """,
+        {"service_name": "Послуг%", "service_unit": "послуга"},
+    )
+    result = frozenset(int(r["pid"]) for r in rows)
+    with _SERVICE_LOCK:
+        _SERVICE_CACHE = (time.monotonic(), result)
+    return result
+
+
 def source_readiness(max_lag_days: int) -> dict[str, Any]:
     """Cached business-source probe for health/readiness endpoints.
 
@@ -72,20 +105,17 @@ def source_readiness(max_lag_days: int) -> dict[str, Any]:
 
     synthetic_ids = synthetic_product_ids()
     synth_ph, synth_params = in_clause("health_synth", list(synthetic_ids) or [0])
+    today = datetime.combine(datetime.now(rules.BUSINESS_ZONE).date(), datetime.min.time())
     rows = query(
         f"""
         SELECT
             (
-                SELECT TOP 1 o.Created
-                FROM dbo.ClientAgreement ca
+                SELECT TOP 1 {rules.SOLD_AT}
+                FROM {rules.SPINE}
                 JOIN dbo.Client c ON c.ID = ca.ClientID AND c.Deleted = 0
-                JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
-                JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-                WHERE oi.IsValidForCurrentSale = 1
-                      AND oi.ProductID IS NOT NULL
+                WHERE {rules.PURCHASED}
                       AND oi.ProductID NOT IN {synth_ph}
-                      AND o.Created >= :history_start
-                ORDER BY o.Created DESC, o.ID DESC
+                ORDER BY {rules.SALE_INSTANT} DESC, s.ID DESC
             ) AS latest_sale_at,
             (
                 SELECT COUNT_BIG(DISTINCT pa.ProductID)
@@ -93,23 +123,19 @@ def source_readiness(max_lag_days: int) -> dict[str, Any]:
                 JOIN dbo.Product p ON p.ID = pa.ProductID AND p.Deleted = 0
                 JOIN dbo.Storage s ON s.ID = pa.StorageID
                 WHERE pa.Deleted = 0 AND pa.Amount > 0
-                      AND s.Deleted = 0
-                      AND (s.AvailableForReSale = 1 OR s.IsResale = 1)
+                      AND {rules.sellable_storage("s")}
             ) AS stocked_product_count,
             (
                 SELECT COUNT_BIG(*)
                 FROM dbo.Storage s
-                WHERE s.Deleted = 0
-                      AND (s.AvailableForReSale = 1 OR s.IsResale = 1)
+                WHERE {rules.sellable_storage("s")}
             ) AS sellable_storage_count
         """,
-        {"history_start": source_history_start_iso(), **synth_params},
+        {**rules.window(today + timedelta(days=1)), **synth_params},
     )
     row = rows[0] if rows else {}
     latest = row.get("latest_sale_at")
-    fresh = isinstance(latest, datetime) and latest >= datetime.now() - timedelta(
-        days=max_lag_days
-    )
+    fresh = isinstance(latest, datetime) and latest >= today - timedelta(days=max_lag_days)
     stocked_count = int(row.get("stocked_product_count") or 0)
     storage_count = int(row.get("sellable_storage_count") or 0)
     reasons: list[str] = []
@@ -135,6 +161,125 @@ def source_readiness(max_lag_days: int) -> dict[str, Any]:
     with _READINESS_LOCK:
         _READINESS_CACHE[max_lag_days] = (time.monotonic(), dict(result))
     return result
+
+
+def sibling_card_rows() -> tuple[list[tuple[int, str, str]], list[tuple[str, int]]]:
+    """Live cards of one article, by gba-server's sibling rule (ProductSiblingRepository):
+    equal meaningful VendorCode on at most four live cards with the same first word of the
+    name, plus the manual links of dbo.ProductSiblingLink."""
+    auto = query(
+        """
+        SELECT m.ID AS pid, m.VendorCode AS code,
+               LEFT(LTRIM(m.Name), CHARINDEX(N' ', LTRIM(m.Name) + N' ') - 1) AS name_key
+        FROM dbo.Product m
+        JOIN (SELECT VendorCode FROM dbo.Product WHERE Deleted = 0
+              GROUP BY VendorCode HAVING COUNT(*) BETWEEN 2 AND :max_size) g
+             ON g.VendorCode = m.VendorCode
+        WHERE m.Deleted = 0 AND m.VendorCode LIKE :meaningful
+        """,
+        {"max_size": _MAX_SIBLING_GROUP, "meaningful": _MEANINGFUL_VENDOR_CODE},
+    )
+    manual: list[dict[str, Any]] = []
+    ready = query(
+        "SELECT CASE WHEN OBJECT_ID(N'dbo.ProductSiblingLink', N'U') IS NOT NULL "
+        "THEN 1 ELSE 0 END AS ready"
+    )
+    if ready and ready[0]["ready"]:
+        manual = query(
+            """
+            SELECT l.GroupKey AS gkey, p.ID AS pid
+            FROM dbo.ProductSiblingLink l
+            JOIN dbo.Product p ON p.SourceAmgCode = l.SourceCode AND p.Deleted = 0
+            WHERE l.SourceWorld = 'AMG'
+            UNION
+            SELECT l.GroupKey AS gkey, p.ID AS pid
+            FROM dbo.ProductSiblingLink l
+            JOIN dbo.Product p ON p.SourceFenixCode = l.SourceCode AND p.Deleted = 0
+            WHERE l.SourceWorld = 'FENIX'
+            """
+        )
+    return (
+        [(int(r["pid"]), str(r["code"]), str(r["name_key"] or "")) for r in auto],
+        [(str(r["gkey"]), int(r["pid"])) for r in manual],
+    )
+
+
+def group_siblings(
+    auto: list[tuple[int, str, str]], manual: list[tuple[str, int]],
+) -> dict[int, int]:
+    """Card id -> article id (the lowest card id of its sibling group), grouped cards only."""
+    parent: dict[int, int] = {}
+
+    def find(pid: int) -> int:
+        parent.setdefault(pid, pid)
+        while parent[pid] != pid:
+            parent[pid] = parent[parent[pid]]
+            pid = parent[pid]
+        return pid
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    buckets: dict[tuple[str, str], list[int]] = {}
+    for pid, code, name_key in auto:
+        buckets.setdefault((code, name_key), []).append(pid)
+    for gkey, pid in manual:
+        buckets.setdefault((gkey, "\x00manual"), []).append(pid)
+    for members in buckets.values():
+        for pid in members[1:]:
+            union(members[0], pid)
+    sizes: dict[int, int] = {}
+    for pid in list(parent):
+        sizes[find(pid)] = sizes.get(find(pid), 0) + 1
+    return {pid: find(pid) for pid in parent if sizes[find(pid)] > 1}
+
+
+def sibling_articles() -> dict[int, int]:
+    global _SIBLING_CACHE
+    now = time.monotonic()
+    with _SIBLING_LOCK:
+        if _SIBLING_CACHE is not None and now - _SIBLING_CACHE[0] < _SIBLING_TTL:
+            return _SIBLING_CACHE[1]
+    result = group_siblings(*sibling_card_rows())
+    with _SIBLING_LOCK:
+        _SIBLING_CACHE = (time.monotonic(), result)
+    return result
+
+
+def with_siblings(product_ids: set[int] | frozenset[int], articles: dict[int, int]) -> set[int]:
+    wanted = {articles[pid] for pid in product_ids if pid in articles}
+    if not wanted:
+        return set(product_ids)
+    return set(product_ids) | {pid for pid, article in articles.items() if article in wanted}
+
+
+def open_order_rows(as_of: str) -> list[tuple[int, int]]:
+    rows = query(
+        f"""
+        SELECT DISTINCT ca.ClientID AS cid, oi.ProductID AS pid
+        FROM {rules.SPINE}
+        WHERE {rules.OPEN_ORDER}
+        """,
+        rules.open_window(as_of, get_settings().open_order_days),
+    )
+    return [(int(r["cid"]), int(r["pid"])) for r in rows]
+
+
+def open_order_product_ids(customer_id: int, as_of: str) -> frozenset[int]:
+    """Products in the client's open orders, with their sibling cards: already in the basket,
+    so never recommended."""
+    rows = query(
+        f"""
+        SELECT DISTINCT oi.ProductID AS pid
+        FROM {rules.SPINE}
+        WHERE ca.ClientID = :cid AND {rules.OPEN_ORDER}
+        """,
+        {"cid": customer_id, **rules.open_window(as_of, get_settings().open_order_days)},
+    )
+    found = {int(r["pid"]) for r in rows}
+    return frozenset(with_siblings(found, sibling_articles())) if found else frozenset()
 
 
 def client_exists(customer_id: int) -> bool:
@@ -169,17 +314,13 @@ def active_product_ids(product_ids: list[int]) -> set[int]:
     return {int(row["pid"]) for row in rows}
 
 
-def _query_ubiquitous(pct: float) -> frozenset[int]:
+def _query_ubiquitous(pct: float, as_of: str) -> frozenset[int]:
     rows = query(
-        """
+        f"""
         WITH base AS (
             SELECT ca.ClientID AS cid, oi.ProductID AS pid
-            FROM dbo.[Order] o
-            JOIN dbo.ClientAgreement ca ON ca.ID = o.ClientAgreementID
-            JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-            WHERE oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
-                  AND o.Created >= DATEADD(month, -12, GETDATE())
-                  AND o.Created >= :history_start
+            FROM {rules.SPINE}
+            WHERE {rules.PURCHASED}
         ),
         tot AS (SELECT COUNT(DISTINCT cid) AS n FROM base)
         SELECT b.pid AS pid
@@ -187,31 +328,34 @@ def _query_ubiquitous(pct: float) -> frozenset[int]:
         GROUP BY b.pid, tot.n
         HAVING COUNT(DISTINCT b.cid) * 1.0 / NULLIF(tot.n, 0) > :pct
         """,
-        {"pct": pct, "history_start": source_history_start_iso()},
+        {"pct": pct, **rules.window(as_of, rules.trailing_year(as_of))},
     )
     return frozenset(int(r["pid"]) for r in rows)
 
 
-def ubiquitous_product_ids(pct: float) -> frozenset[int]:
+def ubiquitous_product_ids(pct: float, as_of: str | None = None) -> frozenset[int]:
     """Products to exclude from rec/candidate populations: the synthetic accounting
     lines (always, e.g. the debt-entry line — see synthetic_product_ids) UNION the data-driven
     ubiquity set — products bought
     by more than `pct` of distinct clients over the last 12mo on the SAME valid population the
-    recommender uses (oi.IsValidForCurrentSale=1). These are universal staples / synthetic lines,
+    recommender uses (source_rules.PURCHASED). These are universal staples / synthetic lines,
     not cross-sell candidates, and pollute popularity ranking.
 
     TTL-refreshed (config.ubiquity_cache_ttl) rather than process-lifetime cached, so the set
     tracks the rolling window without a restart. The synthetic ids are pinned unconditionally so
     exclusion never depends on the ubiquity threshold catching them in a given window."""
     s = get_settings()
+    as_of = as_of or rules.today()
     now = time.monotonic()
     with _UBIQUITY_LOCK:
-        entry = _UBIQUITY_CACHE.get(pct)
+        entry = _UBIQUITY_CACHE.get((pct, as_of))
         if entry is not None and now - entry[0] < s.ubiquity_cache_ttl:
             return entry[1]
-    result = synthetic_product_ids() | _query_ubiquitous(pct)
+    result = synthetic_product_ids() | service_product_ids() | _query_ubiquitous(pct, as_of)
     with _UBIQUITY_LOCK:
-        _UBIQUITY_CACHE[pct] = (time.monotonic(), result)
+        if len(_UBIQUITY_CACHE) > 512:
+            _UBIQUITY_CACHE.clear()
+        _UBIQUITY_CACHE[(pct, as_of)] = (time.monotonic(), result)
     return result
 
 
@@ -290,23 +434,17 @@ def count_orders_before(
     customer_id: int, as_of_date: str, client_agreement_net_id: str | None = None,
 ) -> int:
     rows = query(
-        """
+        f"""
         SELECT COUNT(DISTINCT o.ID) AS n
-        FROM dbo.ClientAgreement ca
-        JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
-        JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
+        FROM {rules.SPINE}
         WHERE ca.ClientID = :cid
                   AND (:agreement_uid IS NULL OR ca.NetUID = CONVERT(uniqueidentifier, :agreement_uid))
-                  AND o.Created < :asof
-              AND o.Created >= :history_start
-              AND oi.IsValidForCurrentSale = 1
-              AND oi.ProductID IS NOT NULL
+                  AND {rules.PURCHASED}
         """,
         {
             "cid": customer_id,
             "agreement_uid": client_agreement_net_id,
-            "asof": as_of_date,
-            "history_start": source_history_start_iso(),
+            **rules.window(as_of_date),
         },
     )
     return int(rows[0]["n"]) if rows else 0
@@ -317,7 +455,7 @@ def repurchase_rate(
 ) -> float:
     """Share of products bought 2+ times — drives REGULAR sub-segmentation.
 
-    Restricted to the valid rec sales spine (oi.IsValidForCurrentSale = 1) with the synthetic
+    Restricted to confirmed purchases (source_rules.PURCHASED) with the synthetic
     accounting lines (the debt-entry line) excluded, matching the rest of the reco spine.
     Without this, synthetic-only / synthetic-dominated clients score an inflated rate (e.g. 1.0)
     and flip REGULAR sub-segmentation on a non-real-product line."""
@@ -329,15 +467,10 @@ def repurchase_rate(
             SUM(CASE WHEN purchase_count >= 2 THEN 1 ELSE 0 END) AS repurchased
         FROM (
             SELECT oi.ProductID, COUNT(DISTINCT o.ID) AS purchase_count
-            FROM dbo.ClientAgreement ca
-            JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
-            JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
+            FROM {rules.SPINE}
             WHERE ca.ClientID = :cid
                   AND (:agreement_uid IS NULL OR ca.NetUID = CONVERT(uniqueidentifier, :agreement_uid))
-                  AND o.Created < :asof
-                  AND o.Created >= :history_start
-                  AND oi.IsValidForCurrentSale = 1
-                  AND oi.ProductID IS NOT NULL
+                  AND {rules.PURCHASED}
                   AND oi.ProductID NOT IN {synth_ph}
             GROUP BY oi.ProductID
         ) t
@@ -345,8 +478,7 @@ def repurchase_rate(
         {
             "cid": customer_id,
             "agreement_uid": client_agreement_net_id,
-            "asof": as_of_date,
-            "history_start": source_history_start_iso(),
+            **rules.window(as_of_date),
             **synth_params,
         },
     )
@@ -359,23 +491,18 @@ def product_frequency(
     customer_id: int, as_of_date: str, client_agreement_net_id: str | None = None,
 ) -> dict[int, int]:
     rows = query(
-        """
+        f"""
         SELECT oi.ProductID AS pid, COUNT(DISTINCT o.ID) AS cnt
-        FROM dbo.ClientAgreement ca
-        JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
-        JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
+        FROM {rules.SPINE}
         WHERE ca.ClientID = :cid
                   AND (:agreement_uid IS NULL OR ca.NetUID = CONVERT(uniqueidentifier, :agreement_uid))
-                  AND o.Created < :asof
-              AND o.Created >= :history_start
-              AND oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
+                  AND {rules.PURCHASED}
         GROUP BY oi.ProductID
         """,
         {
             "cid": customer_id,
             "agreement_uid": client_agreement_net_id,
-            "asof": as_of_date,
-            "history_start": source_history_start_iso(),
+            **rules.window(as_of_date),
         },
     )
     return {int(r["pid"]): int(r["cnt"]) for r in rows}
@@ -385,23 +512,18 @@ def product_last_purchase(
     customer_id: int, as_of_date: str, client_agreement_net_id: str | None = None,
 ) -> dict[int, object]:
     rows = query(
-        """
-        SELECT oi.ProductID AS pid, MAX(o.Created) AS last_dt
-        FROM dbo.ClientAgreement ca
-        JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
-        JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
+        f"""
+        SELECT oi.ProductID AS pid, MAX({rules.SOLD_AT}) AS last_dt
+        FROM {rules.SPINE}
         WHERE ca.ClientID = :cid
                   AND (:agreement_uid IS NULL OR ca.NetUID = CONVERT(uniqueidentifier, :agreement_uid))
-                  AND o.Created < :asof
-              AND o.Created >= :history_start
-              AND oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
+                  AND {rules.PURCHASED}
         GROUP BY oi.ProductID
         """,
         {
             "cid": customer_id,
             "agreement_uid": client_agreement_net_id,
-            "asof": as_of_date,
-            "history_start": source_history_start_iso(),
+            **rules.window(as_of_date),
         },
     )
     return {int(r["pid"]): r["last_dt"] for r in rows}
@@ -416,21 +538,17 @@ def owned_live_product_ids(
     re-sync. Comparing raw ProductID values would therefore let a newer generation of an
     already-bought product leak into discovery. Resolve each historical row with the exact
     same newest-live-VendorCode rule as ``live_remap``. The whole lookup stays in SQL, avoiding
-    an unbounded ProductID ``IN`` list for clients with wide histories.
+    an unbounded ProductID ``IN`` list for clients with wide histories. Sibling cards of a bought
+    product are the same article, so they count as bought too.
     """
     rows = query(
-        """
+        f"""
         WITH Owned AS (
             SELECT DISTINCT oi.ProductID AS historical_id
-            FROM dbo.ClientAgreement ca
-            JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
-            JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
+            FROM {rules.SPINE}
             WHERE ca.ClientID = :cid
                   AND (:agreement_uid IS NULL OR ca.NetUID = CONVERT(uniqueidentifier, :agreement_uid))
-                  AND o.Created < :asof
-                  AND o.Created >= :history_start
-                  AND oi.IsValidForCurrentSale = 1
-                  AND oi.ProductID IS NOT NULL
+                  AND {rules.PURCHASED}
         )
         SELECT DISTINCT
                CASE WHEN historical.Deleted = 0
@@ -452,11 +570,10 @@ def owned_live_product_ids(
         {
             "cid": customer_id,
             "agreement_uid": client_agreement_net_id,
-            "asof": as_of_date,
-            "history_start": source_history_start_iso(),
+            **rules.window(as_of_date),
         },
     )
-    return {int(row["pid"]) for row in rows}
+    return with_siblings({int(row["pid"]) for row in rows}, sibling_articles())
 
 
 def customer_products(
@@ -464,26 +581,21 @@ def customer_products(
 ) -> set[int]:
     """Most-recent N distinct products — for Jaccard similarity (bounded for perf)."""
     rows = query(
-        """
+        f"""
         SELECT DISTINCT ProductID FROM (
-            SELECT TOP (:lim) oi.ProductID, o.Created
-            FROM dbo.ClientAgreement ca
-            JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
-            JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
+            SELECT TOP (:lim) oi.ProductID, {rules.SALE_INSTANT} AS sold_at
+            FROM {rules.SPINE}
             WHERE ca.ClientID = :cid
                   AND (:agreement_uid IS NULL OR ca.NetUID = CONVERT(uniqueidentifier, :agreement_uid))
-                  AND o.Created < :asof
-                  AND o.Created >= :history_start
-                  AND oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
-            ORDER BY o.Created DESC, o.ID DESC, oi.ProductID ASC
+                  AND {rules.PURCHASED}
+            ORDER BY {rules.SALE_INSTANT} DESC, o.ID DESC, oi.ProductID ASC
         ) t
         """,
         {
             "cid": customer_id,
             "agreement_uid": client_agreement_net_id,
-            "asof": as_of_date,
             "lim": limit,
-            "history_start": source_history_start_iso(),
+            **rules.window(as_of_date),
         },
     )
     return {int(r["ProductID"]) for r in rows}
@@ -509,23 +621,18 @@ def candidate_similar_customers(product_ids: set[int], exclude_id: int, as_of_da
     rows = query(
         f"""
         SELECT TOP (:lim) ca.ClientID AS cid, COUNT(DISTINCT oi.ProductID) AS overlap
-        FROM dbo.ClientAgreement ca
+        FROM {rules.SPINE}
         {region_join}
-        JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
-        JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
         WHERE ca.ClientID <> :exclude
-              AND o.Created < :asof
-              AND o.Created >= :history_start
-              AND oi.IsValidForCurrentSale = 1
+              AND {rules.PURCHASED}
               AND oi.ProductID IN {placeholder}
         GROUP BY ca.ClientID
         ORDER BY overlap DESC, ca.ClientID ASC
         """,
         {
             "exclude": exclude_id,
-            "asof": as_of_date,
             "lim": limit,
-            "history_start": source_history_start_iso(),
+            **rules.window(as_of_date),
             **pparams,
             **extra,
         },
@@ -544,16 +651,12 @@ def customer_products_bulk(customer_ids: list[int], as_of_date: str) -> dict[int
     rows = query(
         f"""
         SELECT DISTINCT ca.ClientID AS cid, oi.ProductID AS pid
-        FROM dbo.ClientAgreement ca
-        JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
-        JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
-        WHERE ca.ClientID IN {placeholder} AND o.Created < :asof
-              AND o.Created >= :history_start
-              AND oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
+        FROM {rules.SPINE}
+        WHERE ca.ClientID IN {placeholder}
+              AND {rules.PURCHASED}
         """,
         {
-            "asof": as_of_date,
-            "history_start": source_history_start_iso(),
+            **rules.window(as_of_date),
             **params,
         },
     )
@@ -584,14 +687,10 @@ def collaborative_products(
         f"""
         WITH Owned AS (
             SELECT DISTINCT oi.ProductID AS pid
-            FROM dbo.ClientAgreement ca
-            JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
-            JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
+            FROM {rules.SPINE}
             WHERE ca.ClientID = :cid
                   AND (:agreement_uid IS NULL OR ca.NetUID = CONVERT(uniqueidentifier, :agreement_uid))
-                  AND o.Created < :asof
-                  AND o.Created >= :history_start
-                  AND oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
+                  AND {rules.PURCHASED}
         ),
         Sim AS (
             SELECT customer_id, similarity FROM (VALUES {sim_rows}) AS t(customer_id, similarity)
@@ -602,28 +701,22 @@ def collaborative_products(
             -- once per line. Without this DISTINCT the SUM(similarity) is inflated by line-count.
             -- Scoped to the Sim neighbours so the dedupe only spans the candidate pool.
             SELECT DISTINCT ca.ClientID AS customer_id, oi.ProductID AS pid
-            FROM dbo.ClientAgreement ca
-            JOIN dbo.[Order] o ON ca.ID = o.ClientAgreementID
-            JOIN dbo.OrderItem oi ON o.ID = oi.OrderID
-            JOIN Sim s ON ca.ClientID = s.customer_id
-            WHERE o.Created < :asof
-                  AND o.Created >= :history_start
-                  AND oi.IsValidForCurrentSale = 1
-                  AND oi.ProductID IS NOT NULL
+            FROM {rules.SPINE}
+            JOIN Sim sim ON ca.ClientID = sim.customer_id
+            WHERE {rules.PURCHASED}
                   AND NOT EXISTS (SELECT 1 FROM Owned ow WHERE ow.pid = oi.ProductID)
         )
         SELECT np.pid AS pid,
-               SUM(s.similarity) / COUNT(DISTINCT s.customer_id) AS score
+               SUM(sim.similarity) / COUNT(DISTINCT sim.customer_id) AS score
         FROM NeighborProducts np
-        JOIN Sim s ON np.customer_id = s.customer_id
+        JOIN Sim sim ON np.customer_id = sim.customer_id
         GROUP BY np.pid
-        HAVING COUNT(DISTINCT s.customer_id) >= 2
+        HAVING COUNT(DISTINCT sim.customer_id) >= 2
         """,
         {
-            "asof": as_of_date,
             "cid": customer_id,
             "agreement_uid": client_agreement_net_id,
-            "history_start": source_history_start_iso(),
+            **rules.window(as_of_date),
             **sim_params,
         },
     )
@@ -676,8 +769,7 @@ def in_stock_product_ids(product_ids: list[int], client_agreement_net_id: str | 
         JOIN dbo.ProductAvailability pa
              ON pa.ProductID = m.live_id AND pa.Deleted = 0 AND pa.Amount > 0
         JOIN dbo.Storage s ON s.ID = pa.StorageID
-        WHERE s.Deleted = 0
-              AND (s.AvailableForReSale = 1 OR s.IsResale = 1)
+        WHERE {rules.sellable_storage("s")}
         """,
         params,
     )
@@ -729,6 +821,7 @@ def product_groups(product_ids: list[int]) -> dict[int, int]:
         SELECT ProductID AS pid, ProductGroupID AS gid
         FROM dbo.ProductProductGroup
         WHERE ProductID IN {placeholder} AND Deleted = 0
+        ORDER BY ProductID, ProductGroupID
         """,
         pparams,
     )

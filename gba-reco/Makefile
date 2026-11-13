@@ -24,7 +24,7 @@ smoke:
 	.venv/bin/python scripts/smoke_test.py
 
 worker:
-	.venv/bin/python -m app.services.recommendations.worker --top-n 50
+	.venv/bin/python -m app.services.recommendations.worker
 
 up:
 	docker compose up -d --build

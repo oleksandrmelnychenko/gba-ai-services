@@ -31,6 +31,8 @@ _PATH = "/internal/procure/purchase-cost-observations/v1"
 _SCOPE = "CurrentPostedReceipts"
 _RESOLVER = "current-posted-receipt-cost-v1"
 _CONTRACT_VERSIONS = frozenset({"GBA-ONEC-INBOUND-V7", "GBA-ONEC-INBOUND-V8"})
+_WIRE_VERSIONS = (2, 1)
+_MAX_ERROR_BYTES = 1024
 _MAX_ROWS = 50_000
 _MAX_BYTES = 64 * 1024 * 1024
 _MAX_I64 = 2**63 - 1
@@ -258,9 +260,10 @@ def parse_purchase_cost_response(payload: bytes, request: PurchaseCostRequest) -
     except (ValueError, UnicodeError, RecursionError):
         raise NativePurchaseCostError("invalid_purchase_cost_response") from None
     expected = request.payload()
+    version = root["version"]
     _require(
-        type(root["version"]) is int
-        and root["version"] == 1
+        type(version) is int
+        and version in _WIRE_VERSIONS
         and root["scope"] == _SCOPE
         and root["resolver_version"] == _RESOLVER
         and root["currency"] == "EUR"
@@ -336,18 +339,19 @@ def parse_purchase_cost_response(payload: bytes, request: PurchaseCostRequest) -
         _require(type(row["status"]) is str and row["status"] in {"known", "unknown"})
         cost = None
         if known:
+            native = version == 2 and receipt_id is None and not ordinals
             _require(
                 not reasons
                 and supplier is not None
                 and agreement is not None
                 and unit is not None
-                and receipt_id in publications
-                and len(ordinals) == 1
+                and (native or receipt_id in publications and len(ordinals) == 1)
             )
             _require(from_ticks <= _utc_ticks(row["document_date_utc"]) < to_ticks)
-            key = (receipt_id, ordinals[0])
-            _require(key not in evidence_ids)
-            evidence_ids.add(key)
+            if not native:
+                key = (receipt_id, ordinals[0])
+                _require(key not in evidence_ids)
+                evidence_ids.add(key)
             cost = _money(row["unit_net_cost_eur"])
         else:
             _require(
@@ -389,7 +393,8 @@ class _NoRedirects(HTTPRedirectHandler):
 
 
 class NativePurchaseCostClient:
-    """Sync data-layer client. No retries, cache, proxy inheritance, redirects or SQL fallback.
+    """Sync data-layer client. No retries (except version 1 after a version 2 refusal), cache,
+    proxy inheritance, redirects or SQL fallback.
 
     Socket operations time out after timeout_seconds (> server's120s). A response
     finishing after that elapsed deadline is rejected. The deadline is checked
@@ -439,7 +444,14 @@ class NativePurchaseCostClient:
         )
 
     def read(self, request: PurchaseCostRequest) -> PurchaseCostSnapshot:
-        body = json.dumps(request.payload(), separators=(",", ":")).encode("ascii")
+        for version in _WIRE_VERSIONS:
+            payload = self._post(request, version)
+            if payload is not None:
+                return parse_purchase_cost_response(payload, request)
+        raise NativePurchaseCostError("purchase_cost_transport_unavailable")
+
+    def _post(self, request: PurchaseCostRequest, version: int) -> bytes | None:
+        body = json.dumps({**request.payload(), "version": version}, separators=(",", ":")).encode("ascii")
         _require(len(body) <= 65536, "invalid_purchase_cost_request")
         message = Request(
             self._url,
@@ -480,9 +492,25 @@ class NativePurchaseCostClient:
                 _require(time.monotonic() - started <= self._timeout, "purchase_cost_timeout")
                 if length is not None:
                     _require(size == int(length))
-        except (TimeoutError, HTTPError, URLError, OSError, HTTPException, UnicodeError):
+        except HTTPError as error:
+            if version != _WIRE_VERSIONS[-1] and _refuses_version(error):
+                return None
             raise NativePurchaseCostError("purchase_cost_transport_unavailable") from None
-        return parse_purchase_cost_response(b"".join(chunks), request)
+        except (TimeoutError, URLError, OSError, HTTPException, UnicodeError):
+            raise NativePurchaseCostError("purchase_cost_transport_unavailable") from None
+        return b"".join(chunks)
+
+
+def _refuses_version(error: HTTPError) -> bool:
+    if error.code != 400:
+        return False
+    try:
+        body = error.read(_MAX_ERROR_BYTES + 1) if error.fp is not None else b""
+        return len(body) <= _MAX_ERROR_BYTES and json.loads(body.decode("utf-8")) == {
+            "error": "invalid_purchase_cost_scope"
+        }
+    except (ValueError, UnicodeError, OSError, HTTPException, AttributeError):
+        return False
 
 
 @dataclass(frozen=True)

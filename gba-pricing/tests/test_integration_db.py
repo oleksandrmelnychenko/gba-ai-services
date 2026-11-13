@@ -203,8 +203,8 @@ def test_normal_product_full_recommendation_is_sane(normal):
     )
     assert out.baseline_price is not None and out.baseline_price > 0
     if out.rationale == "constraints-conflict":
-        assert out.recommended_price is None and out.suggested_discount_pct is None
-        assert out.discount_band is None and out.confidence == "low"
+        assert out.constraints_conflict is True and out.conflict_reason
+        assert out.confidence == "low"
     else:
         assert 0 < out.recommended_price <= out.baseline_price
         assert out.suggested_discount_pct == out.discount_band.target_pct

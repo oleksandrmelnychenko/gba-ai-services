@@ -199,13 +199,34 @@ class PriceRecommendation(BaseModel):
         default=None,
         ge=0.0,
         allow_inf_nan=False,
-        description="price reproduced by the feasible rounded discount; null on conflicting constraints",
+        description="price reproduced by the feasible rounded discount; on conflicting constraints "
+        "the held current agreement price (see constraints_conflict)",
     )
     price_floor: float | None = Field(
         default=None,
         ge=0.0,
         allow_inf_nan=False,
-        description="unit_cost_eur*(1+target_margin_pct/100); never recommend below",
+        description="unit_cost_eur*(1+floor_markup_pct/100); never recommend below",
+    )
+    floor_markup_pct: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=100.0,
+        allow_inf_nan=False,
+        description="the floor rule as a markup on unit cost, percent (the target_margin_pct "
+        "setting or request override)",
+    )
+    floor_margin_pct: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=100.0,
+        allow_inf_nan=False,
+        description="the same floor rule as a margin of price, percent: "
+        "floor_markup_pct/(100+floor_markup_pct)*100; comparable to margin_pct_at_recommended",
+    )
+    floor_basis: str | None = Field(
+        default=None,
+        description="markup_on_cost -- the floor is a markup on cost, not a margin of price",
     )
     unit_cost_eur: float | None = Field(
         default=None,
@@ -227,8 +248,41 @@ class PriceRecommendation(BaseModel):
     discount_band: DiscountBand | None = None
     peer_band: PeerBand = Field(default_factory=PeerBand)
     confidence: Confidence = Confidence.LOW
-    margin_pct_at_recommended: float | None = Field(default=None, allow_inf_nan=False)
-    rationale: str = ""
+    margin_pct_at_recommended: float | None = Field(
+        default=None,
+        allow_inf_nan=False,
+        description="(recommended_price - unit_cost_eur)/recommended_price*100, a margin of "
+        "price; equals floor_margin_pct when the recommendation sits on the floor",
+    )
+    rationale: str = Field(
+        default="",
+        description="binding constraint; margin-floor / below-margin-loss-flag mean the "
+        "cost-plus-markup floor (floor_markup_pct on cost = floor_margin_pct of price) bound",
+    )
+    constraints_conflict: bool = Field(
+        default=False,
+        description="true when the agreement price, margin floor and peer discount cap leave "
+        "no feasible discount; recommended_price is then a hold/advisory price, not a target",
+    )
+    conflict_reason: str | None = Field(
+        default=None,
+        description="current-discount-above-peer-cap | current-price-at-margin-floor | "
+        "margin-floor-above-list-price",
+    )
+    conflict_explanation: str | None = None
+    discount_cap_pct: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=100.0,
+        allow_inf_nan=False,
+        description="binding upper discount limit on a conflict (peer cap or margin floor)",
+    )
+    price_at_discount_cap: float | None = Field(
+        default=None,
+        ge=0.0,
+        allow_inf_nan=False,
+        description="price the agreement would reach at discount_cap_pct",
+    )
     elasticity: float | None = Field(
         default=None,
         allow_inf_nan=False,
@@ -309,9 +363,20 @@ class PriceRequest(BaseModel):
         ..., min_length=1, description="dbo.ClientAgreement.NetUID"
     )
     culture: str = Field(default="uk", min_length=1)
-    with_vat: bool = True
+    with_vat: bool = Field(
+        default=True,
+        description=(
+            "Accepted for compatibility and ignored. Prices are always 'as invoiced' on the "
+            "agreement's own VAT basis (gross on a VAT agreement); no VAT conversion is applied."
+        ),
+    )
     target_margin_pct: float | None = Field(
-        default=None, ge=0.0, le=100.0, description="override the config default margin floor"
+        default=None,
+        ge=0.0,
+        le=100.0,
+        description="override the config default floor markup on cost, percent (despite the "
+        "name this is a markup on cost; the response states it as floor_markup_pct and the "
+        "equivalent margin of price as floor_margin_pct)"
     )
     use_cache: bool = True
     as_of_date: date | None = None
@@ -348,7 +413,13 @@ class BatchPriceItem(BaseModel):
 class BatchPriceRequest(BaseModel):
     items: list[BatchPriceItem] = Field(..., min_length=1, max_length=500)
     culture: str = Field(default="uk", min_length=1)
-    with_vat: bool = True
+    with_vat: bool = Field(
+        default=True,
+        description=(
+            "Accepted for compatibility and ignored. Prices are always 'as invoiced' on the "
+            "agreement's own VAT basis (gross on a VAT agreement); no VAT conversion is applied."
+        ),
+    )
     target_margin_pct: float | None = Field(default=None, ge=0.0, le=100.0)
     use_cache: bool = True
     as_of_date: date | None = None

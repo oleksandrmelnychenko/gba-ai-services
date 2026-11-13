@@ -16,6 +16,23 @@ def test_price_floor_applies_target_margin():
     assert engine.price_floor(10.0, 0.0) == Decimal("10")
 
 
+def test_floor_terms_state_markup_and_the_margin_it_yields():
+    terms = engine.floor_terms(12.0)
+    assert terms == {
+        "floor_markup_pct": 12.0,
+        "floor_margin_pct": 10.71,
+        "floor_basis": "markup_on_cost",
+    }
+    assert engine.floor_terms(0.0)["floor_margin_pct"] == 0.0
+    assert engine.floor_terms(100.0)["floor_margin_pct"] == 50.0
+
+
+def test_floor_margin_equals_displayed_margin_on_the_floor_price():
+    floor = engine.price_floor(10.0, 12.0)
+    shown = engine.margin_pct_at(floor, 10.0)
+    assert engine._round2(shown) == engine.floor_terms(12.0)["floor_margin_pct"]
+
+
 def test_price_floor_none_when_no_cost():
     assert engine.price_floor(None, 12.0) is None
 
@@ -184,6 +201,8 @@ def test_assembler_happy_path_peer_median():
     reco = _build()
     assert reco.baseline_price == 20.0
     assert reco.price_floor == 11.2
+    assert reco.floor_markup_pct == 12.0
+    assert reco.floor_margin_pct == 10.71
     assert reco.unit_cost_eur == 10.0
     assert reco.recommended_price == 18.5
     assert reco.suggested_discount_pct == pytest.approx(7.5)
@@ -247,18 +266,74 @@ def test_assembler_no_cost_path_is_peer_only_low_confidence():
     assert reco.confidence == Confidence.LOW
     assert reco.discount_band.min_pct == 0.0
 
-def test_agreement_baseline_and_peer_cap_conflict_is_not_an_actionable_discount():
+def test_agreement_discount_above_peer_cap_holds_current_price_with_flag():
     reco = _build(
         baseline=Decimal("3.1616"), marked_up=Decimal("3.952"),
         cost={"unit_cost_eur": Decimal("2.10"), "lot_count": 4},
         peer={"p25": 3.0, "p50": 3.5, "p75": 3.8, "n": 12},
         segment={"p75": 16, "p90": 18},
     )
-    assert reco.recommended_price is None
-    assert reco.suggested_discount_pct is None
-    assert reco.discount_band is None
     assert reco.rationale == engine.R_CONSTRAINTS_CONFLICT
     assert reco.confidence == Confidence.LOW
+    assert reco.constraints_conflict is True
+    assert reco.conflict_reason == engine.CONFLICT_DISCOUNT_ABOVE_PEER_CAP
+    assert reco.recommended_price == reco.baseline_price == 3.16
+    assert reco.recommended_price >= reco.price_floor
+    assert reco.suggested_discount_pct == 20.0
+    assert reco.discount_band.min_pct == reco.discount_band.target_pct == 20.0
+    assert reco.discount_band.max_pct == 20.0
+    assert reco.discount_cap_pct == 16.0
+    assert reco.price_at_discount_cap == 3.32
+    assert "20.00%" in reco.conflict_explanation and "16.00%" in reco.conflict_explanation
+
+
+def test_conflict_hold_price_reproduces_through_discount_base():
+    reco = _build(
+        baseline=Decimal("17.5032"), marked_up=Decimal("21.879"),
+        cost={"unit_cost_eur": Decimal("14.7233"), "lot_count": 2},
+        peer={"p25": 16.8, "p50": 17.5, "p75": 17.9, "n": 30},
+        segment={"p75": 16.0, "p90": 19.0},
+    )
+    assert reco.constraints_conflict is True
+    assert reco.recommended_price == 17.5
+    expected = Decimal(str(reco.discount_base_price)) * (
+        1 - Decimal(str(reco.suggested_discount_pct)) / 100
+    )
+    assert abs(expected - Decimal(str(reco.recommended_price))) <= Decimal("0.01")
+    assert reco.margin_pct_at_recommended is not None
+
+
+def test_conflict_without_room_above_margin_floor_names_the_floor():
+    reco = _build(
+        baseline=Decimal("11.1993"), marked_up=Decimal("14.0000"),
+        cost={"unit_cost_eur": Decimal("11.199") / Decimal("1.12"), "lot_count": 4},
+        peer={"p25": 11.0, "p50": 11.2, "p75": 11.5, "n": 12},
+        segment={"p75": None, "p90": None},
+    )
+    assert reco.constraints_conflict is True
+    assert reco.conflict_reason == engine.CONFLICT_PRICE_AT_MARGIN_FLOOR
+    assert reco.recommended_price == 11.2
+    assert reco.recommended_price >= reco.price_floor
+
+
+def test_floor_above_list_price_conflict_is_flagged_and_keeps_advisory_floor():
+    reco = _build(cost={"unit_cost_eur": 25, "lot_count": 4})
+    assert reco.rationale == engine.R_BELOW_MARGIN
+    assert reco.constraints_conflict is True
+    assert reco.conflict_reason == engine.CONFLICT_FLOOR_ABOVE_LIST
+    assert reco.recommended_price == 28
+    assert reco.suggested_discount_pct is None
+    assert reco.discount_band is None
+    assert reco.discount_cap_pct is None
+
+
+def test_feasible_recommendation_carries_no_conflict_fields():
+    reco = _build()
+    assert reco.constraints_conflict is False
+    assert reco.conflict_reason is None
+    assert reco.conflict_explanation is None
+    assert reco.discount_cap_pct is None
+    assert reco.price_at_discount_cap is None
 
 
 @pytest.mark.parametrize("marked_up", ["3.952", "19.9995", "123456.78901"])

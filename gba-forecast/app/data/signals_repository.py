@@ -1,22 +1,10 @@
 """Read-only sales-history signals over ConcordDb_V5. All parameterized.
 
-LOAD-BEARING DATA RULES (verified on ConcordDb_V5):
-  - SALE-side OrderItem.PricePerItem is ALREADY EUR — never currency-convert it. Monthly SALE
-    amount (EUR) = SUM(CAST(Qty AS decimal) * CAST(PricePerItem AS decimal)). Qty is stored as
-    SQL float, so both operands must be cast BEFORE multiplication; otherwise SQL promotes the
-    expression to binary float and a half-cent boundary can drift.
-  - Time windows MUST key off Order.Created. OrderItem.Created is truncated (~3 days) and unusable.
-  - VALIDITY: filter sales with OrderItem.IsValidForCurrentSale = 1 — NEVER o.Deleted = 0 /
-    oi.Deleted = 0 on the Sale/Order/OrderItem spine. In ConcordDb_V5 the spine rows are mostly
-    Deleted = 1 (a "Deleted = 0" filter keeps only ~16% of valid OrderItems and silently drops
-    ~84% of real sales — a catastrophic undercount). IsValidForCurrentSale = 1 is the canonical
-    validity flag used by every other GBA AI service (solvency/products/reco/pricing); the ~77%
-    valid-but-Deleted=1 spine rows ARE real sales and must be counted. This filter goes on the
-    OrderItem alias; the Order spine carries no validity predicate of its own.
-  - Client join path: Client.NetUID -> ClientAgreement.ClientID -> [Order].ClientAgreementID.
-    A client can hold several agreements; aggregate over all of them.
-  - Product join path: OrderItem.ProductID -> Product.ID where Product.NetUID = :uid.
-  - Monthly grain = CONVERT(char(7), o.Created, 120); months with no sales are absent (caller fills zeros).
+Every series reads the facts defined once in app.data.source_rules (gba-server's confirmed
+sale net of buyer returns on the returned line, plus the negative facts of returns anchored to
+import placeholders, Europe/Kyiv months; a month never goes below zero). Amounts are EUR:
+OrderItem.PricePerItem is already EUR, and Qty is a SQL float, so both operands are cast to
+decimal before multiplying. Months with no sales are absent (the caller fills zeros).
 """
 
 from __future__ import annotations
@@ -29,69 +17,68 @@ from typing import Any
 
 from app.core.config import get_settings
 from app.core.history import HistoryWindow, resolve_history_window
+from app.data import source_rules as rules
 from app.data.db import query
 
-# Trailing calendar-month predicate shared by every series query. ``history_start`` is the
-# requested rolling start clamped to the factual source floor. Keeping both predicates is
-# intentional defense-in-depth: no caller can accidentally read pre-source rows even if its
-# effective-window calculation regresses.
-_WINDOW = (
-    "o.Created >= :source_history_start "
-    "AND o.Created >= :history_start "
-    "AND o.Created < :asof"
-)
-_EUR_AMOUNT = (
-    "CAST(oi.Qty AS decimal(18, 8)) * CAST(oi.PricePerItem AS decimal(28, 14))"
-)
+_WINDOW = rules.window("f.fact_at")
+_FACTS = rules.net_sales_facts()
+_NET_EUR = rules.monthly_net_eur()
 
 # Synthetic «Ввід боргів» ProductID used for debt-injection bookkeeping, never a real sale. It
 # must be excluded from every EUR series so its amounts can't pollute the forecast input — see
 # the note above the backtest samplers for why it matters on the by-client paths specifically.
 # The ID is NOT stable (the 1С sync re-mints the Product row), so it is resolved from the live
 # table at startup and re-resolved hourly; settings.synthetic_product_id (env) overrides when
-# set, and the last known live row is the offline fallback.
-_SYNTHETIC_FALLBACK_ID = 29555414
+# set. There is no hardcoded fallback: an unresolved identity fails loudly.
 _SYNTHETIC_REFRESH_SECONDS = 3600
-_synthetic_cached: tuple[int, float, bool, str] | None = None
+_synthetic_cached: tuple[int | None, float, bool, str] | None = None
 
 _SALES_SOURCE_SCHEMA_SQL = """
 SELECT CASE WHEN
     OBJECT_ID(N'dbo.OrderItem', N'U') IS NOT NULL
     AND OBJECT_ID(N'dbo.[Order]', N'U') IS NOT NULL
+    AND OBJECT_ID(N'dbo.Sale', N'U') IS NOT NULL
+    AND OBJECT_ID(N'dbo.SaleReturn', N'U') IS NOT NULL
+    AND OBJECT_ID(N'dbo.SaleReturnItem', N'U') IS NOT NULL
+    AND OBJECT_ID(N'dbo.DataSyncAccountingSourceTarget', N'U') IS NOT NULL
     AND COL_LENGTH(N'dbo.OrderItem', N'OrderID') IS NOT NULL
     AND COL_LENGTH(N'dbo.OrderItem', N'ProductID') IS NOT NULL
     AND COL_LENGTH(N'dbo.OrderItem', N'Qty') IS NOT NULL
     AND COL_LENGTH(N'dbo.OrderItem', N'PricePerItem') IS NOT NULL
     AND COL_LENGTH(N'dbo.OrderItem', N'IsValidForCurrentSale') IS NOT NULL
+    AND COL_LENGTH(N'dbo.OrderItem', N'Deleted') IS NOT NULL
     AND COL_LENGTH(N'dbo.[Order]', N'ID') IS NOT NULL
-    AND COL_LENGTH(N'dbo.[Order]', N'Created') IS NOT NULL
+    AND COL_LENGTH(N'dbo.Sale', N'OrderID') IS NOT NULL
+    AND COL_LENGTH(N'dbo.Sale', N'ClientAgreementID') IS NOT NULL
+    AND COL_LENGTH(N'dbo.Sale', N'ChangedToInvoice') IS NOT NULL
+    AND COL_LENGTH(N'dbo.Sale', N'Deleted') IS NOT NULL
+    AND COL_LENGTH(N'dbo.SaleReturn', N'FromDate') IS NOT NULL
+    AND COL_LENGTH(N'dbo.SaleReturn', N'IsCanceled') IS NOT NULL
+    AND COL_LENGTH(N'dbo.SaleReturn', N'ClientAgreementID') IS NOT NULL
+    AND COL_LENGTH(N'dbo.SaleReturnItem', N'OrderItemID') IS NOT NULL
+    AND COL_LENGTH(N'dbo.SaleReturnItem', N'Qty') IS NOT NULL
 THEN 1 ELSE 0 END AS source_schema_present
 """
 
-_SALES_SOURCE_STATUS_SQL = """
+_SALES_SOURCE_STATUS_SQL = f"""
 SELECT
     COUNT_BIG(*) AS canonical_row_count,
-    SUM(CASE WHEN o.Created >= :history_start THEN 1 ELSE 0 END)
+    SUM(CASE WHEN f.fact_at >= :history_start THEN 1 ELSE 0 END)
         AS history_row_count,
     COUNT(DISTINCT CASE
-        WHEN o.Created >= :history_start THEN oi.ProductID
+        WHEN f.fact_at >= :history_start THEN f.product_id
     END) AS history_product_count,
     COUNT(DISTINCT CASE
-        WHEN o.Created >= :history_start THEN ca.ClientID
+        WHEN f.fact_at >= :history_start THEN f.client_id
     END) AS history_client_count,
-    MAX(o.Created) AS latest_sale_at,
+    MAX(f.fact_at) AS latest_sale_at,
     SUM(CASE
-        WHEN oi.Qty IS NULL OR oi.PricePerItem IS NULL
-             OR oi.Qty < 0 OR oi.PricePerItem < 0
+        WHEN f.qty IS NULL OR f.price IS NULL OR f.price < 0
         THEN 1 ELSE 0
     END) AS invalid_value_row_count
-FROM dbo.OrderItem oi
-JOIN dbo.[Order] o ON o.ID = oi.OrderID
-LEFT JOIN dbo.ClientAgreement ca ON ca.ID = o.ClientAgreementID
-WHERE oi.IsValidForCurrentSale = 1
-      AND oi.ProductID <> :synth
-      AND o.Created >= :source_history_start
-      AND o.Created < :asof
+FROM {rules.net_sales_facts(whole_source=True)}
+WHERE f.product_id <> :synth
+      AND {rules.SALE_FACT}
 """
 
 
@@ -106,15 +93,24 @@ def _resolved_history_window(as_of: str | datetime, months: int) -> HistoryWindo
 def _history_query_params(as_of: str | datetime, months: int) -> tuple[HistoryWindow, dict[str, Any]]:
     window = _resolved_history_window(as_of, months)
     return window, {
-        "asof": as_of,
-        "source_history_start": window.source_history_start.isoformat(),
-        "history_start": window.effective_start.isoformat(),
+        "asof": rules.utc_instant(as_of),
+        "source_history_start": rules.utc_instant(window.source_history_start),
+        "history_start": rules.utc_instant(window.effective_start),
     }
+
+
+def _month(params: dict[str, Any]) -> str:
+    start, end = params["source_history_start"], params["asof"]
+    params.update(rules.zone_params(start, end))
+    return rules.fact_month(start, end)
 
 
 def synthetic_product_id() -> int:
     """Current dbo.Product.ID of the synthetic «Ввід боргів» debt-entry product (cached ~1h)."""
-    return int(synthetic_product_status()["product_id"])
+    status = synthetic_product_status()
+    if not status["resolved"] or status["product_id"] is None:
+        raise RuntimeError("synthetic_product_unresolved")
+    return int(status["product_id"])
 
 
 def synthetic_product_status() -> dict[str, Any]:
@@ -142,12 +138,12 @@ def synthetic_product_status() -> dict[str, Any]:
         source = "verified_override" if override else "verified_database"
         _synthetic_cached = (int(rows[0]["id"]), now, True, source)
     else:
-        fallback = _synthetic_cached[0] if _synthetic_cached is not None else _SYNTHETIC_FALLBACK_ID
-        _synthetic_cached = (fallback, now, False, "unverified_fallback")
+        last_known = _synthetic_cached[0] if _synthetic_cached is not None else None
+        _synthetic_cached = (last_known, now, False, "unresolved")
     return _synthetic_status_dict(_synthetic_cached)
 
 
-def _synthetic_status_dict(state: tuple[int, float, bool, str]) -> dict[str, Any]:
+def _synthetic_status_dict(state: tuple[int | None, float, bool, str]) -> dict[str, Any]:
     return {
         "product_id": state[0],
         "resolved": state[2],
@@ -194,6 +190,73 @@ def sales_source_status(as_of: datetime, months: int) -> dict[str, Any]:
     }
 
 
+_PLACEHOLDER_GRAINS = {
+    "by_client": ("f.client_id",),
+    "by_product": ("f.product_id",),
+    "by_client_and_product": ("f.client_id", "f.product_id"),
+}
+
+
+def placeholder_return_diagnostic(as_of: str | datetime, months: int) -> dict[str, Any]:
+    """Returns anchored to import placeholders: EUR booked and EUR a zero-floored month dropped."""
+    _, params = _history_query_params(as_of, months)
+    params["synth"] = synthetic_product_id()
+    month = _month(params)
+    totals = query(
+        f"""
+        SELECT COUNT_BIG(*) AS line_count,
+               COUNT(DISTINCT f.client_id) AS client_count,
+               COUNT(DISTINCT f.product_id) AS product_count,
+               ISNULL(-SUM(f.eur), 0) AS return_eur
+        FROM {_FACTS}
+        WHERE f.placeholder_return = 1 AND f.product_id <> :synth
+        """,
+        params,
+    )
+    total = totals[0] if totals else {}
+    out: dict[str, Any] = {
+        "line_count": int(total.get("line_count") or 0),
+        "client_count": int(total.get("client_count") or 0),
+        "product_count": int(total.get("product_count") or 0),
+        "return_eur": Decimal(str(total.get("return_eur") or 0)),
+    }
+    for name, columns in _PLACEHOLDER_GRAINS.items():
+        keys = ", ".join(columns)
+        scope = " AND ".join(
+            f"{column} IN (SELECT r.{column.split('.')[1]} "
+            f"FROM ({rules.placeholder_return_facts()}) r)"
+            for column in columns
+        )
+        rows = query(
+            f"""
+            SELECT COUNT_BIG(*) AS month_count,
+                   ISNULL(SUM(b.return_eur), 0) AS return_eur,
+                   ISNULL(SUM(b.dropped_eur), 0) AS dropped_eur,
+                   ISNULL(SUM(CASE WHEN b.dropped_eur > 0 THEN 1 ELSE 0 END), 0)
+                       AS dropped_month_count
+            FROM (
+                SELECT {rules.placeholder_eur()} AS return_eur,
+                       {rules.dropped_placeholder_eur()} AS dropped_eur
+                FROM {_FACTS}
+                WHERE f.product_id <> :synth AND {scope}
+                GROUP BY {keys}, {month}
+                HAVING MAX(f.placeholder_return) = 1
+            ) b
+            """,
+            params,
+        )
+        row = rows[0] if rows else {}
+        booked = Decimal(str(row.get("return_eur") or 0))
+        dropped = Decimal(str(row.get("dropped_eur") or 0))
+        out[name] = {
+            "month_count": int(row.get("month_count") or 0),
+            "absorbed_eur": booked - dropped,
+            "dropped_eur": dropped,
+            "dropped_month_count": int(row.get("dropped_month_count") or 0),
+        }
+    return out
+
+
 def forecast_source_fingerprint(
     client_id: int | None,
     product_id: int | None,
@@ -220,43 +283,45 @@ def forecast_source_fingerprint(
         ).hexdigest()[:24]
 
     params["synth"] = synthetic_product_id()
+    facts = _FACTS
     if client_id is not None and product_id is not None:
-        scope = "(ca.ClientID = :cid OR oi.ProductID = :pid)"
+        facts = (
+            f"(SELECT * FROM {_FACTS} WHERE f.client_id = :cid "
+            f"UNION ALL "
+            f"SELECT * FROM {_FACTS} WHERE f.product_id = :pid AND f.client_id <> :cid) f"
+        )
+        scope = "1 = 1"
         params.update({"cid": client_id, "pid": product_id})
     elif client_id is not None:
-        scope = "ca.ClientID = :cid"
+        scope = "f.client_id = :cid"
         params["cid"] = client_id
     else:
-        scope = "oi.ProductID = :pid"
+        scope = "f.product_id = :pid"
         params["pid"] = product_id
 
     rows = query(
         f"""
         SELECT
             COUNT_BIG(*) AS row_count,
-            MAX(oi.ID) AS max_item_id,
-            MAX(oi.Updated) AS max_item_updated,
-            MAX(o.Updated) AS max_order_updated,
-            MAX(o.Created) AS max_order_created,
-            SUM(CAST(oi.Qty AS decimal(38, 6))) AS quantity_sum,
-            SUM({_EUR_AMOUNT}) AS amount_sum,
+            MAX(f.fact_id) AS max_item_id,
+            MAX(f.line_updated) AS max_item_updated,
+            MAX(f.document_updated) AS max_order_updated,
+            MAX(f.return_updated) AS max_return_updated,
+            MAX(f.fact_at) AS max_order_created,
+            SUM(f.qty) AS quantity_sum,
+            SUM(f.eur) AS amount_sum,
             CHECKSUM_AGG(BINARY_CHECKSUM(
-                oi.ID,
-                oi.OrderID,
-                oi.ProductID,
-                oi.Qty,
-                oi.PricePerItem,
-                oi.IsValidForCurrentSale,
-                o.Created,
-                ca.ClientID
+                f.fact_id,
+                f.product_id,
+                f.qty,
+                f.returned_qty,
+                f.price,
+                f.fact_at,
+                f.client_id
             )) AS row_checksum
-        FROM dbo.OrderItem oi
-        JOIN dbo.[Order] o ON o.ID = oi.OrderID
-        LEFT JOIN dbo.ClientAgreement ca ON ca.ID = o.ClientAgreementID
-        WHERE oi.IsValidForCurrentSale = 1
-              AND oi.ProductID <> :synth
+        FROM {facts}
+        WHERE f.product_id <> :synth
               AND {scope}
-              AND {_WINDOW}
         """,
         params,
     )
@@ -270,6 +335,7 @@ def forecast_source_fingerprint(
         row.get("max_item_id") or 0,
         row.get("max_item_updated") or "",
         row.get("max_order_updated") or "",
+        row.get("max_return_updated") or "",
         row.get("max_order_created") or "",
         row.get("quantity_sum") or 0,
         row.get("amount_sum") or 0,
@@ -297,20 +363,18 @@ def product_id_for_netuid(net_uid: str) -> int | None:
 
 
 def monthly_sales_by_client(client_id: int, as_of: str, months: int) -> list[dict]:
-    """Per-month EUR sale amount for one client (across all its agreements), trailing window."""
+    """Per-month net EUR sales for one client (across all its agreements), trailing window."""
     _, params = _history_query_params(as_of, months)
     params.update({"cid": client_id, "synth": synthetic_product_id()})
+    month = _month(params)
     return query(
         f"""
-        SELECT CONVERT(char(7), o.Created, 120) AS ym,
-               SUM({_EUR_AMOUNT}) AS eur
-        FROM dbo.ClientAgreement ca
-        JOIN dbo.[Order] o    ON o.ClientAgreementID = ca.ID
-        JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-        WHERE ca.ClientID = :cid AND oi.IsValidForCurrentSale = 1
-              AND oi.ProductID <> :synth
-              AND {_WINDOW}
-        GROUP BY CONVERT(char(7), o.Created, 120)
+        SELECT {month} AS ym,
+               {_NET_EUR} AS eur
+        FROM {_FACTS}
+        WHERE f.client_id = :cid
+              AND f.product_id <> :synth
+        GROUP BY {month}
         ORDER BY ym
         """,
         params,
@@ -318,18 +382,17 @@ def monthly_sales_by_client(client_id: int, as_of: str, months: int) -> list[dic
 
 
 def monthly_sales_by_product(product_id: int, as_of: str, months: int) -> list[dict]:
-    """Per-month EUR sale amount for one product across all clients, trailing window."""
+    """Per-month net EUR sales for one product across all clients, trailing window."""
     _, params = _history_query_params(as_of, months)
     params["pid"] = product_id
+    month = _month(params)
     return query(
         f"""
-        SELECT CONVERT(char(7), o.Created, 120) AS ym,
-               SUM({_EUR_AMOUNT}) AS eur
-        FROM dbo.OrderItem oi
-        JOIN dbo.[Order] o ON o.ID = oi.OrderID
-        WHERE oi.ProductID = :pid AND oi.IsValidForCurrentSale = 1
-              AND {_WINDOW}
-        GROUP BY CONVERT(char(7), o.Created, 120)
+        SELECT {month} AS ym,
+               {_NET_EUR} AS eur
+        FROM {_FACTS}
+        WHERE f.product_id = :pid
+        GROUP BY {month}
         ORDER BY ym
         """,
         params,
@@ -339,7 +402,7 @@ def monthly_sales_by_product(product_id: int, as_of: str, months: int) -> list[d
 def monthly_sales_by_client_and_product(
     client_id: int, product_id: int, as_of: str, months: int
 ) -> list[dict]:
-    """Per-month EUR sale amount for one client buying one product, trailing window."""
+    """Per-month net EUR sales for one client buying one product, trailing window."""
     _, params = _history_query_params(as_of, months)
     params.update(
         {
@@ -348,18 +411,15 @@ def monthly_sales_by_client_and_product(
             "synth": synthetic_product_id(),
         }
     )
+    month = _month(params)
     return query(
         f"""
-        SELECT CONVERT(char(7), o.Created, 120) AS ym,
-               SUM({_EUR_AMOUNT}) AS eur
-        FROM dbo.ClientAgreement ca
-        JOIN dbo.[Order] o    ON o.ClientAgreementID = ca.ID
-        JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-        WHERE ca.ClientID = :cid AND oi.ProductID = :pid
-              AND oi.IsValidForCurrentSale = 1
-              AND oi.ProductID <> :synth
-              AND {_WINDOW}
-        GROUP BY CONVERT(char(7), o.Created, 120)
+        SELECT {month} AS ym,
+               {_NET_EUR} AS eur
+        FROM {_FACTS}
+        WHERE f.client_id = :cid AND f.product_id = :pid
+              AND f.product_id <> :synth
+        GROUP BY {month}
         ORDER BY ym
         """,
         params,
@@ -413,98 +473,63 @@ def query_one(sql: str, params: dict[str, Any] | None = None) -> list[dict]:
 
 
 # --- Backtest sampling (offline accuracy evaluation only; not on the request path) ---------
-#
-# The synthetic ProductID (synthetic_product_id()) is excluded here too, for the same reason it
-# is excluded on the live paths: its debt-injection amounts are not real demand and must never
-# enter an EUR series.
-#
-# Note on the live paths: only the by-PRODUCT query (monthly_sales_by_product) is inherently
-# safe, because it filters by the single requested product and so can never sum the synthetic
-# id unless that id is explicitly requested. The by-CLIENT queries
-# (monthly_sales_by_client / monthly_sales_by_client_and_product) aggregate every product the
-# client bought, so they WOULD pick up the synthetic debt-injection rows; they each carry an
-# explicit `oi.ProductID <> synthetic_product_id()` filter to keep that pollution out.
 
 
 def sample_client_monthly_series(as_of: str, months: int, limit: int) -> list[dict]:
-    """{cid, ym, eur} rows for the `limit` most-active clients — one bulk read for the backtest.
-
-    Picks clients by number of active months (so the sample spans smooth..lumpy patterns) and
-    returns their full monthly EUR series in one query. Same EUR / Order.Created / validity
-    (IsValidForCurrentSale = 1) rules as the live per-client query; the synthetic product is
-    excluded.
-    """
+    """{cid, ym, eur} rows for the `limit` most-active clients — one bulk read for the backtest."""
     _, params = _history_query_params(as_of, months)
     params.update({"lim": limit, "synth": synthetic_product_id()})
+    month = _month(params)
     return query(
         f"""
-        WITH ranked AS (
-            SELECT ca.ClientID AS cid,
-                   COUNT(DISTINCT CONVERT(char(7), o.Created, 120)) AS active_months,
-                   SUM({_EUR_AMOUNT}) AS total_eur
-            FROM dbo.ClientAgreement ca
-            JOIN dbo.[Order] o    ON o.ClientAgreementID = ca.ID
-            JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-            WHERE oi.IsValidForCurrentSale = 1
-                  AND oi.ProductID <> :synth
-                  AND {_WINDOW}
-            GROUP BY ca.ClientID
+        WITH monthly AS (
+            SELECT f.client_id AS entity_id,
+                   {month} AS ym,
+                   {_NET_EUR} AS eur
+            FROM {_FACTS}
+            WHERE f.product_id <> :synth
+            GROUP BY f.client_id, {month}
         ),
-        top_clients AS (
-            SELECT TOP (:lim) cid FROM ranked ORDER BY active_months DESC, total_eur DESC
+        top_entities AS (
+            SELECT TOP (:lim) entity_id
+            FROM monthly
+            GROUP BY entity_id
+            ORDER BY COUNT(*) DESC, SUM(eur) DESC
         )
-        SELECT ca.ClientID AS cid,
-               CONVERT(char(7), o.Created, 120) AS ym,
-               SUM({_EUR_AMOUNT}) AS eur
-        FROM dbo.ClientAgreement ca
-        JOIN dbo.[Order] o    ON o.ClientAgreementID = ca.ID
-        JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-        WHERE ca.ClientID IN (SELECT cid FROM top_clients)
-              AND oi.IsValidForCurrentSale = 1
-              AND oi.ProductID <> :synth
-              AND {_WINDOW}
-        GROUP BY ca.ClientID, CONVERT(char(7), o.Created, 120)
-        ORDER BY ca.ClientID, ym
+        SELECT m.entity_id AS cid, m.ym, m.eur
+        FROM monthly m
+        WHERE m.entity_id IN (SELECT entity_id FROM top_entities)
+        ORDER BY m.entity_id, m.ym
         """,
         params,
     )
 
 
 def sample_product_monthly_series(as_of: str, months: int, limit: int) -> list[dict]:
-    """{pid, ym, eur} rows for the `limit` most-active products — one bulk read for the backtest.
-
-    Mirrors sample_client_monthly_series for products. The synthetic product is excluded so it
-    never enters the evaluation sample.
-    """
+    """{pid, ym, eur} rows for the `limit` most-active products — one bulk read for the backtest."""
     _, params = _history_query_params(as_of, months)
     params.update({"lim": limit, "synth": synthetic_product_id()})
+    month = _month(params)
     return query(
         f"""
-        WITH ranked AS (
-            SELECT oi.ProductID AS pid,
-                   COUNT(DISTINCT CONVERT(char(7), o.Created, 120)) AS active_months,
-                   SUM({_EUR_AMOUNT}) AS total_eur
-            FROM dbo.OrderItem oi
-            JOIN dbo.[Order] o ON o.ID = oi.OrderID
-            WHERE oi.IsValidForCurrentSale = 1
-                  AND oi.ProductID <> :synth
-                  AND {_WINDOW}
-            GROUP BY oi.ProductID
+        WITH monthly AS (
+            SELECT f.product_id AS entity_id,
+                   {month} AS ym,
+                   {_NET_EUR} AS eur
+            FROM {_FACTS}
+            WHERE f.product_id <> :synth
+            GROUP BY f.product_id, {month}
         ),
-        top_products AS (
-            SELECT TOP (:lim) pid FROM ranked ORDER BY active_months DESC, total_eur DESC
+        top_entities AS (
+            SELECT TOP (:lim) entity_id
+            FROM monthly
+            GROUP BY entity_id
+            ORDER BY COUNT(*) DESC, SUM(eur) DESC
         )
-        SELECT oi.ProductID AS pid,
-               CONVERT(char(7), o.Created, 120) AS ym,
-               SUM({_EUR_AMOUNT}) AS eur
-        FROM dbo.OrderItem oi
-        JOIN dbo.[Order] o ON o.ID = oi.OrderID
-        WHERE oi.ProductID IN (SELECT pid FROM top_products)
-              AND oi.IsValidForCurrentSale = 1
-              AND oi.ProductID <> :synth
-              AND {_WINDOW}
-        GROUP BY oi.ProductID, CONVERT(char(7), o.Created, 120)
-        ORDER BY oi.ProductID, ym
+        SELECT m.entity_id AS pid, m.ym, m.eur
+        FROM monthly m
+        WHERE m.entity_id IN (SELECT entity_id FROM top_entities)
+        ORDER BY m.entity_id, m.ym
         """,
         params,
     )
@@ -520,3 +545,37 @@ def group_series_by_entity(rows: list[dict], key: str) -> dict[int, dict[str, fl
             continue
         out.setdefault(int(eid), {})[str(ym)] = float(r["eur"] or 0.0)
     return out
+
+
+def all_client_monthly_series(as_of: str, months: int) -> list[dict]:
+    _, params = _history_query_params(as_of, months)
+    params["synth"] = synthetic_product_id()
+    month = _month(params)
+    return query(
+        f"""
+        SELECT f.client_id AS cid,
+               {month} AS ym,
+               {_NET_EUR} AS eur
+        FROM {_FACTS}
+        WHERE f.product_id <> :synth
+        GROUP BY f.client_id, {month}
+        """,
+        params,
+    )
+
+
+def all_product_monthly_series(as_of: str, months: int) -> list[dict]:
+    _, params = _history_query_params(as_of, months)
+    params["synth"] = synthetic_product_id()
+    month = _month(params)
+    return query(
+        f"""
+        SELECT f.product_id AS pid,
+               {month} AS ym,
+               {_NET_EUR} AS eur
+        FROM {_FACTS}
+        WHERE f.product_id <> :synth
+        GROUP BY f.product_id, {month}
+        """,
+        params,
+    )

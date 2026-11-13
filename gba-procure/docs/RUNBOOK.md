@@ -25,7 +25,7 @@ On the DB network:
 ```bash
 docker run -d --name gba-procure-api --network gba-dev_default \
   -e DB_HOST=gba-dev-gba-mssql-1 -e DB_USER=gba_reco_ro -e DB_PASSWORD=... \
-  -e REDIS_HOST=gba-procure-redis -p 8001:8001 gba-procure:latest
+  -e REDIS_HOST=gba-procure-redis -p 127.0.0.1:8001:8001 gba-procure:latest
 ```
 
 ## 3. Smoke test

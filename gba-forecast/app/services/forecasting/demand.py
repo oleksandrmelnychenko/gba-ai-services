@@ -117,6 +117,18 @@ def croston_rate(series: list[float], alpha: float, sba: bool) -> float:
     return max(0.0, rate)
 
 
+def tsb_rate(series: list[float], alpha: float, beta: float) -> float:
+    if not series:
+        return 0.0
+    probability = 1.0 if series[0] > 0 else 0.0
+    size = series[0] if series[0] > 0 else next((v for v in series if v > 0), 0.0)
+    for value in series[1:]:
+        probability += beta * ((1.0 if value > 0 else 0.0) - probability)
+        if value > 0:
+            size += alpha * (value - size)
+    return max(0.0, probability * size)
+
+
 def damped_trend_path(
     series: list[float],
     horizon: int,
@@ -170,7 +182,9 @@ def damped_trend_path(
     return out
 
 
-def monthly_rate(series: list[float], method: str, alpha: float) -> tuple[float, str]:
+def monthly_rate(
+    series: list[float], method: str, alpha: float, ewma_alpha: float = EWMA_ALPHA
+) -> tuple[float, str]:
     """Dispatch a FLAT method to its per-month rate; returns (per_month_rate, method_id).
 
     Only the flat methods (moving_avg/croston/sba/ewma) have a single representative rate. The
@@ -184,14 +198,16 @@ def monthly_rate(series: list[float], method: str, alpha: float) -> tuple[float,
     if method == "sba":
         return croston_rate(series, alpha, sba=True), _METHOD_SBA
     if method == "ewma":
-        return ewma_rate(series, EWMA_ALPHA), _METHOD_EWMA
+        return ewma_rate(series, ewma_alpha), _METHOD_EWMA
     if method == "damped_trend":
         path = damped_trend_path(series, 1)
         return (path[0] if path else 0.0), _METHOD_DAMPED_TREND
     return moving_avg_rate(series), _METHOD_MOVING_AVG
 
 
-def forecast_path(series: list[float], horizon: int, method: str, alpha: float) -> list[float]:
+def forecast_path(
+    series: list[float], horizon: int, method: str, alpha: float, ewma_alpha: float = EWMA_ALPHA
+) -> list[float]:
     """Project the next `horizon` months as a per-step path — the general projection contract.
 
     For FLAT methods (moving_avg/croston/sba/ewma) this is the single per-month rate repeated
@@ -204,12 +220,14 @@ def forecast_path(series: list[float], horizon: int, method: str, alpha: float) 
     method = (method or "moving_avg").lower()
     if method == "damped_trend":
         return damped_trend_path(series, h)
-    rate, _ = monthly_rate(series, method, alpha)
+    rate, _ = monthly_rate(series, method, alpha, ewma_alpha)
     rate = max(0.0, rate)
     return [rate for _ in range(h)]
 
 
-def forecast_series(series: list[float], horizon: int, method: str, alpha: float) -> list[float]:
+def forecast_series(
+    series: list[float], horizon: int, method: str, alpha: float, ewma_alpha: float = EWMA_ALPHA
+) -> list[float]:
     """Project the next `horizon` months. Thin alias of forecast_path kept for the existing
     call sites / tests: a flat method yields a repeated rate, damped_trend yields its path.
 
@@ -217,4 +235,4 @@ def forecast_series(series: list[float], horizon: int, method: str, alpha: float
     For the per-segment "auto" selection, callers resolve the concrete method first (see
     selection.select_method); this function never classifies — it just projects what it is told.
     """
-    return forecast_path(series, horizon, method, alpha)
+    return forecast_path(series, horizon, method, alpha, ewma_alpha)

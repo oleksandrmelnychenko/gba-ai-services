@@ -118,11 +118,11 @@ def test_cache_key_stable_and_versioned():
     k1 = make_key(123, "2026-06-01", 12)
     k2 = make_key(123, "2026-06-01", 12)
     assert k1 == k2
-    assert k1.startswith("solv:response-v5:history-20250101:")
+    assert k1.startswith("solv:response-v8:history-20250101:")
     assert ":123:" in k1
     assert "creditscore-v3" in k1
     ck = make_charts_key(123, "2026-06-01", 12)
-    assert ck.startswith("solvchart:response-v5:history-20250101:")
+    assert ck.startswith("solvchart:response-v8:history-20250101:")
 
 
 def test_api_money_uses_half_up_and_rounds_only_after_aggregate():

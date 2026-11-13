@@ -14,6 +14,7 @@ from app.core.history import full_history_coverage
 from app.core.logging import get_logger
 from app.data import cache
 from app.data import sales_repository as repo
+from app.data import source_rules as rules
 from app.domain.models import (
     ProductRec,
     RecommendationResult,
@@ -21,6 +22,7 @@ from app.domain.models import (
     RecSourceDetail,
     Segment,
 )
+from app.services.eval import measured
 from app.services.recommendations import live_remap
 
 log = get_logger("recommender")
@@ -115,6 +117,8 @@ def _backfill(
     segment: Segment,
     excl: frozenset[int],
     owned_live: frozenset[int],
+    *,
+    degraded: list[str] | None = None,
     **scope: str,
 ) -> list[ProductRec]:
     """Fill the gap to top_n when V3.2 discovery under-delivers (HEAVY/LIGHT clients with weak
@@ -159,8 +163,10 @@ def _backfill(
                 continue
             blocked.add(r.product_id)
             combined.append(_emit(r.product_id, RecSourceDetail.COPURCHASE))
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        if degraded is not None:
+            degraded.append("copurchase_backfill")
+        log.warning("backfill_degraded", customer_id=customer_id, error=str(exc))
 
     if len(combined) < top_n:
         pool_size = min(_STOCK_POOL_CAP, max(top_n * 5, top_n + len(blocked)))
@@ -195,7 +201,7 @@ def recommend(
     scope = {"client_agreement_net_id": client_agreement_net_id} if client_agreement_net_id else {}
     s = get_settings()
     started = datetime.now()
-    as_of = as_of_date or datetime.now().strftime("%Y-%m-%d")
+    as_of = as_of_date or rules.today()
     history = full_history_coverage(as_of)
     top_n = top_n or s.default_top_n
     repurchase_n = min(s.repurchase_count, top_n)
@@ -209,11 +215,20 @@ def recommend(
     # Fail-open when the client has no region set.
     region_id = repo.client_region_id(customer_id) if region_scope else None
 
-    excl = repo.ubiquitous_product_ids(s.ubiquity_exclude_pct) | cache.get_negatives(customer_id)
+    excl = (
+        repo.ubiquitous_product_ids(s.ubiquity_exclude_pct, as_of)
+        | cache.get_negatives(customer_id)
+        | repo.open_order_product_ids(customer_id, as_of)
+    )
     owned_live = (
         frozenset(repo.owned_live_product_ids(customer_id, as_of, **scope))
         if include_discovery
         else frozenset()
+    )
+    client_owned_live = (
+        frozenset(repo.owned_live_product_ids(customer_id, as_of))
+        if include_discovery and scope
+        else owned_live
     )
     freq = _normalize({pid: float(c) for pid, c in repo.product_frequency(customer_id, as_of, **scope).items()
                        if pid not in excl})
@@ -240,7 +255,8 @@ def recommend(
     repurchase = _diversity_filter(repurchase, s.max_per_group)[:repurchase_n]
 
     discovery: list[ProductRec] = []
-    if discovery_n > 0:
+    degraded: list[str] = []
+    if discovery_n > 0 and s.discovery_source == "similar_clients":
         try:
             sims = _similar_customers(customer_id, as_of, region_id=region_id, **scope)
             collab = {
@@ -267,6 +283,7 @@ def recommend(
             discovery = _diversity_filter(discovery, s.max_per_group)[:discovery_n]
         except Exception as exc:  # noqa: BLE001
             log.warning("discovery_degraded", customer_id=customer_id, error=str(exc))
+            degraded.append("discovery")
             discovery = []
 
     combined = repurchase + discovery
@@ -279,6 +296,7 @@ def recommend(
             segment,
             excl,
             owned_live,
+            degraded=degraded,
             **scope,
         )
     # History carries product ids of soft-deleted catalog generations (re-syncs mint new
@@ -300,6 +318,10 @@ def recommend(
             for item in combined
             if item.source != RecSource.DISCOVERY or item.product_id not in owned_live
         ]
+    for item in combined:
+        if item.source == RecSource.DISCOVERY and item.product_id in client_owned_live:
+            item.source = RecSource.REPURCHASE
+            item.source_detail = RecSourceDetail.REPURCHASE_HISTORY
     # Defense in depth: the exact live ids returned to the caller must still be in operational
     # resale stock. The repository uses the same remap rule, so this should remove nothing.
     final_stock = repo.in_stock_product_ids([item.product_id for item in combined], **scope)
@@ -316,10 +338,12 @@ def recommend(
         count=len(combined),
         discovery_count=discovery_count,
         segment=segment.value,
+        precision_estimate=measured.precision("personal", top_n),
         latency_ms=round(latency_ms, 2),
         cached=False,
         as_of_date=as_of,
         source_history_start=history.source_history_start.isoformat(),
         effective_start=history.effective_start.isoformat(),
         history_complete=history.history_complete,
+        degraded=bool(degraded),
     )

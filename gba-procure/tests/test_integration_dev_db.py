@@ -103,7 +103,7 @@ def test_producer_lead_time_is_positive_and_sane(current_candidate):
     assert mean_days > 0
     assert mean_days < 365
     assert std_days >= 0
-    assert source in ("empirical", "geo", "default")
+    assert source in ("empirical", "empirical_trimmed", "geo", "default")
 
 
 def test_producer_lead_times_samples_within_plausible_window(current_empirical_candidate):
@@ -176,3 +176,40 @@ def test_build_plan_items_carry_eur_unit_cost(current_priced_candidate):
             Decimal(str(it.unit_cost_eur)) * Decimal(str(it.suggested_qty))
         ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         assert Decimal(str(it.line_cost_eur)) == expected_line_cost
+
+
+def test_supply_document_quantities_agree_with_the_derived_minimum(current_candidate):
+    producer_id, _name, _product_ids = current_candidate
+    minimums = {
+        (t["producer_id"], t["product_id"]): t
+        for t in repo.derive_moq_terms(AS_OF, 3)
+        if t["producer_id"] == producer_id
+    }
+    documents = repo.supply_document_quantities(AS_OF, 3, producer_id=producer_id)
+    assert set(documents) == set(minimums)
+    for pair, found in documents.items():
+        quantities = [qty for _day, _document, qty in found["documents"]]
+        assert len(quantities) == minimums[pair]["orders"] >= 3
+        assert min(quantities) == pytest.approx(minimums[pair]["moq"])
+        assert found["pack"] == minimums[pair]["pack"]
+
+
+def test_validated_derived_terms_carry_no_flag_and_reach_plan_lines(current_candidate):
+    from app.services.replenishment import derived_terms
+
+    producer_id, _name, product_ids = current_candidate
+    found = derived_terms.derive(AS_OF, {producer_id: product_ids})
+    validated = {t.product_id: t for t in found if t.validated}
+    for term in validated.values():
+        assert term.effective_moq <= term.sales_12m_units
+        assert term.pack is None or abs(term.moq / term.pack - round(term.moq / term.pack)) < 1e-6
+    plan = policy.build_plan(producer_id, AS_OF, only_needed=False, product_ids=product_ids)
+    for item in plan.items:
+        term = validated.get(item.product_id)
+        if term is None:
+            assert item.moq_basis is None and item.moq is None
+        else:
+            assert item.moq_basis == "derived_validated"
+            assert item.moq == term.moq and item.pack_multiple == term.pack
+            if item.suggested_qty > 0:
+                assert item.suggested_qty >= term.effective_moq

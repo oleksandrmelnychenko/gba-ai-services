@@ -22,6 +22,48 @@ def _db_ok() -> bool:
         return False
 
 
+_KYIV_MONTH = (
+    "CONVERT(char(7), CAST({column} AT TIME ZONE 'UTC' "
+    "AT TIME ZONE 'FLE Standard Time' AS datetime2), 126)"
+)
+_CONFIRMED = """s.Deleted = 0 AND s.ChangedToInvoice IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM dbo.DataSyncAccountingSourceTarget t
+                              WHERE t.TargetEntityType = N'Sale' AND t.TargetEntityID = s.ID
+                                    AND t.IsCurrent = 1 AND t.OwnershipType = 1)
+              AND oi.Deleted = 0 AND oi.IsValidForCurrentSale = 1 AND oi.Qty > 0"""
+
+
+def _net_monthly_sql(scope: str) -> str:
+    return f"""
+        SELECT x.ym, SUM(x.eur) AS eur
+        FROM (
+            SELECT {_KYIV_MONTH.format(column="s.ChangedToInvoice")} AS ym,
+                   CAST(CASE WHEN CAST(oi.Qty AS decimal(38, 6)) > ISNULL(back.qty, 0)
+                             THEN CAST(oi.Qty AS decimal(38, 6)) - ISNULL(back.qty, 0)
+                             ELSE 0 END AS decimal(18, 8))
+                   * CAST(oi.PricePerItem AS decimal(28, 14)) AS eur
+            FROM dbo.Sale s
+            JOIN dbo.OrderItem oi ON oi.OrderID = s.OrderID
+            JOIN dbo.ClientAgreement ca ON ca.ID = s.ClientAgreementID
+            OUTER APPLY (
+                SELECT SUM(CAST(sri.Qty AS decimal(38, 6))) AS qty
+                FROM dbo.SaleReturnItem sri
+                JOIN dbo.SaleReturn sr ON sr.ID = sri.SaleReturnID
+                WHERE sri.OrderItemID = oi.ID
+                      AND sri.Deleted = 0 AND sr.Deleted = 0 AND sr.IsCanceled = 0
+                      AND sri.Qty > 0
+                      AND sr.FromDate < :returned_before
+            ) back
+            WHERE {_CONFIRMED}
+                  AND {scope}
+                  AND s.ChangedToInvoice >= :source_history_start
+                  AND s.ChangedToInvoice >= :history_start
+                  AND s.ChangedToInvoice < :asof
+        ) x
+        GROUP BY x.ym
+    """
+
+
 def _active_avantazh() -> tuple[int, str]:
     from app.data.db import query
 
@@ -127,6 +169,7 @@ def test_live_identity_and_history_money_reconcile_exactly(monkeypatch):
     from app.core.history import resolve_history_window
     from app.data import signals_repository as sig
     from app.data.db import query
+    from app.data.source_rules import utc_instant
     from app.services import forecast as fc
 
     as_of = main._today()
@@ -137,37 +180,37 @@ def test_live_identity_and_history_money_reconcile_exactly(monkeypatch):
         cfg.source_history_start_date,
     )
     synth = sig.synthetic_product_id()
+    bounds = {
+        "source_history_start": utc_instant(window.source_history_start),
+        "history_start": utc_instant(window.effective_start),
+        "asof": utc_instant(as_of),
+    }
     seeds = query(
-        """
+        f"""
         SELECT TOP 1
                ca.ClientID AS client_id,
                CONVERT(varchar(36), c.NetUID) AS client_net_id,
                oi.ProductID AS product_id,
                CONVERT(varchar(36), p.NetUID) AS product_net_id,
-               COUNT(DISTINCT CONVERT(char(7), o.Created, 120)) AS active_months
-        FROM dbo.OrderItem oi
-        JOIN dbo.[Order] o ON o.ID = oi.OrderID
-        JOIN dbo.ClientAgreement ca ON ca.ID = o.ClientAgreementID
+               COUNT(DISTINCT {_KYIV_MONTH.format(column="s.ChangedToInvoice")}) AS active_months
+        FROM dbo.Sale s
+        JOIN dbo.OrderItem oi ON oi.OrderID = s.OrderID
+        JOIN dbo.ClientAgreement ca ON ca.ID = s.ClientAgreementID
         JOIN dbo.Client c ON c.ID = ca.ClientID
         JOIN dbo.Product p ON p.ID = oi.ProductID
-        WHERE oi.IsValidForCurrentSale = 1
+        WHERE {_CONFIRMED}
               AND oi.ProductID <> :synth
               AND c.Deleted = 0
               AND p.Deleted = 0
               AND c.NetUID IS NOT NULL
               AND p.NetUID IS NOT NULL
-              AND o.Created >= :source_history_start
-              AND o.Created >= :history_start
-              AND o.Created < :asof
+              AND s.ChangedToInvoice >= :source_history_start
+              AND s.ChangedToInvoice >= :history_start
+              AND s.ChangedToInvoice < :asof
         GROUP BY ca.ClientID, c.NetUID, oi.ProductID, p.NetUID
         ORDER BY active_months DESC, ca.ClientID, oi.ProductID
         """,
-        {
-            "synth": synth,
-            "source_history_start": window.source_history_start.isoformat(),
-            "history_start": window.effective_start.isoformat(),
-            "asof": as_of,
-        },
+        {"synth": synth, **bounds},
     )
     assert seeds
     seed = seeds[0]
@@ -199,67 +242,20 @@ def test_live_identity_and_history_money_reconcile_exactly(monkeypatch):
     }
 
     scope_sql = {
-        "ByClient": """
-            SELECT CONVERT(char(7), o.Created, 120) AS ym,
-                   SUM(
-                       CAST(oi.Qty AS decimal(18, 8))
-                       * CAST(oi.PricePerItem AS decimal(28, 14))
-                   ) AS eur
-            FROM dbo.ClientAgreement ca
-            JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
-            JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-            WHERE ca.ClientID = :client_id
-                  AND oi.IsValidForCurrentSale = 1
-                  AND oi.ProductID <> :synth
-                  AND o.Created >= :source_history_start
-                  AND o.Created >= :history_start
-                  AND o.Created < :asof
-            GROUP BY CONVERT(char(7), o.Created, 120)
-        """,
-        "ByProduct": """
-            SELECT CONVERT(char(7), o.Created, 120) AS ym,
-                   SUM(
-                       CAST(oi.Qty AS decimal(18, 8))
-                       * CAST(oi.PricePerItem AS decimal(28, 14))
-                   ) AS eur
-            FROM dbo.OrderItem oi
-            JOIN dbo.[Order] o ON o.ID = oi.OrderID
-            WHERE oi.ProductID = :product_id
-                  AND oi.IsValidForCurrentSale = 1
-                  AND o.Created >= :source_history_start
-                  AND o.Created >= :history_start
-                  AND o.Created < :asof
-            GROUP BY CONVERT(char(7), o.Created, 120)
-        """,
-        "ByClientAndProduct": """
-            SELECT CONVERT(char(7), o.Created, 120) AS ym,
-                   SUM(
-                       CAST(oi.Qty AS decimal(18, 8))
-                       * CAST(oi.PricePerItem AS decimal(28, 14))
-                   ) AS eur
-            FROM dbo.ClientAgreement ca
-            JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
-            JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-            WHERE ca.ClientID = :client_id
-                  AND oi.ProductID = :product_id
-                  AND oi.IsValidForCurrentSale = 1
-                  AND oi.ProductID <> :synth
-                  AND o.Created >= :source_history_start
-                  AND o.Created >= :history_start
-                  AND o.Created < :asof
-            GROUP BY CONVERT(char(7), o.Created, 120)
-        """,
+        "ByClient": _net_monthly_sql("ca.ClientID = :client_id AND oi.ProductID <> :synth"),
+        "ByProduct": _net_monthly_sql("oi.ProductID = :product_id"),
+        "ByClientAndProduct": _net_monthly_sql(
+            "ca.ClientID = :client_id AND oi.ProductID = :product_id"
+        ),
     }
     params = {
         "client_id": seed["client_id"],
         "product_id": seed["product_id"],
         "synth": synth,
-        "source_history_start": window.source_history_start.isoformat(),
-        "history_start": window.effective_start.isoformat(),
-        "asof": as_of,
+        **bounds,
+        "asof": utc_instant(as_of[:7] + "-01"),
+        "returned_before": bounds["asof"],
     }
-    # Monthly training and its metadata use only closed calendar months.
-    params["asof"] = as_of[:7] + "-01"
     for key, sql in scope_sql.items():
         rows = query(sql, params)
         values = [Decimal(str(row["eur"] or 0)) for row in rows if row.get("ym")]

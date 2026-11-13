@@ -25,12 +25,7 @@ CSV_PREVIEW_PATH = DATA_DIR / "risk_dataset_v3_preview.csv"
 DEFAULT_FEATURE_DATE = "2026-03-25"
 DEFAULT_LABEL_DATE = "2026-06-25"
 
-SANITY_CLIENTS = {
-    411780: "ТРАМП ОЙЛ",
-    411801: "АБРАМЧЕНКО О.Я.",
-    416221: "(416221)",
-    426447: "МАГТРАНС",
-}
+SANITY_ROWS = 5
 
 
 def _hr(title: str) -> None:
@@ -131,23 +126,21 @@ def main() -> int:
         print(f"{name:<26}{cov:>10.1f}%{sa:>10}{sf:>10}")
 
     # -------------------------------------------------------------- sanity rows
-    _hr("SANITY (known overdue clients)")
+    _hr(f"SANITY (the {SANITY_ROWS} largest 180+ overdue exposures in this dataset)")
     key_cols = [
         "label_sev180", "already_default_at_feature_date", "overdue_eur_180plus",
         "overdue_eur_91_180", "total_debt_eur", "pct_debt_180plus", "max_overdue_days",
         "n_open_debt_lines",
     ]
-    for cid, name in SANITY_CLIENTS.items():
-        sub = df[df["client_id"] == cid]
-        if sub.empty:
-            print(f"{cid} {name}: NOT in buyer universe (no role-1 buyer row)")
-            continue
-        r = sub.iloc[0]
+    worst = df[df["overdue_eur_180plus"] > 0].nlargest(SANITY_ROWS, "overdue_eur_180plus")
+    if worst.empty:
+        print("no buyer carries 180+ overdue debt at the feature date")
+    for _, r in worst.iterrows():
         vals = "  ".join(
             f"{k}={r[k]:.1f}" if isinstance(r[k], float) else f"{k}={r[k]}"
             for k in key_cols
         )
-        print(f"{cid} {name}:\n    {vals}")
+        print(f"client {int(r['client_id'])}:\n    {vals}")
 
     print()
     return 0

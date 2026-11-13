@@ -8,6 +8,7 @@ from typing import Self
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.core.history import parse_as_of, source_history_start
+from app.services.eval import measured
 
 
 class Segment(StrEnum):
@@ -64,15 +65,13 @@ class RecommendationResult(BaseModel):
     discovery_count: int = Field(ge=0)
     segment: str = Field(min_length=1)
     precision_estimate: float = Field(
-        default=0.033,
+        default_factory=lambda: measured.precision("personal", 25),
         ge=0,
         le=1,
         description=(
-            "Harness-derived precision@10 for the v3.2 model on the leave-last-basket eval "
-            "(n=409, synthetic/ubiquitous excluded; see docs/eval-baseline.md). NOT a per-call "
-            "confidence — it is the model's measured offline precision. Was a fabricated 0.754; "
-            "replaced with the real measured number so the contract carries an honest metric "
-            "(the .NET DTO field is non-nullable double, so the value is kept rather than omitted)."
+            "Offline precision@k measured for this model version and list kind on the temporal "
+            "holdout (app/services/eval/measured.json; k = 10 for lists of up to 10, else 25). "
+            "A property of the model, not a per-call confidence."
         ),
     )
     latency_ms: float = Field(default=0.0, ge=0)
@@ -81,7 +80,16 @@ class RecommendationResult(BaseModel):
     source_history_start: str
     effective_start: str
     history_complete: bool
-    model_version: str = "v39-agreement-history-floor-20250101"
+    degraded: bool = False
+    stale: bool = Field(
+        default=False,
+        description=(
+            "True when the list comes from a snapshot older than the requested day "
+            "(SERVE_LATEST_FALLBACK); as_of_date is the day the list was computed for."
+        ),
+    )
+    degraded_reason: str | None = None
+    model_version: str = "v42-confirmed-sales-history-floor-20250101"
 
     @model_validator(mode="after")
     def validate_exact_contract(self) -> Self:

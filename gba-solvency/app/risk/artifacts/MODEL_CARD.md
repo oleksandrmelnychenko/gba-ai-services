@@ -39,3 +39,14 @@ trajectory, sales/RFM and returns are bounded by the source-history floor.
 No forward artifact is published and no legacy forward PD is served. The API returns the valid
 current score with `forward_risk=null`, `forward_risk_status="model_unavailable"` and the support
 reason. `forward_model_status.json` is the deployable evidence for this degraded state.
+
+<!-- quality:start (written by scripts/retrain.py) -->
+## Quality where the scorecard has to rank
+
+- Training run: `current-20261109T014047+0000-dfb89fb2ed42`
+- All rows, five-fold OOF AUC: 0.9786 (most buyers carry no debt, so this mostly measures has-debt / has-no-debt)
+- Buyers with open debt at the feature date: 177 rows, 25 positives (5.4% of the dataset)
+  - out-of-fold: AUC 0.6254, KS 0.3061, Brier 0.6033 (class-balanced, uncalibrated fold models)
+  - as served (calibrated PD with the SEV180 floor, in-sample): AUC 0.7709, KS 0.6639, Brier 0.1093
+- Live buyers scored exactly 100: 1299 of 1814 scored (71.6%, as of 2026-11-12)
+<!-- quality:end -->

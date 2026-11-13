@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+import threading
 import time
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime
@@ -23,7 +24,9 @@ from app.core.metrics import METRICS
 from app.data import cache
 from app.data import signals_repository as sig
 from app.data.db import dispose, get_engine
+from app.data.source_rules import SOURCE_LABEL as SALES_SOURCE_LABEL
 from app.services import forecast as fc
+from app.services.forecasting import intervals, selection
 
 log = get_logger("api")
 settings = get_settings()
@@ -31,6 +34,10 @@ _EXPECTED_SOURCE_HISTORY_START = "2025-01-01"
 KYIV = ZoneInfo("Europe/Kyiv")
 
 _OPEN_PATHS = {"/health"}
+_SOURCE_HEALTH_TTL_SECONDS = 60.0
+_SOURCE_HEALTH_FAILURE_TTL_SECONDS = 10.0
+_source_health_lock = threading.Lock()
+_source_health_cached: tuple[float, dict[str, Any]] | None = None
 
 
 @asynccontextmanager
@@ -49,7 +56,7 @@ async def lifespan(app: FastAPI):
     log.info("service_stopped")
 
 
-app = FastAPI(title="GBA Sales Forecast Service", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="GBA Sales Forecast Service", version="0.4.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_allow_origins,
@@ -128,11 +135,12 @@ def _database_health() -> tuple[str, bool]:
 
 
 def _health_snapshot(now: datetime | None = None) -> dict[str, Any]:
+    use_cached_source = now is None
     now = now or datetime.now(UTC)
     _, db_ok = _database_health()
     cache_ok = cache.health()
     data = (
-        _sales_data_health(now)
+        (_cached_sales_data_health(now) if use_cached_source else _sales_data_health(now))
         if db_ok
         else _empty_sales_data_health("database_unavailable", now.date())
     )
@@ -153,15 +161,31 @@ def _health_snapshot(now: datetime | None = None) -> dict[str, Any]:
         "cache_connected": cache_ok,
         "source_history_start": source_history_start,
         "source_history_contract_ready": source_history_contract_ready,
-        "version": "0.1.0",
+        "version": "0.4.0",
         "model_version": settings.model_version,
         "data": data,
     }
 
 
+def _cached_sales_data_health(now: datetime) -> dict[str, Any]:
+    global _source_health_cached
+    with _source_health_lock:
+        cached = _source_health_cached
+        if cached is not None and time.monotonic() < cached[0]:
+            return dict(cached[1])
+        data = _sales_data_health(now)
+        ttl = _SOURCE_HEALTH_TTL_SECONDS if data["source_ready"] else _SOURCE_HEALTH_FAILURE_TTL_SECONDS
+        _source_health_cached = (time.monotonic() + ttl, data)
+        return dict(data)
+
+
 def _sales_data_health(now: datetime) -> dict[str, Any]:
     as_of = datetime.combine(now.date(), datetime.min.time(), tzinfo=UTC)
     history_metadata = _history_metadata(now.date())
+    synthetic = sig.synthetic_product_status()
+    if not synthetic["resolved"]:
+        log.error("synthetic_product_unresolved", source=synthetic["source"])
+        return _empty_sales_data_health("synthetic_product_unresolved", now.date())
     try:
         snapshot = sig.sales_source_status(as_of, settings.history_months)
     except Exception as exc:  # noqa: BLE001
@@ -179,7 +203,6 @@ def _sales_data_health(now: datetime) -> dict[str, Any]:
     )
     source_fresh = bool(age_hours is not None and 0 <= age_hours <= settings.source_max_age_hours)
     values_valid = snapshot["invalid_value_row_count"] == 0
-    synthetic = sig.synthetic_product_status()
     synthetic_resolved = bool(synthetic["resolved"])
     source_ready = (
         source_exists
@@ -204,7 +227,7 @@ def _sales_data_health(now: datetime) -> dict[str, Any]:
         reason = "canonical_source_stale"
 
     return {
-        "source": "dbo.OrderItem.IsValidForCurrentSale + dbo.Order.Created",
+        "source": SALES_SOURCE_LABEL,
         "source_ready": source_ready,
         "reason": reason,
         "source_schema_present": bool(snapshot["source_schema_present"]),
@@ -229,7 +252,7 @@ def _sales_data_health(now: datetime) -> dict[str, Any]:
 def _empty_sales_data_health(reason: str, as_of: date | None = None) -> dict[str, Any]:
     history_metadata = _history_metadata(as_of or datetime.now(UTC).date())
     return {
-        "source": "dbo.OrderItem.IsValidForCurrentSale + dbo.Order.Created",
+        "source": SALES_SOURCE_LABEL,
         "source_ready": False,
         "reason": reason,
         "source_schema_present": False,
@@ -262,6 +285,28 @@ def metrics() -> dict:
     return METRICS.snapshot()
 
 
+@app.get("/diagnostics/placeholder-returns")
+def placeholder_returns() -> dict:
+    """Buyer returns of sales older than the history: EUR taken off their month and EUR dropped."""
+    as_of = _today()
+    try:
+        outcome = sig.placeholder_return_diagnostic(as_of, settings.history_months)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {
+        "as_of": as_of,
+        "history_window_months": settings.history_months,
+        **_history_metadata(as_of),
+        **_public_money(outcome),
+    }
+
+
+def _public_money(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _public_money(item) for key, item in value.items()}
+    return float(round(value, 2)) if isinstance(value, Decimal) else value
+
+
 @app.get("/forecast/sales")
 def forecast_sales(
     client_net_id: UUID | None = None,
@@ -277,7 +322,8 @@ def forecast_sales(
       - product_net_id       -> ByProduct
       - both                 -> ByClient, ByProduct, and ByClientAndProduct (that client buying
                                 that product)
-    Each populated key is an array of {SaleAmount, MonthNameUK} for the next N months
+    Each populated key is an array of {SaleAmount, MonthNameUK, SaleAmountLow, SaleAmountHigh}
+    for the next N months
     (`months`, default config). A series with too little history yields [] for its key
     (the console shows «немає даних») — never crashes. Internal-key gated when configured.
     """
@@ -343,6 +389,7 @@ def forecast_sales(
             "ByProduct": [],
             "ByClientAndProduct": [],
         }
+        methods: dict[str, Any] = {"ByClient": None, "ByProduct": None, "ByClientAndProduct": None}
         history = {
             "ByClient": _unavailable_history_status(
                 "not_requested" if client_net_id is None else "unknown_identity"
@@ -365,19 +412,25 @@ def forecast_sales(
 
         if client_id is not None:
             client_rows = sig.monthly_sales_by_client(client_id, as_of_str, settings.history_months)
-            out["ByClient"], history["ByClient"] = _forecast_with_history(client_rows, as_of, horizon)
+            out["ByClient"], history["ByClient"], methods["ByClient"] = _forecast_with_history(
+                client_rows, as_of, horizon, selection.SCOPE_CLIENT
+            )
 
         if product_id is not None and not is_synthetic_product:
             product_rows = sig.monthly_sales_by_product(product_id, as_of_str, settings.history_months)
-            out["ByProduct"], history["ByProduct"] = _forecast_with_history(product_rows, as_of, horizon)
+            out["ByProduct"], history["ByProduct"], methods["ByProduct"] = _forecast_with_history(
+                product_rows, as_of, horizon, selection.SCOPE_PRODUCT
+            )
 
         if client_id is not None and product_id is not None and not is_synthetic_product:
             pair_rows = sig.monthly_sales_by_client_and_product(
                 client_id, product_id, as_of_str, settings.history_months
             )
-            out["ByClientAndProduct"], history["ByClientAndProduct"] = _forecast_with_history(
-                pair_rows, as_of, horizon
-            )
+            (
+                out["ByClientAndProduct"],
+                history["ByClientAndProduct"],
+                methods["ByClientAndProduct"],
+            ) = _forecast_with_history(pair_rows, as_of, horizon, selection.SCOPE_PAIR)
 
         client_identity = (
             "not_requested" if client_net_id is None else "resolved" if client_id is not None else "unknown"
@@ -402,6 +455,7 @@ def forecast_sales(
             "as_of": as_of_str,
             "requested_as_of": requested_as_of,
             "horizon_months": horizon,
+            "horizon_shape": selection.horizon_shape(settings.forecast_method),
             "currency": "EUR",
             "model_version": settings.model_version,
             "source_fingerprint": source_fingerprint,
@@ -423,6 +477,8 @@ def forecast_sales(
             "history_window_months": settings.history_months,
             "minimum_non_zero_months": settings.min_history_months,
             "history": history,
+            "method": methods,
+            "interval": intervals.metadata(),
         }
 
         METRICS.record_request((time.time() - started) * 1000)
@@ -464,7 +520,9 @@ def forecast_sales(
         raise HTTPException(status_code=500, detail="forecast_sales_failed") from exc
 
 
-def _forecast_with_history(rows: list[dict], as_of: date, horizon: int) -> tuple[list[dict], dict[str, Any]]:
+def _forecast_with_history(
+    rows: list[dict], as_of: date, horizon: int, scope: str = selection.SCOPE_CLIENT
+) -> tuple[list[dict], dict[str, Any], dict[str, str] | None]:
     labels = fc.history_labels(
         as_of,
         settings.history_months,
@@ -477,7 +535,9 @@ def _forecast_with_history(rows: list[dict], as_of: date, horizon: int) -> tuple
     training_months = set(fc.training_labels(as_of, settings))
     training_rows = [row for row in rows if str(row.get("ym")) in training_months]
     summary = sig.history_summary(training_rows, max_months=len(training_months))
-    points = fc.forecast_points(sig.to_series(rows), as_of, settings, horizon)
+    points, method = fc.forecast_points_with_method(
+        sig.to_series(rows), as_of, settings, horizon, scope
+    )
     sufficient = summary["non_zero_month_count"] >= settings.min_history_months
     status = "sufficient" if sufficient else "insufficient_history"
     return points, {
@@ -486,7 +546,7 @@ def _forecast_with_history(rows: list[dict], as_of: date, horizon: int) -> tuple
         "non_zero_month_count": summary["non_zero_month_count"],
         "total_eur": fc.eur_cents(summary["total_eur"]),
         "sufficient": sufficient,
-    }
+    }, method
 
 
 def _unavailable_history_status(status: str) -> dict[str, Any]:
@@ -602,12 +662,14 @@ def _is_valid_cached_response(
         meta.get("as_of") != as_of
         or meta.get("requested_as_of") != requested_as_of
         or meta.get("horizon_months") != horizon
+        or meta.get("horizon_shape") != selection.horizon_shape(settings.forecast_method)
         or meta.get("currency") != "EUR"
         or meta.get("model_version") != settings.model_version
         or meta.get("source_fingerprint") != source_fingerprint
         or meta.get("source_history_start") != history_metadata["source_history_start"]
         or meta.get("effective_start") != history_metadata["effective_start"]
         or meta.get("history_complete") is not history_metadata["history_complete"]
+        or meta.get("interval") != intervals.metadata()
     ):
         return False
     if meta.get("status") not in {
@@ -761,8 +823,11 @@ def _valid_history_item(item: dict[str, Any], *, max_months: int | None = None) 
 def _valid_forecast_point(point: object) -> bool:
     return (
         isinstance(point, dict)
-        and set(point) == {"SaleAmount", "MonthNameUK"}
+        and set(point) == {"SaleAmount", "MonthNameUK", "SaleAmountLow", "SaleAmountHigh"}
         and _is_eur_cents(point["SaleAmount"])
+        and _is_eur_cents(point["SaleAmountLow"])
+        and _is_eur_cents(point["SaleAmountHigh"])
+        and point["SaleAmountLow"] <= point["SaleAmount"] <= point["SaleAmountHigh"]
         and isinstance(point["MonthNameUK"], str)
         and bool(point["MonthNameUK"])
     )

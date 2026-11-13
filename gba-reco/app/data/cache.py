@@ -11,7 +11,9 @@ still works (just uncached). Never let cache failure break recommendations.
 from __future__ import annotations
 
 import json
+import re
 import time
+from datetime import date, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -23,9 +25,10 @@ from app.core.metrics import METRICS
 
 log = get_logger("cache")
 
-# v39: target history and operational stock are scoped to ClientAgreement.NetUID.
-# Separate agreement keys also isolate the legacy client-wide NBA/batch signals.
-_MODEL_VERSION = "v39-agreement-history-floor-20250101"
+# v42: purchase history follows gba-server's confirmed sale (app.data.source_rules), lists
+# hold one card per article and skip services and open-order products
+# (docs/eval-2026-11-13.md).
+_MODEL_VERSION = "v42-confirmed-sales-history-floor-20250101"
 _RETRY_COOLDOWN_S = 30.0
 _client: redis.Redis | None = None
 _unavailable_until = 0.0
@@ -66,6 +69,70 @@ def make_copurchase_key(customer_id: int, as_of: str, top_n: int,
                         client_agreement_net_id: str | None = None) -> str:
     base = f"copurchase:{_MODEL_VERSION}:{customer_id}:{as_of}:{top_n}"
     return f"{base}:a{UUID(client_agreement_net_id)}" if client_agreement_net_id else base
+
+
+def to_latest(key: str, as_of: str) -> str:
+    return key.replace(f":{as_of}:", ":latest:", 1) if f":{as_of}:" in key else f"{key}:latest"
+
+
+def fallback_floor(as_of: str) -> str:
+    age = get_settings().latest_fallback_max_age_days
+    return (date.fromisoformat(as_of[:10]) - timedelta(days=age)).isoformat()
+
+
+def get_latest(key: str, as_of: str) -> dict[str, Any] | None:
+    payload = get(to_latest(key, as_of))
+    if not payload:
+        return None
+    served = payload.get("as_of_date")
+    if not isinstance(served, str) or not fallback_floor(as_of) <= served <= as_of:
+        return None
+    return payload
+
+
+def set_warm(key: str, as_of: str, value: dict[str, Any], ttl: int) -> bool:
+    return set(key, value, ttl=ttl) and set(to_latest(key, as_of), value, ttl=ttl)
+
+
+_DATED_KEY = re.compile(r"^(?:reco|copurchase):([^:]+):\d+:(\d{4}-\d{2}-\d{2}|latest)(?::|$)")
+
+
+def purge_dated_before(as_of: str) -> int:
+    client = _get_client()
+    if client is None:
+        return 0
+    deleted = 0
+    try:
+        for pattern in ("reco:*", "copurchase:*"):
+            batch: list[str] = []
+            for key in client.scan_iter(match=pattern, count=1000):
+                match = _DATED_KEY.match(key)
+                if match and (
+                    match.group(1) != _MODEL_VERSION
+                    or (match.group(2) != "latest" and match.group(2) < as_of)
+                ):
+                    batch.append(key)
+                if len(batch) >= 500:
+                    deleted += client.delete(*batch)
+                    batch = []
+            if batch:
+                deleted += client.delete(*batch)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("cache_purge_failed", error=str(exc))
+    return deleted
+
+
+def negative_client_uids() -> frozenset[str]:
+    client = _get_client()
+    if client is None:
+        return frozenset()
+    try:
+        return frozenset(
+            key.removeprefix("reco:neg:") for key in client.scan_iter(match="reco:neg:*", count=1000)
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("neg_scan_failed", error=str(exc))
+        return frozenset()
 
 
 def get(key: str) -> dict[str, Any] | None:

@@ -29,3 +29,19 @@ Historical serving would require immutable client features or scores captured at
 ## Verification
 
 Offline tests cover current-day and DST/midnight behavior, one clock read, fixed score window versus chart display window, no-data and non-buyer states, stale caches, FX mismatch, and pre-I/O rejection. All HTTP/database access is denied in the isolated test runner; actual model JSON is read into a private test sandbox without modifying the live files. .NET contract tests cover required JSON fields, exact pairs, empty buyer history, rejection of numeric legacy history and FX/window mismatch. No live SQL, 1C connection, retraining, financial mutation or restart is required for these tests.
+
+## Date basis — 2026-11-13
+
+Stored instants (`Debt.Created`, `Sale.ChangedToInvoice`) are UTC; the as-of date is a Europe/Kyiv day. Every calendar difference now converts the instant to its Kyiv date first (`app/data/source_rules.py`: `local_date`, `days_since`, `months_since`, `local_month`):
+
+- overdue days, ageing buckets, the overdue amount and the SEV180 label count from the Kyiv date of `Debt.Created`. A line stamped at Kyiv midnight (22:00 or 21:00 UTC of the previous day) was one day too old;
+- recency days and tenure months count from the Kyiv date of the last / first invoice;
+- the debt-trajectory windows (3, 6 and 12 months) and the months-with-debt key use Kyiv days and Kyiv months.
+
+A sale is dated by its invoice instant `Sale.ChangedToInvoice` (the server's `Sale.EffectiveDate` for an invoiced sale), not by `Sale.Created`. This applies to the 12-month turnover, order count, sold quantity, the per-currency breakdown, recency, tenure and the monthly series, so a client's monthly turnover is the server sales report's month.
+
+The monthly series (`turnover_trend`, `turnover_vs_exposure`) carries every Kyiv month from the first full month in the window through the month of the last complete day; a month without sales is an explicit `0.00` point.
+
+Unchanged: the row-visibility cutoffs (`Debt.Created <= as_of`, sales before the as-of Kyiv midnight), `limit_utilization`, the v4 payment ledger (`app/risk/payment_behaviour.py`, still dated by `Sale.Created` and UTC debt days), the settled-documents count of the discipline donut (`total_sales_count`, non-deleted sale documents by `Sale.Created`) and the default model version. The `/charts` build no longer issues the `open_unpaid_stats` read: no served number depended on it. The legacy five-factor engine (`app/services/solvency/score.py`) and the reads only it used (`retail_payment_status_counts`, `credit_limit_utilization`, `client_flags`) were removed on 2026-11-13: nothing in `app/` or `scripts/` imported them. The reads `payment_status_counts`, `open_unpaid_stats`, `total_sales_count`, `activity_stats` and `return_qty_rate` have no caller on the serving path either and are kept only because the source-guard and date-basis tests pin them.
+
+The cache namespace is `response-v7`.

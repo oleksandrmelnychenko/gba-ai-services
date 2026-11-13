@@ -8,12 +8,12 @@
   "observed_unique_positive_clients": 0,
   "observed_positive_rows": 0,
   "observed_atrisk_rows": 1073,
-  "dataset_sha256": "f807fb2c0cf2de2e2f50da54ff7b981022db3ed6707b8d3b547307815d70e432",
+  "dataset_sha256": "e1cf811aa2e07aa2ef6b812bb8e217dfc8119413f952afdf9a5d2b756738ca05",
   "dataset_lineage": {
     "lineage_schema_version": 1,
     "dataset_role": "forward_6m_training",
     "builder": "scripts/build_vintages.py",
-    "built_at": "2026-10-19T00:38:11+00:00",
+    "built_at": "2026-11-09T01:40:20+00:00",
     "source_history_start": "2025-01-01",
     "transactional_history_policy": "clamped_to_source_history_start",
     "current_state_exceptions": [
@@ -79,12 +79,12 @@
         "history_complete": false
       }
     ],
-    "rows": 26208,
+    "rows": 26264,
     "positives": 0,
-    "unique_clients": 3276,
+    "unique_clients": 3283,
     "unique_positive_clients": 0,
     "target_column": "forward_default",
-    "parquet_sha256": "f807fb2c0cf2de2e2f50da54ff7b981022db3ed6707b8d3b547307815d70e432"
+    "parquet_sha256": "e1cf811aa2e07aa2ef6b812bb8e217dfc8119413f952afdf9a5d2b756738ca05"
   },
-  "evaluated_at": "2026-10-19T00:38:40+00:00"
+  "evaluated_at": "2026-11-09T01:40:49+00:00"
 }

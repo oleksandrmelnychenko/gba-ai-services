@@ -24,7 +24,7 @@ from app.core.metrics import METRICS
 log = get_logger("cache")
 
 _RETRY_COOLDOWN_S = 30.0
-_RESPONSE_CONTRACT = "response-v5"
+_RESPONSE_CONTRACT = "response-v8"
 _client: redis.Redis | None = None
 _unavailable_until = 0.0
 
@@ -94,6 +94,33 @@ def get(key: str) -> dict[str, Any] | None:
         return None
 
 
+def get_many(keys: list[str]) -> list[dict[str, Any] | None]:
+    """One MGET for a key list; positions match `keys`, a miss or undecodable entry is None."""
+    if not keys:
+        return []
+    client = _get_client()
+    if client is None:
+        return [None] * len(keys)
+    try:
+        raws = client.mget(keys)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("cache_get_failed", error=str(exc))
+        return [None] * len(keys)
+    values: list[dict[str, Any] | None] = []
+    for key, raw in zip(keys, raws, strict=True):
+        if raw is None:
+            METRICS.record_cache(hit=False)
+            values.append(None)
+            continue
+        METRICS.record_cache(hit=True)
+        try:
+            values.append(json.loads(raw))
+        except json.JSONDecodeError as exc:
+            log.warning("cache_decode_failed", key=key, error=str(exc))
+            values.append(None)
+    return values
+
+
 def set(key: str, value: dict[str, Any], ttl: int | None = None) -> None:
     client = _get_client()
     if client is None:
@@ -101,6 +128,23 @@ def set(key: str, value: dict[str, Any], ttl: int | None = None) -> None:
     ttl = ttl or get_settings().cache_ttl
     try:
         client.setex(key, ttl, json.dumps(value, default=str))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("cache_set_failed", error=str(exc))
+
+
+def set_many(items: dict[str, dict[str, Any]], ttl: int | None = None) -> None:
+    """Pipeline SETEX for many entries in one round trip."""
+    if not items:
+        return
+    client = _get_client()
+    if client is None:
+        return
+    ttl = ttl or get_settings().cache_ttl
+    try:
+        pipe = client.pipeline(transaction=False)
+        for key, value in items.items():
+            pipe.setex(key, ttl, json.dumps(value, default=str))
+        pipe.execute()
     except Exception as exc:  # noqa: BLE001
         log.warning("cache_set_failed", error=str(exc))
 

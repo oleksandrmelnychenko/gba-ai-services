@@ -42,10 +42,11 @@ empty. Shared environments should fail startup if the internal key is missing.
 and the canonical non-synthetic `OrderItem` sales source exists, has valid rows in the history
 window, and its newest sale is within `SOURCE_MAX_AGE_HOURS`.
 
-`FORECAST_METHOD=auto` selects the method per demand segment: smooth series use EWMA, erratic
-series use the window mean, intermittent/lumpy series use SBA, and no-demand series stay on the
-safe moving average. `MIN_HISTORY_MONTHS=3` suppresses forecasts for keys with fewer than three
-non-zero history months.
+`FORECAST_METHOD=auto` selects the method per scope and demand class: regular series and all
+client+product pairs use an EWMA level, sporadic (intermittent, lumpy) clients and products use
+TSB. The horizon is a flat run-rate (`meta.horizon_shape = "flat_run_rate"`); every point carries
+an 80% range. `MIN_HISTORY_MONTHS=3` suppresses forecasts for keys with fewer than three non-zero
+history months. Evidence: `docs/statistical-review-2026-11-12.md`.
 
 `SOURCE_HISTORY_START_DATE` is the factual lower boundary shared by SQL reads, dense model
 series, backtests, source fingerprints, and cache keys. A requested `HISTORY_MONTHS` window is

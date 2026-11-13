@@ -10,10 +10,23 @@ from typing import Any
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import InterfaceError, OperationalError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from app.core.config import get_settings
 
 _engine: Engine | None = None
+
+SOURCE_UNAVAILABLE = (OperationalError, InterfaceError, PoolTimeoutError)
+_TIMEOUT_MARKERS = ("timed out", "timeout", "20003")
+
+
+def unavailable_reason(exc: BaseException) -> str:
+    """Why the sales database could not answer: it was too slow, or it was not reachable."""
+    text_ = str(exc).lower()
+    if isinstance(exc, PoolTimeoutError) or any(marker in text_ for marker in _TIMEOUT_MARKERS):
+        return "database_timeout"
+    return "database_unavailable"
 
 
 def get_engine() -> Engine:

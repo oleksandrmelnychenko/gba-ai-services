@@ -41,6 +41,32 @@ def test_cover_bucket_edges():
     assert policy._cover_bucket(99999.0) == "90+"
 
 
+def test_cover_bucket_separates_products_without_stock():
+    assert policy._cover_bucket(0, position=0) == "немає залишку"
+    assert policy._cover_bucket(0, position=-3) == "немає залишку"
+    assert policy._cover_bucket(99999.0, position=0) == "немає залишку"
+    assert policy._cover_bucket(0, position=0.4) == "0-7"
+    assert policy._cover_bucket(5, position=5) == "0-7"
+
+
+def test_cover_histogram_counts_stock_outs_in_their_own_bucket(monkeypatch):
+    items = [
+        _sug(1, 9.0, Urgency.CRITICAL, 0.0, on_hand=0),
+        _sug(2, 9.0, Urgency.CRITICAL, 0.0, on_hand=0),
+        _sug(3, 4.0, Urgency.HIGH, 3.0, on_hand=3),
+        _sug(4, 0.0, Urgency.NONE, 99999.0, on_hand=0, mean_daily=0.0),
+    ]
+    monkeypatch.setattr(policy, "build_plan",
+                        lambda pid, as_of, only_needed=True, **kwargs: _plan(items))
+    monkeypatch.setattr(policy.repo, "product_daily_demand_bulk", lambda ids, as_of, days: {})
+
+    charts = policy.build_charts(367, "2026-06-15", top_n=15)
+
+    hist = {b.bucket: b.count for b in charts.days_of_cover_hist}
+    assert hist == {"немає залишку": 3, "<0": 0, "0-7": 1, "8-30": 0, "31-90": 0, "90+": 0}
+    assert sum(hist.values()) == len(items)
+
+
 def test_next_month_wraps_december():
     from datetime import date
     assert policy._next_month(date(2026, 6, 15)).isoformat() == "2026-07-01"
@@ -77,10 +103,10 @@ def test_build_charts_producer_uses_full_distribution(monkeypatch):
     assert {b.urgency: b.count for b in charts.urgency_mix} == {
         Urgency.CRITICAL: 1, Urgency.HIGH: 1, Urgency.NORMAL: 1, Urgency.NONE: 1}
 
-    # cover hist: 5 fixed buckets, every one present
-    assert [b.bucket for b in charts.days_of_cover_hist] == ["<0", "0-7", "8-30", "31-90", "90+"]
+    assert [b.bucket for b in charts.days_of_cover_hist] == [
+        "немає залишку", "<0", "0-7", "8-30", "31-90", "90+"]
     hist = {b.bucket: b.count for b in charts.days_of_cover_hist}
-    assert hist == {"<0": 0, "0-7": 2, "8-30": 0, "31-90": 1, "90+": 1}
+    assert hist == {"немає залишку": 1, "<0": 0, "0-7": 1, "8-30": 0, "31-90": 1, "90+": 1}
 
     # top_items: urgency then suggested_qty; carries on_hand + reorder_point
     assert [t.product_id for t in charts.top_items] == [1, 2, 4, 3]

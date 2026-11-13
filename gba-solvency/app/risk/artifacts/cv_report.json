@@ -1,15 +1,15 @@
 {
   "source_history_start": "2025-01-01",
   "dataset": {
-    "rows": 3300,
+    "rows": 3307,
     "positives": 25,
-    "prevalence": 0.007575757575757576
+    "prevalence": 0.0075597218022376775
   },
   "dataset_lineage": {
     "lineage_schema_version": 1,
     "dataset_role": "current_state_training",
     "builder": "scripts/build_risk_dataset.py",
-    "built_at": "2026-10-19T00:38:00+00:00",
+    "built_at": "2026-11-09T01:40:06+00:00",
     "source_history_start": "2025-01-01",
     "transactional_history_policy": "clamped_to_source_history_start",
     "current_state_exceptions": [
@@ -19,19 +19,19 @@
     "window_months": 12,
     "date_coverage": [
       {
-        "feature_date": "2026-07-21",
-        "label_date": "2026-10-19",
-        "requested_start": "2025-07-21",
-        "effective_start": "2025-07-21",
+        "feature_date": "2026-08-11",
+        "label_date": "2026-11-09",
+        "requested_start": "2025-08-11",
+        "effective_start": "2025-08-11",
         "history_complete": true
       }
     ],
-    "rows": 3300,
+    "rows": 3307,
     "positives": 25,
-    "unique_clients": 3300,
+    "unique_clients": 3307,
     "unique_positive_clients": 25,
     "target_column": "label_sev180",
-    "parquet_sha256": "248ad8bfa154998638b3adeaf7be204721d211614328f68a6acc85974f3e2f39"
+    "parquet_sha256": "dfb89fb2ed4264afd8e77ca614cbd01bd1c03625c19c88b03cd862a7341e826f"
   },
   "primary_features": [
     "overdue_eur_91_180",
@@ -64,23 +64,23 @@
     "tiers": {
       "non_debt_table_only": {
         "n_features": 9,
-        "auc_mean": 0.6435,
-        "ks_mean": 0.4431
+        "auc_mean": 0.7608,
+        "ks_mean": 0.6467
       },
       "leading_no_aging_buckets": {
         "n_features": 12,
-        "auc_mean": 0.6435,
-        "ks_mean": 0.4427
+        "auc_mean": 0.7608,
+        "ks_mean": 0.6467
       },
       "primary_full": {
         "n_features": 20,
-        "auc_mean": 0.9996,
-        "ks_mean": 0.9994
+        "auc_mean": 0.9998,
+        "ks_mean": 1.0
       },
       "with_tautological": {
         "n_features": 22,
-        "auc_mean": 0.9797,
-        "ks_mean": 0.9594
+        "auc_mean": 0.9798,
+        "ks_mean": 0.9597
       }
     },
     "groups": {
@@ -114,77 +114,77 @@
   },
   "cv": {
     "woe_scorecard_primary": {
-      "auc_mean": 0.9804885496183207,
-      "auc_std": 0.006721303604886354,
+      "auc_mean": 0.982691094034228,
+      "auc_std": 0.012405871122865494,
       "auc_folds": [
-        0.9698,
-        0.9803,
-        0.991,
-        0.9812,
-        0.9802
+        0.9843,
+        0.9889,
+        0.9855,
+        0.9956,
+        0.9591
       ],
-      "ks_mean": 0.9572519083969466,
-      "gini_mean": 0.9609770992366413,
-      "brier_mean": 0.042446210728993475,
-      "oof_auc": 0.9772519083969466
+      "ks_mean": 0.966484296692282,
+      "gini_mean": 0.9653821880684561,
+      "brier_mean": 0.04120184785065831,
+      "oof_auc": 0.9785618525289458
     },
     "woe_scorecard_with_tautological": {
-      "auc_mean": 0.9528549618320611,
-      "auc_std": 0.062429002387841145,
+      "auc_mean": 0.9550377733229387,
+      "auc_std": 0.06748226854042905,
       "auc_folds": [
-        0.8284,
-        0.9805,
-        0.9936,
-        0.9817,
-        0.9802
+        0.9858,
+        0.9903,
+        0.988,
+        0.991,
+        0.8201
       ],
-      "ks_mean": 0.9306870229007634,
-      "gini_mean": 0.9057099236641222,
-      "brier_mean": 0.04007336320243465,
-      "oof_auc": 0.9471877862595419
+      "ks_mean": 0.9292240227196793,
+      "gini_mean": 0.9100755466458774,
+      "brier_mean": 0.03780563393037445,
+      "oof_auc": 0.9474162096282753
     },
     "gbm_primary": {
-      "auc_mean": 0.9996335877862595,
-      "auc_std": 0.0004590319504846705,
+      "auc_mean": 0.9997868173887218,
+      "auc_std": 0.0002982920644870836,
       "auc_folds": [
-        0.9989,
         1.0,
+        0.9992,
+        0.9997,
         1.0,
-        1.0,
-        0.9992
+        1.0
       ],
-      "ks_mean": 0.9993893129770992,
-      "gini_mean": 0.9992671755725191,
-      "brier_mean": 0.0006059733907741061,
-      "oof_auc": 0.9994992366412213
+      "ks_mean": 1.0,
+      "gini_mean": 0.9995736347774435,
+      "brier_mean": 0.0009057397420909917,
+      "oof_auc": 0.9997135892748324
     },
     "gbm_with_tautological": {
-      "auc_mean": 0.9796946564885497,
-      "auc_std": 0.04023009399289291,
+      "auc_mean": 0.9797868173887219,
+      "auc_std": 0.0398943814804116,
       "auc_folds": [
-        0.8992,
         1.0,
+        0.9992,
+        0.9997,
         1.0,
-        1.0,
-        0.9992
+        0.9
       ],
-      "ks_mean": 0.9593893129770992,
-      "gini_mean": 0.9593893129770994,
-      "brier_mean": 0.0009091257102545169,
-      "oof_auc": 0.9898015267175573
+      "ks_mean": 0.9596951219512195,
+      "gini_mean": 0.9595736347774437,
+      "brier_mean": 0.0011806668560527915,
+      "oof_auc": 0.9861486898232784
     },
-    "ablation_auc_delta_woe": -0.0276,
-    "ablation_auc_delta_gbm": -0.0199
+    "ablation_auc_delta_woe": -0.0277,
+    "ablation_auc_delta_gbm": -0.02
   },
   "production_gate": {
     "gate": "current_state_production_v1",
     "passed": true,
     "minimum_rows": 1000,
-    "observed_rows": 3300,
+    "observed_rows": 3307,
     "minimum_positives": 20,
     "observed_positives": 25,
     "minimum_oof_auc": 0.9,
-    "oof_auc": 0.9772519083969466,
+    "oof_auc": 0.9785618525289458,
     "folds": 5,
     "sev180_policy_passed": true,
     "sev180_policy_rows": 24
@@ -200,34 +200,34 @@
     "realized": [
       {
         "band": "A",
-        "n": 3128,
+        "n": 3110,
         "realized_pd": 0.0,
-        "mean_score": 99.25020184837399,
-        "min_score": 78.72424987654242,
+        "mean_score": 99.42831679729008,
+        "min_score": 81.38135133499199,
         "max_score": 100.0
       },
       {
         "band": "B",
-        "n": 37,
-        "realized_pd": 0.02702702702702703,
-        "mean_score": 75.40486943109619,
-        "min_score": 73.54183672600308,
-        "max_score": 75.5113284428158
+        "n": 54,
+        "realized_pd": 0.0,
+        "mean_score": 77.65858885385715,
+        "min_score": 73.47330053400202,
+        "max_score": 78.04404418352709
       },
       {
         "band": "C",
-        "n": 67,
-        "realized_pd": 0.0,
-        "mean_score": 67.01451194495472,
-        "min_score": 63.61283719326508,
-        "max_score": 70.2105139822443
+        "n": 74,
+        "realized_pd": 0.013513513513513514,
+        "mean_score": 67.25806017978817,
+        "min_score": 63.578870642079266,
+        "max_score": 70.67309496995819
       },
       {
         "band": "D",
-        "n": 68,
-        "realized_pd": 0.35294117647058826,
-        "mean_score": 58.20767414303323,
-        "min_score": 56.29252141023622,
+        "n": 69,
+        "realized_pd": 0.34782608695652173,
+        "mean_score": 58.31638504851397,
+        "min_score": 56.412502414610174,
         "max_score": 61.96158711389381
       }
     ]
@@ -235,15 +235,15 @@
   "training_lineage": {
     "lineage_schema_version": 1,
     "artifact_role": "current_state_scorecard",
-    "training_run_id": "current-20261019T003838+0000-248ad8bfa154",
-    "trained_at": "2026-10-19T00:38:38+00:00",
+    "training_run_id": "current-20261109T014047+0000-dfb89fb2ed42",
+    "trained_at": "2026-11-09T01:40:47+00:00",
     "source_history_start": "2025-01-01",
     "training_code": "scripts/train_current_state.py",
     "dataset": {
       "lineage_schema_version": 1,
       "dataset_role": "current_state_training",
       "builder": "scripts/build_risk_dataset.py",
-      "built_at": "2026-10-19T00:38:00+00:00",
+      "built_at": "2026-11-09T01:40:06+00:00",
       "source_history_start": "2025-01-01",
       "transactional_history_policy": "clamped_to_source_history_start",
       "current_state_exceptions": [
@@ -253,34 +253,34 @@
       "window_months": 12,
       "date_coverage": [
         {
-          "feature_date": "2026-07-21",
-          "label_date": "2026-10-19",
-          "requested_start": "2025-07-21",
-          "effective_start": "2025-07-21",
+          "feature_date": "2026-08-11",
+          "label_date": "2026-11-09",
+          "requested_start": "2025-08-11",
+          "effective_start": "2025-08-11",
           "history_complete": true
         }
       ],
-      "rows": 3300,
+      "rows": 3307,
       "positives": 25,
-      "unique_clients": 3300,
+      "unique_clients": 3307,
       "unique_positive_clients": 25,
       "target_column": "label_sev180",
-      "parquet_sha256": "248ad8bfa154998638b3adeaf7be204721d211614328f68a6acc85974f3e2f39"
+      "parquet_sha256": "dfb89fb2ed4264afd8e77ca614cbd01bd1c03625c19c88b03cd862a7341e826f"
     },
     "validation": {
       "gate": "current_state_production_v1",
       "passed": true,
       "minimum_rows": 1000,
-      "observed_rows": 3300,
+      "observed_rows": 3307,
       "minimum_positives": 20,
       "observed_positives": 25,
       "minimum_oof_auc": 0.9,
-      "oof_auc": 0.9772519083969466,
+      "oof_auc": 0.9785618525289458,
       "folds": 5,
       "sev180_policy_passed": true,
       "sev180_policy_rows": 24
     },
-    "model_payload_sha256": "1140c63df9672d546a9f1e6def0ab6a4c8b3881607fcf46511cfaad13df9d748"
+    "model_payload_sha256": "f5353013beb0d3d68db223aba8ced3b7c1b5040eba99eda2e2c8e20ef9d36557"
   },
   "calibration_plot": "/root/projects/gba-solvency/app/risk/artifacts/calibration_current.png"
 }

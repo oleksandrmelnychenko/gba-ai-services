@@ -19,7 +19,7 @@ from app.core.metrics import METRICS
 
 log = get_logger("cache")
 
-_VER = "v3-closed-months"
+_VER = "v7-placeholder-returns"
 _client: redis.Redis | None = None
 _unavailable = False
 _last_failure_at = 0.0

@@ -88,8 +88,9 @@ def test_watchdog_repairs_missing_daily_generation(monkeypatch):
 
     result = scheduler._cache_watchdog_job(as_of="2026-06-15")
 
-    assert [name for name, _ in calls] == ["cart", "charts", "producers"]
-    assert calls[2][1]["skip_existing"] is True
+    assert [name for name, _ in calls] == ["producers"]
+    assert calls[0][1]["skip_existing"] is True
+    assert calls[0][1]["warm_cart_key"] is True
     assert result["as_of"] == "2026-06-15"
 
 
@@ -121,14 +122,16 @@ def test_watchdog_keeps_valid_generation_and_only_resumes_producers(monkeypatch)
         "warm_charts",
         lambda **kwargs: (_ for _ in ()).throw(AssertionError("valid charts must not be rebuilt")),
     )
+    runs = []
     monkeypatch.setattr(
         worker,
         "run",
-        lambda **kwargs: {"ok": 0, "failed": 0, "skipped": 769},
+        lambda **kwargs: runs.append(kwargs) or {"ok": 0, "failed": 0, "skipped": 769},
     )
 
     result = scheduler._cache_watchdog_job(as_of="2026-06-15")
 
+    assert runs[0]["warm_cart_key"] is False
     assert result["producers_warmed"] == 0
     assert result["producers_skipped"] == 769
 
@@ -151,24 +154,14 @@ def test_watchdog_rebuilds_old_source_epoch(monkeypatch):
     monkeypatch.setattr(scheduler.cache, "get", payloads.get)
     deleted = []
     monkeypatch.setattr(scheduler.cache, "delete", deleted.append)
-    warmed = []
-    monkeypatch.setattr(
-        worker,
-        "warm_cart",
-        lambda **kwargs: warmed.append("cart"),
-    )
-    monkeypatch.setattr(
-        worker,
-        "warm_charts",
-        lambda **kwargs: warmed.append("charts"),
-    )
+    runs = []
     monkeypatch.setattr(
         worker,
         "run",
-        lambda **kwargs: {"ok": 0, "failed": 0, "skipped": 769},
+        lambda **kwargs: runs.append(kwargs) or {"ok": 0, "failed": 0, "skipped": 769},
     )
 
     scheduler._cache_watchdog_job(as_of="2026-06-15")
 
-    assert warmed == ["cart", "charts"]
-    assert set(deleted) == set(payloads)
+    assert [(run["warm_cart_key"], run["skip_existing"]) for run in runs] == [(True, True)]
+    assert deleted == []
