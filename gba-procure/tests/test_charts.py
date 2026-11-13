@@ -226,3 +226,19 @@ def test_legacy_chart_enrichment_is_read_only_and_rejects_mixed_plan(monkeypatch
     assert policy.enrich_captured_charts(legacy, plan.model_copy(update={"as_of_date": "2026-10-21"})).population is None
     mismatched = plan.model_copy(update={"items": [items[0], items[1].model_copy(update={"suggested_qty": 8})]})
     assert policy.enrich_captured_charts(legacy, mismatched).population is None
+
+
+def test_top_items_carry_the_plan_line_measure_unit(monkeypatch):
+    items = [
+        _sug(1, 5.0, Urgency.HIGH, 2.0).model_copy(update={"measure_unit": "шт"}),
+        _sug(2, 7.0, Urgency.CRITICAL, 1.0),
+    ]
+    plan = _plan(items).model_copy(update={"as_of_date": "2026-10-22"})
+    monkeypatch.setattr(policy.repo, "product_daily_demand_bulk", lambda *a: {})
+    charts = policy.build_charts(99, "2026-10-22", top_n=5, plan_input=plan)
+    units = {row.product_id: row.measure_unit for row in charts.top_items}
+    assert units == {1: "шт", 2: None}
+    legacy = charts.model_dump(mode="json")
+    for row in legacy["top_items"]:
+        row.pop("measure_unit")
+    assert all(row.measure_unit is None for row in policy.PlanCharts.model_validate(legacy).top_items)

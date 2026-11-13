@@ -133,3 +133,44 @@ def test_limit_respected(client):
     resp = client.get("/head/escalated", params={"manager_net_uid": HEAD_UID, "limit": 2})
     body = resp.json()
     assert body["count"] == 2
+
+
+def test_escalation_follows_the_current_urgency(client):
+    from app.data import mongo
+    from app.services import lifecycle
+    stale = _seed("k|debt|aged", urgency=Urgency.HIGH, escalated_to=99)
+    kept = _seed("k|debt|fresh", urgency=Urgency.HIGH, escalated_to=99)
+    mongo.tasks().update_many({}, {"$set": {"sla_breached": True}})
+    mongo.tasks().update_one({"task_key": stale}, {"$set": {"urgency": Urgency.LOW.value}})
+
+    body = client.get("/head/escalated", params={"manager_net_uid": HEAD_UID}).json()
+    assert [t["task_key"] for t in body["tasks"]] == [kept]
+    assert body["count"] == 1
+    assert lifecycle.escalated_count() == 1
+    assert {t["urgency"] for t in body["tasks"]} <= {"critical", "high"}
+
+
+@pytest.mark.parametrize("urgency", [Urgency.NORMAL, Urgency.LOW])
+def test_refresh_below_high_releases_the_escalation(client, urgency):
+    from app.data import mongo
+    from app.services import lifecycle
+    key = _seed("k|debt|downgraded", urgency=Urgency.HIGH, escalated_to=99)
+    mongo.tasks().update_one({"task_key": key}, {"$set": {"sla_breached": True}})
+
+    _seed(key, urgency=urgency)
+
+    doc = mongo.tasks().find_one({"task_key": key})
+    assert doc["urgency"] == urgency.value
+    assert doc["escalated_to"] is None
+    assert lifecycle.escalated_count() == 0
+
+    _seed(key, urgency=Urgency.HIGH)
+    assert lifecycle.sweep_sla(escalate_to=99)["escalated"] == 1
+    assert mongo.tasks().find_one({"task_key": key})["escalated_to"] == 99
+
+
+def test_refresh_at_high_keeps_the_escalation(client):
+    from app.data import mongo
+    key = _seed("k|debt|still_high", urgency=Urgency.CRITICAL, escalated_to=99)
+    _seed(key, urgency=Urgency.HIGH)
+    assert mongo.tasks().find_one({"task_key": key})["escalated_to"] == 99

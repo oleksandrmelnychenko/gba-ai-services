@@ -264,6 +264,8 @@ def upsert_generated(task: Task) -> str:
         # refresh computed fields only; keep status/notes/history/snooze/outcome
         changed = any(existing.get(field) != value for field, value in computed.items()
                       if field not in ("updated_at", "expires_at"))
+        if existing.get("escalated_to") is not None and task.urgency.value not in _ESCALATION_URGENCIES:
+            computed["escalated_to"] = None
         refreshed = mongo.tasks().update_one(
             {"task_key": task.task_key, "manager_id": task.manager_id,
              "status": {"$in": [status.value for status in ACTIVE]}}, {"$set": computed})
@@ -486,6 +488,17 @@ def wake_snoozed() -> int:
     return res.modified_count
 
 
+_ESCALATION_URGENCIES = (Urgency.CRITICAL.value, Urgency.HIGH.value)
+
+
+def _escalated_query() -> dict:
+    return {
+        "status": {"$in": list(s.value for s in ACTIVE)},
+        "escalated_to": {"$ne": None, "$exists": True},
+        "urgency": {"$in": list(_ESCALATION_URGENCIES)},
+    }
+
+
 def sweep_sla(escalate_to: int | None = None) -> dict:
     """Flag overdue active tasks as SLA-breached; when escalate_to (the head's User.ID) is given,
     escalate high/critical breached tasks to them by setting escalated_to (surfaced to the head)."""
@@ -500,7 +513,7 @@ def sweep_sla(escalate_to: int | None = None) -> dict:
     if escalate_to is not None:
         escalated = mongo.tasks().update_many(
             {"status": {"$in": active_values}, "sla_breached": True,
-             "urgency": {"$in": [Urgency.CRITICAL.value, Urgency.HIGH.value]},
+             "urgency": {"$in": list(_ESCALATION_URGENCIES)},
              "$and": [
                  {"$or": [{"escalated_to": None}, {"escalated_to": {"$exists": False}}]},
                  {"$or": not_future_snoozed},
@@ -680,12 +693,8 @@ def escalated_tasks(limit: int = 100) -> list[dict]:
     """Active tasks escalated to the head (escalated_to set) — the head's escalation queue.
     Ordered by the same urgency band -> EV score -> business tier tie-breaker policy as the manager
     inbox."""
-    query = {
-        "status": {"$in": list(s.value for s in ACTIVE)},
-        "escalated_to": {"$ne": None, "$exists": True},
-    }
     backfill_active_ranking_fields()
-    docs = list(mongo.tasks().find(query))
+    docs = list(mongo.tasks().find(_escalated_query()))
     _hydrate_ranking_fields(docs, persist=False)
     docs.sort(key=_inbox_sort_key)
     return docs[:max(0, limit)]
@@ -793,9 +802,7 @@ def active_count(manager_id: int, exclude_manual: bool = False) -> int:
 def escalated_count() -> int:
     """Count of active tasks escalated to a head (the head escalation queue size), unbounded —
     the head dashboard reports the true total, not a page cap."""
-    return mongo.tasks().count_documents(
-        {"status": {"$in": list(s.value for s in ACTIVE)},
-         "escalated_to": {"$ne": None, "$exists": True}})
+    return mongo.tasks().count_documents(_escalated_query())
 
 
 def dismissal_stats(window_days: int = 30, manager_ids: list[int] | None = None) -> dict:

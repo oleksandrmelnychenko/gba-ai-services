@@ -309,6 +309,7 @@ class TopItem(BaseModel):
     producer_id: int | None = None
     producer_name: str | None = None
     suggested_qty: float
+    measure_unit: str | None = None
     on_hand: float
     reorder_point: float
     urgency: Urgency

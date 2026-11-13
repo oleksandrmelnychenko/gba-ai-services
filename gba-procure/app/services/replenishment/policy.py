@@ -1103,6 +1103,7 @@ def build_charts(
             producer_id=it.producer_id,
             producer_name=it.producer_name,
             suggested_qty=it.suggested_qty,
+            measure_unit=it.measure_unit,
             on_hand=it.inventory.on_hand,
             reorder_point=it.reorder_point,
             urgency=it.urgency,
