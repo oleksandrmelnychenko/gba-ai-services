@@ -53,7 +53,10 @@ def test_unknown_product_is_404_on_profile_and_analytics(monkeypatch):
     for path in ("/product/987654321", "/product/987654321/analytics"):
         response = client.get(path, headers=_headers)
         assert response.status_code == 404
-        assert response.json() == {"detail": "product_not_found"}
+        detail = response.json()["detail"]
+        assert detail["error"] == detail["code"] == "product_not_found"
+        assert detail["product_id"] == 987654321
+        assert detail["reason"].startswith("Товар не знайдено")
 
 
 def test_catalog_product_without_signals_stays_200_found_false(monkeypatch):
@@ -78,3 +81,34 @@ def test_memoised_portfolio_is_validated_once_per_cache_key(monkeypatch):
     monkeypatch.setattr(main.cache, "refresh_generation", lambda: "daily-next")
     asyncio.run(main._portfolio(as_of))
     assert len(checks) == 2
+
+
+def _row(pid, abc, revenue, gross, units):
+    return {"product_id": pid, "band": "dead", "health": 1.0, "abc": abc, "xyz": "Z", "lifecycle": "dead",
+            "revenue_eur": revenue, "gross_revenue_eur": gross, "classification_units": units,
+            "financial_basis": {"revenue_eur": revenue}}
+
+
+def test_product_profile_discloses_stock_observation_and_abc_status(monkeypatch):
+    _stub(monkeypatch, [_row(5, "unknown", 0.0, 0.0, 0.0)], {5: {"product_id": 5, "name": "Idle"}})
+    body = client.get("/product/5", headers=_headers).json()
+    assert body["stock_as_of"] == main._today()
+    assert body["stock_basis"] == "current" and body["stock_matches_as_of"] is True
+    assert body["abc"] == "unknown"
+    assert body["abc_status"] == "no_sales" and body["abc_label"] == "Без продажів за період"
+
+
+def test_abc_status_separates_no_sales_from_returned_sales_and_keeps_classes(monkeypatch):
+    rows = [_row(1, "A", 10.0, 10.0, 2.0), _row(2, "unknown", 0.0, 0.0, 0.0), _row(3, "unknown", -4.0, 6.0, 1.0)]
+    _stub(monkeypatch, rows, {})
+    tasks = client.get("/assortment/health", params={"stocked_only": False}, headers=_headers).json()["tasks"]
+    assert {t["product_id"]: (t["abc"], t["abc_status"], t["abc_label"]) for t in tasks} == {
+        1: ("A", "classified", "A"),
+        2: ("unknown", "no_sales", "Без продажів за період"),
+        3: ("unknown", "non_positive_contribution", "Продажі перекриті поверненнями або коригуваннями"),
+    }
+    for value, expected in (("no_sales", [2]), ("unknown", [2, 3]), ("non_positive_contribution", [3]), ("a", [1])):
+        response = client.get("/assortment/health", params={"stocked_only": False, "abc": value}, headers=_headers)
+        assert sorted(t["product_id"] for t in response.json()["tasks"]) == expected
+    assert main._abc_overview(rows)["by_abc_status"] == {
+        "classified": 1, "no_sales": 1, "non_positive_contribution": 1}

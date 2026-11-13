@@ -591,7 +591,7 @@ _REGIONAL_SORTS = {"regional_revenue", "regional_units"}
 _PORTFOLIO_ROW_FIELDS = {"health", "demand_score", "margin_score", "action_label", "financial_basis", "net_revenue_eur"}
 _FILTER_VALUES = {
     "band": {b.value for b in InventoryBand} | {"unknown"},
-    "abc": {a.value for a in AbcClass} | {"unknown"},
+    "abc": {a.value for a in AbcClass} | {"unknown", "no_sales", "non_positive_contribution"},
     "xyz": {x.value for x in XyzClass} | {"unknown"},
     "lifecycle": {s.value for s in LifecycleStage} | {"unknown"},
 }
@@ -603,6 +603,45 @@ def _normalize_filter(field: str, value: str) -> str:
             return canon
     raise HTTPException(status_code=422,
                         detail={"error": f"unknown_{field}", "allowed": sorted(_FILTER_VALUES[field])})
+
+
+_ABC_UNCLASSIFIED_LABELS = {
+    "no_sales": "Без продажів за період",
+    "non_positive_contribution": "Продажі перекриті поверненнями або коригуваннями",
+}
+
+
+def _abc_status(row: dict) -> str:
+    if row.get("abc") != "unknown":
+        return "classified"
+    basis = row.get("financial_basis") or {}
+    amounts = [basis.get("revenue_eur", row.get("revenue_eur")), row.get("gross_revenue_eur"),
+               row.get("classification_units")]
+    if all(exact.decimal_value(value or 0, "ABC status amount", non_negative=False) == 0 for value in amounts):
+        return "no_sales"
+    return "non_positive_contribution"
+
+
+def _abc_fields(row: dict) -> dict:
+    status = _abc_status(row)
+    return {"abc_status": status, "abc_label": _ABC_UNCLASSIFIED_LABELS.get(status, row.get("abc"))}
+
+
+def _abc_overview(rows: list[dict]) -> dict:
+    tally: dict[str, int] = {}
+    for row in rows:
+        status = _abc_status(row)
+        tally[status] = tally.get(status, 0) + 1
+    return {"by_abc_status": tally, "abc_status_labels": dict(_ABC_UNCLASSIFIED_LABELS)}
+
+
+def _product_not_found(product_id: int) -> HTTPException:
+    return HTTPException(status_code=404, detail={
+        "error": "product_not_found",
+        "code": "product_not_found",
+        "reason": "Товар не знайдено в каталозі або він не має даних для аналітики асортименту.",
+        "product_id": product_id,
+    })
 
 
 def _portfolio_cache_compatible(build: dict) -> bool:
@@ -651,7 +690,7 @@ async def assortment_overview(as_of_date: date | None = None) -> dict:
             "model_version": build["model_version"],
             **_history_response_fields(build),
             "count": build["count"],
-            "overview": build["overview"],
+            "overview": {**build["overview"], **_abc_overview(build["rows"])},
         }
     except Exception as exc:  # noqa: BLE001
         METRICS.record_request((time.time() - started) * 1000, error=True)
@@ -685,7 +724,10 @@ async def assortment_health(as_of_date: date | None = None, band: str | None = N
         if stocked_only:
             rows = [r for r in rows if r["band"] != "order_to_demand"]
         for field, val in filters.items():
-            rows = [r for r in rows if r[field] == val]
+            if field == "abc" and val in _ABC_UNCLASSIFIED_LABELS:
+                rows = [r for r in rows if _abc_status(r) == val]
+            else:
+                rows = [r for r in rows if r[field] == val]
         win = None
         if region_id is not None:
             win = _region_window(region_window_days)
@@ -701,6 +743,7 @@ async def assortment_health(as_of_date: date | None = None, band: str | None = N
         keyfn, rev = _SORTS[resolved_sort]
         rows = sorted(rows, key=keyfn, reverse=rev)[:max(0, limit)]
         tasks = await asyncio.to_thread(_attach_meta, rows, as_of)
+        tasks = [{**task, **_abc_fields(task)} for task in tasks]
         METRICS.record_request((time.time() - started) * 1000)
         return {
             "as_of": as_of,
@@ -766,6 +809,7 @@ async def product_profile(
         return {
             "as_of": as_of,
             **_history_response_fields(build),
+            **history_policy.stock_observation(as_of),
             **snapshot,
         }
     except HTTPException:
@@ -783,7 +827,7 @@ def _product_snapshot(build: dict, product_id: int, as_of: str) -> dict:
     row = next((r for r in build["rows"] if int(r["product_id"]) == product_id), None)
     meta = sig.product_meta([product_id], as_of).get(product_id, {})
     if row is None and not meta:
-        raise HTTPException(status_code=404, detail="product_not_found")
+        raise _product_not_found(product_id)
     if meta and exact.positive_int(
         meta.get("product_id"),
         "product_meta.product_id",
@@ -792,6 +836,7 @@ def _product_snapshot(build: dict, product_id: int, as_of: str) -> dict:
     snapshot = {"product_id": product_id, "found": row is not None}
     if row is not None:
         snapshot.update(row)
+        snapshot.update(_abc_fields(row))
     snapshot.update(meta)
     snapshot["product_id"] = product_id
     return snapshot
