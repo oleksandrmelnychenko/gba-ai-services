@@ -99,7 +99,8 @@ def test_product_profile_discloses_stock_observation_and_abc_status(monkeypatch)
 
 
 def test_abc_status_separates_no_sales_from_returned_sales_and_keeps_classes(monkeypatch):
-    rows = [_row(1, "A", 10.0, 10.0, 2.0), _row(2, "unknown", 0.0, 0.0, 0.0), _row(3, "unknown", -4.0, 6.0, 1.0)]
+    rows = [_row(1, "A", 10.0, 10.0, 2.0), _row(2, "unknown", 0.0, 0.0, 0.0),
+            _row(3, "unknown", -4.0, 6.0, 1.0)]
     _stub(monkeypatch, rows, {})
     tasks = client.get("/assortment/health", params={"stocked_only": False}, headers=_headers).json()["tasks"]
     assert {t["product_id"]: (t["abc"], t["abc_status"], t["abc_label"]) for t in tasks} == {
@@ -107,8 +108,10 @@ def test_abc_status_separates_no_sales_from_returned_sales_and_keeps_classes(mon
         2: ("unknown", "no_sales", "Без продажів за період"),
         3: ("unknown", "non_positive_contribution", "Продажі перекриті поверненнями або коригуваннями"),
     }
-    for value, expected in (("no_sales", [2]), ("unknown", [2, 3]), ("non_positive_contribution", [3]), ("a", [1])):
-        response = client.get("/assortment/health", params={"stocked_only": False, "abc": value}, headers=_headers)
+    cases = (("no_sales", [2]), ("unknown", [2, 3]), ("non_positive_contribution", [3]), ("a", [1]))
+    for value, expected in cases:
+        response = client.get("/assortment/health", params={"stocked_only": False, "abc": value},
+                              headers=_headers)
         assert sorted(t["product_id"] for t in response.json()["tasks"]) == expected
     assert main._abc_overview(rows)["by_abc_status"] == {
         "classified": 1, "no_sales": 1, "non_positive_contribution": 1}

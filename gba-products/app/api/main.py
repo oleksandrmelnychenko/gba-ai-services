@@ -617,7 +617,7 @@ def _abc_status(row: dict) -> str:
     basis = row.get("financial_basis") or {}
     amounts = [basis.get("revenue_eur", row.get("revenue_eur")), row.get("gross_revenue_eur"),
                row.get("classification_units")]
-    if all(exact.decimal_value(value or 0, "ABC status amount", non_negative=False) == 0 for value in amounts):
+    if all(exact.decimal_value(value or 0, "ABC status amount") == 0 for value in amounts):
         return "no_sales"
     return "non_positive_contribution"
 
