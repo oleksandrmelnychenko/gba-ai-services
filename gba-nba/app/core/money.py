@@ -7,6 +7,7 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 CENT = Decimal("0.01")
 TENTH = Decimal("0.1")
 ZERO = Decimal("0")
+OPEN_DEBT_MIN = Decimal("0.5")
 
 
 def decimal_value(value: object | None) -> Decimal:
@@ -31,6 +32,12 @@ def cents_decimal(value: object | None) -> Decimal:
 def cents(value: object | None) -> float:
     """JSON-compatible number rounded with accounting ROUND_HALF_UP."""
     return float(cents_decimal(value))
+
+
+def is_open_debt(remaining: object | None) -> bool:
+    """A debt line is open when its remaining amount in the document currency is at least half
+    a currency unit; a smaller remainder is a settlement rounding residue, not debt."""
+    return decimal_value(remaining) >= OPEN_DEBT_MIN
 
 
 def tenths(value: object | None) -> float:

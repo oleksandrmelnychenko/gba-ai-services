@@ -4,8 +4,10 @@ A confirmed sale is the native sales reports' fact (NativeSalesNetReportProjecti
 and siblings): a non-deleted, invoiced Sale that is not an accounting carrier, with non-deleted
 valid lines of positive quantity, dated by its invoice instant (Sale.ChangedToInvoice, the
 server's Sale.EffectiveDate for an invoiced sale). An open debt line is the credit-control one
-(ClientCreditControlSnapshotRepository): non-deleted attachment and debt with a positive
-remaining amount; a settled line kept with Total = 0 is not debt.
+(ClientCreditControlSnapshotRepository): non-deleted attachment and debt with a remaining
+amount of at least OPEN_DEBT_MIN (half a unit of the agreement currency); a settled line kept
+with Total = 0 and a settlement rounding residue below that (0.01-0.14 on DEV) are not debt.
+gba-nba applies the same threshold (app.core.money.OPEN_DEBT_MIN).
 
 dbo.GetExchangedToEuroValue returns its input unchanged when a currency has no rate, so a debt
 line is read only through debt_agreement(): a currency the function leaves unchanged (or a
@@ -32,8 +34,15 @@ def confirmed_line(alias: str = "oi") -> str:
     return f"{alias}.Deleted = 0 AND {alias}.IsValidForCurrentSale = 1 AND {alias}.Qty > 0"
 
 
+OPEN_DEBT_MIN = "0.5"
+
+
+def open_debt_amount(debt: str = "d") -> str:
+    return f"{debt}.Total >= {OPEN_DEBT_MIN}"
+
+
 def open_debt(attachment: str = "cid", debt: str = "d") -> str:
-    return f"{attachment}.Deleted = 0 AND {debt}.Deleted = 0 AND {debt}.Total > 0"
+    return f"{attachment}.Deleted = 0 AND {debt}.Deleted = 0 AND {open_debt_amount(debt)}"
 
 
 def sold_at(alias: str = "s") -> str:

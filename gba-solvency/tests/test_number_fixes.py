@@ -102,7 +102,7 @@ def test_limit_basis_reads_positive_open_debt_in_the_limit_currency(capture):
                      "debt_amount": Decimal("387.19000000000000")}]
     rows = repo.limit_utilization_basis(631102, "2026-11-13")
     sql, params = capture.calls[0]
-    assert "cid.Deleted = 0 AND d.Deleted = 0 AND d.Total > 0" in sql
+    assert "cid.Deleted = 0 AND d.Deleted = 0 AND d.Total >= 0.5" in sql
     assert "da.ID = a.ID OR da.CurrencyID = a.CurrencyID" in sql
     assert "a.IsControlAmountDebt = 1 AND a.AmountDebt > 0" in sql
     assert "ca.Deleted = 0 AND a.Deleted = 0" in sql
@@ -154,7 +154,7 @@ def test_confirmed_sale_rule_matches_the_server_reference():
     assert source_rules.confirmed_line("x") == (
         "x.Deleted = 0 AND x.IsValidForCurrentSale = 1 AND x.Qty > 0"
     )
-    assert source_rules.open_debt() == "cid.Deleted = 0 AND d.Deleted = 0 AND d.Total > 0"
+    assert source_rules.open_debt() == "cid.Deleted = 0 AND d.Deleted = 0 AND d.Total >= 0.5"
 
 
 _SALE_READS = [
@@ -226,12 +226,12 @@ _DEBT_READS = [
 
 
 @pytest.mark.parametrize("read", _DEBT_READS)
-def test_settled_zero_amount_debt_lines_are_not_open_debt(capture, read):
+def test_settled_lines_and_rounding_residues_are_not_open_debt(capture, read):
     read()
     debt_queries = [sql for sql, _ in capture.calls if "dbo.ClientInDebt" in sql]
     assert debt_queries
     for sql in debt_queries:
-        assert "d.Deleted = 0 AND d.Total > 0" in sql, sql
+        assert "d.Deleted = 0 AND d.Total >= 0.5" in sql, sql
 
 
 def test_donut_slices_partition_the_window_sales(capture):
@@ -240,7 +240,7 @@ def test_donut_slices_partition_the_window_sales(capture):
                      "window_lines": 3, "lines": 9}]
     donut = repo.debt_exposure_donut_truth(1, "2026-11-13", 12, "2026-11-13")
     sales_sql, sales_params = capture.calls[0]
-    assert "d.Deleted = 0 AND d.Total > 0" in sales_sql
+    assert "d.Deleted = 0 AND d.Total >= 0.5" in sales_sql
     assert "cid.SaleID = s.ID" in sales_sql
     assert "s.ChangedToInvoice >= :window_start" in sales_sql
     assert "s.ChangedToInvoice < :window_end" in sales_sql

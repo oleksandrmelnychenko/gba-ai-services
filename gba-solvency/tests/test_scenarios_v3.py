@@ -259,7 +259,7 @@ def clean_cohort() -> list[int]:
               AND ca.ClientID NOT IN (
                   SELECT cid.ClientID FROM dbo.ClientInDebt cid
                   JOIN dbo.Debt d ON d.ID = cid.DebtID
-                  WHERE cid.Deleted = 0 AND d.Deleted = 0 AND d.Total > 0)
+                  WHERE cid.Deleted = 0 AND d.Deleted = 0 AND d.Total >= 0.5)
         GROUP BY ca.ClientID
         HAVING COUNT(DISTINCT s.ID) >= 10
         ORDER BY COUNT(DISTINCT s.ID) DESC

@@ -68,6 +68,15 @@ def test_paid_identified_debt_supersedes_with_evidence_and_keeps_notes_and_conta
     assert lifecycle.dashboard_counts(1, "2026-10-17")["manual_backlog"] == 1
 
 
+def test_a_rounding_residue_left_on_the_debt_settles_it(db, monkeypatch):
+    source = facts(monkeypatch, debts={"501": "12.50"})
+    rows, _ = persist(task(kind=TaskType.DEBT_FOLLOWUP))
+    source[10]["debts"]["501"] = "0.14"
+    _, stats = reconciliation.prepare(1, [], "2026-10-17")
+    assert stats["superseded"] == 1
+    assert db.tasks.find_one({"task_key": rows[0].task_key})["source_evidence"]["kind"] == "debt_settled"
+
+
 @pytest.mark.parametrize("current", [{}, {"other": "0"}])
 def test_missing_debt_is_not_paid_and_empty_generator_cannot_close(db, monkeypatch, current):
     source = facts(monkeypatch, debts={"501": "12.50"})

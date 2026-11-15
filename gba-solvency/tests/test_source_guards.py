@@ -132,3 +132,11 @@ def test_every_transaction_history_path_uses_the_shared_source_floor():
         )
         assert "2000-01-01" not in body, fn.__name__
         assert "1980-01-01" not in body, fn.__name__
+
+
+def test_a_rounding_residue_below_half_a_currency_unit_is_never_open_debt():
+    from app.data import source_rules
+    assert source_rules.open_debt() == "cid.Deleted = 0 AND d.Deleted = 0 AND d.Total >= 0.5"
+    sources = inspect.getsource(dataset) + inspect.getsource(repo)
+    assert "Total > 0" not in sources
+    assert dataset._OPEN_DEBT_AMOUNT == "d.Total >= 0.5"

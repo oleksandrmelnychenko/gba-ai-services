@@ -13,13 +13,17 @@ date is the only date there is and its uncertainty is hours against hundreds of 
 terms. It is counted as overdue on the stored date and reported separately as an opening
 balance. It never raises a follow-up task: it needs an accounting decision, not a call.
 An opening balance that the stored date and terms do not put past due stays unknown_date.
+
+A document is open while its remaining Debt.Total in the agreement currency is at least
+money.OPEN_DEBT_MIN (half a currency unit). Smaller remainders are settlement rounding
+residues (0.01-0.14 on DEV), not debt: they are neither overdue, aged nor a task reason.
 """
 from collections import defaultdict
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
-from app.core.money import cents, cents_decimal, decimal_value
+from app.core.money import OPEN_DEBT_MIN, cents, cents_decimal, decimal_value
 from app.data.db import query
 
 _KYIV = ZoneInfo('Europe/Kyiv')
@@ -64,7 +68,7 @@ LEFT JOIN (
               THEN 1 ELSE 0 END AS convertible
   FROM dbo.Currency probe WHERE probe.Deleted = 0
 ) fx ON fx.ID = currency.ID
-WHERE attachment.Deleted = 0 AND d.Total > 0 AND d.Created < :snapshot_end
+WHERE attachment.Deleted = 0 AND d.Total >= :open_debt_min AND d.Created < :snapshot_end
   AND {scope}
 """
 
@@ -79,7 +83,8 @@ def documents(as_of: str, manager_id: int | None = None) -> list[dict]:
     it leaves unchanged is reported with amount_eur NULL and never summed as EUR.
     """
     end = datetime.combine(date.fromisoformat(as_of) + timedelta(days=1), time.min)
-    params = {'snapshot_end': end.replace(tzinfo=None), 'fx_date': as_of, 'fx_probe': _FX_PROBE}
+    params = {'snapshot_end': end.replace(tzinfo=None), 'fx_date': as_of, 'fx_probe': _FX_PROBE,
+              'open_debt_min': OPEN_DEBT_MIN}
     scope = 'c.MainManagerID IS NOT NULL'
     if manager_id is not None:
         scope = 'c.MainManagerID = :manager_id'

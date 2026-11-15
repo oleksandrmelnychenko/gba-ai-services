@@ -8,10 +8,10 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from app.core.logging import get_logger
+from app.core.money import is_open_debt
 from app.data import mongo, reconciliation_repository
 from app.domain.models import ACTIVE, TaskType
 
@@ -20,7 +20,7 @@ _ACTIVE = [status.value for status in ACTIVE]
 
 
 def _positive(value) -> bool:
-    return Decimal(str(value)) > 0
+    return is_open_debt(value)
 
 
 def _products(task) -> list[str]:

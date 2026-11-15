@@ -44,6 +44,8 @@ def test_debt_followup_builds_task(monkeypatch):
     assert t.payload["debt"]["days_past_terms"] == 33
     assert t.urgency.value == "high"
     assert t.title == "Нагадати про оплату заборгованості"
+    assert t.reason == "Прострочка 12 дн понад умови, найдавніший документ 33 дн, борг 5000 EUR"
+    assert t.explanation.factors[0] == "прострочка 12 дн понад умови договору"
 
 
 def test_debt_followup_marks_old_debt_as_low_urgency(monkeypatch):
@@ -59,7 +61,11 @@ def test_debt_followup_marks_old_debt_as_low_urgency(monkeypatch):
     assert task.payload["debt"]["age_band"] == "old"
     assert task.payload["debt"]["lead_days_past_terms"] == 120
     assert task.title.startswith("Стара заборгованість")
-    assert task.reason.startswith("Стара заборгованість")
+    assert task.reason == "Стара заборгованість: 120 дн понад умови, найдавніший документ 370 дн, борг 900 EUR"
+
+
+def test_debt_reason_without_older_document():
+    assert debt_followup.debt_reason(10, 10, 248.25, False) == "Прострочка 10 дн понад умови, борг 248 EUR"
 
 
 def test_reorder_due_bundles_per_client(monkeypatch):

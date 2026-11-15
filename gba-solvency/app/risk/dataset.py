@@ -22,7 +22,8 @@ DATA TRAPS honored (verified):
     not an accounting carrier; lines OrderItem.Deleted=0, IsValidForCurrentSale=1, Qty>0.
     A sale is dated by its invoice instant (Sale.ChangedToInvoice, UTC); sale windows are
     complete Europe/Kyiv days [FD - window, FD) as UTC instants.
-  - Open debt lines need Debt.Total > 0; settled lines kept with Total = 0 are not debt.
+  - Open debt lines need Debt.Total >= OPEN_DEBT_MIN (source_rules); settled lines and rounding
+    residues are not debt.
   - Synthetic ProductID 25422404 («Ввід боргів з 1С») EXCLUDED from turnover/sales/RFM but
     KEPT in debt/exposure (real carried debt).
   - OrderItem.PricePerItem is ALREADY EUR (never wrap in FX).
@@ -52,11 +53,13 @@ from app.data.source_rules import (
     local_date,
     local_month,
     months_since,
+    open_debt_amount,
     sold_at,
 )
 from app.data.synthetic_product import synthetic_product_ids
 
 _SOLD_AT = sold_at()
+_OPEN_DEBT_AMOUNT = open_debt_amount()
 _RECENCY_DAYS = days_since(f"MAX({_SOLD_AT})", ":fd")
 _TENURE_MONTHS = months_since(f"MIN({_SOLD_AT})", ":fd")
 _DEBT_AGE_FD = days_since("d.Created", ":fd")
@@ -152,7 +155,7 @@ def _sev180_eur_by_client(as_of: str) -> dict[int, float]:
         {debt_agreement(":asof")}
         WHERE cid.Deleted = 0
               AND d.Deleted = 0
-              AND d.Total > 0
+              AND {_OPEN_DEBT_AMOUNT}
               AND d.Created <= :asof
               AND {_DEBT_AGE_ASOF} > a.NumberDaysDebt + 180
         GROUP BY cid.ClientID
@@ -183,7 +186,7 @@ def label_sev180_one(client_id: int, as_of: str) -> int:
         {debt_agreement(":asof")}
         WHERE cid.Deleted = 0
               AND d.Deleted = 0
-              AND d.Total > 0
+              AND {_OPEN_DEBT_AMOUNT}
               AND d.Created <= :asof
               AND cid.ClientID = :cid
               AND {_DEBT_AGE_ASOF} > a.NumberDaysDebt + 180
@@ -225,7 +228,7 @@ def feat_debt_aging(feature_date: str) -> pd.DataFrame:
             {debt_agreement(":fd")}
             WHERE cid.Deleted = 0
                   AND d.Deleted = 0
-                  AND d.Total > 0
+                  AND {_OPEN_DEBT_AMOUNT}
                   AND d.Created <= :fd
         ) t
         GROUP BY client_id
@@ -282,7 +285,7 @@ def feat_debt_trajectory(feature_date: str) -> pd.DataFrame:
         ) x
         WHERE cid.Deleted = 0
               AND d.Deleted = 0
-              AND d.Total > 0
+              AND {_OPEN_DEBT_AMOUNT}
               AND d.Created >= :history_start
               AND d.Created <= :fd
         GROUP BY cid.ClientID
@@ -622,7 +625,7 @@ def features_one(client_id: int, feature_date: str, window_months: int = 12) -> 
             {debt_agreement(":fd")}
             WHERE cid.Deleted = 0
                   AND d.Deleted = 0
-                  AND d.Total > 0
+                  AND {_OPEN_DEBT_AMOUNT}
                   AND cid.ClientID = :cid
                   AND d.Created <= :fd
         ) t
@@ -651,7 +654,7 @@ def features_one(client_id: int, feature_date: str, window_months: int = 12) -> 
             {debt_agreement(":fd")}
             WHERE cid.Deleted = 0
                   AND d.Deleted = 0
-                  AND d.Total > 0
+                  AND {_OPEN_DEBT_AMOUNT}
                   AND cid.ClientID = :cid
                   AND d.Created >= :history_start
                   AND d.Created <= :fd
@@ -890,7 +893,7 @@ def features_many(
             {debt_agreement(":fd")}
             WHERE cid.Deleted = 0
                   AND d.Deleted = 0
-                  AND d.Total > 0
+                  AND {_OPEN_DEBT_AMOUNT}
                   AND cid.ClientID IN {ph_cid}
                   AND d.Created <= :fd
         ) t
@@ -931,7 +934,7 @@ def features_many(
         ) x
         WHERE cid.Deleted = 0
               AND d.Deleted = 0
-              AND d.Total > 0
+              AND {_OPEN_DEBT_AMOUNT}
               AND cid.ClientID IN {ph_cid}
               AND d.Created >= :history_start
               AND d.Created <= :fd

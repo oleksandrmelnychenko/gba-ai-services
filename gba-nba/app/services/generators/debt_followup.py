@@ -16,6 +16,14 @@ from app.services import scoring
 TYPE = TaskType.DEBT_FOLLOWUP
 
 
+def debt_reason(lead_days: int, oldest_days: int, amount: float, old_debt: bool) -> str:
+    """The reason quotes the document that sets the urgency; an older one is named as such."""
+    lead = (f"Стара заборгованість: {lead_days} дн понад умови" if old_debt
+            else f"Прострочка {lead_days} дн понад умови")
+    oldest = f", найдавніший документ {oldest_days} дн" if oldest_days > lead_days else ""
+    return f"{lead}{oldest}, борг {amount:.0f} EUR"
+
+
 def generate(manager_id: int, as_of: str, window_tag: str) -> list[Task]:
     s = get_settings()
     rows = sig.debt_task_candidates(manager_id, as_of)
@@ -58,10 +66,7 @@ def generate(manager_id: int, as_of: str, window_tag: str) -> list[Task]:
             manager_id=manager_id, client_id=cid, client_name=name, task_type=TYPE,
             title=("Стара заборгованість: узгодити погашення" if old_debt
                    else "Нагадати про оплату заборгованості"),
-            reason=(f"Стара заборгованість: {days_past} дн понад умови, борг {amount:.0f} EUR"
-                    if old_debt else
-                    f"Прострочка {max_overdue} дн (на {days_past} дн понад умови), "
-                    f"борг {amount:.0f} EUR"),
+            reason=debt_reason(lead_days, days_past, amount, old_debt),
             priority=prio, p_outcome=p_out, expected_value=ev, ev_score=ev_score,
             urgency=scoring.urgency_band(u),
             payload={"debt": {"debt_ids": [int(value) for value in str(r.get("debt_ids") or "").split(",") if value],
@@ -76,7 +81,7 @@ def generate(manager_id: int, as_of: str, window_tag: str) -> list[Task]:
                      "order_count": cf.get("order_count", 0)},
             explanation=Explanation(
                 factors=[("стара заборгованість: " if old_debt else "")
-                         + f"прострочка {days_past} дн понад умови договору",
+                         + f"прострочка {lead_days} дн понад умови договору",
                          f"сума боргу {amount:.0f} EUR",
                          f"річний оборот {monetary:.0f} EUR"],
                 source_signal="debt", confidence=1.0),

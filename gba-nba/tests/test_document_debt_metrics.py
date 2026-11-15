@@ -237,3 +237,20 @@ def test_changed_invoice_definition_rejects_fresh_old_target_cache(monkeypatch):
     assert main._team_snapshot_cached(day) == new
     assert calls == [day]
     assert main._team_snap_state["metric_version"] == main._TEAM_METRIC_VERSION
+
+
+def test_a_rounding_residue_below_half_a_currency_unit_is_not_an_open_document(monkeypatch):
+    from app.core.money import OPEN_DEBT_MIN, is_open_debt
+    from app.data import debt_snapshot
+    seen = {}
+
+    def fake_query(sql, params):
+        seen['sql'], seen['params'] = sql, params
+        return []
+
+    monkeypatch.setattr(debt_snapshot, 'query', fake_query)
+    debt_snapshot.documents('2026-11-15')
+    assert 'd.Total >= :open_debt_min' in seen['sql'] and 'd.Total > 0' not in seen['sql']
+    assert seen['params']['open_debt_min'] == OPEN_DEBT_MIN == Decimal('0.5')
+    assert not is_open_debt(Decimal('0.14')) and not is_open_debt(Decimal('0.49'))
+    assert is_open_debt(Decimal('0.5')) and is_open_debt(Decimal('3013'))

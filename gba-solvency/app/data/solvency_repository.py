@@ -4,7 +4,7 @@ All SQL is parameterized (:name) — no f-string interpolation. Every query hono
 discovery data traps:
   (a) A sale is gba-server's confirmed sale (app.data.source_rules): Sale.Deleted=0, invoiced,
       not an accounting carrier; lines OrderItem.Deleted=0, IsValidForCurrentSale=1, Qty>0.
-      Open debt is a ClientInDebt/Debt pair, both Deleted=0, with Debt.Total > 0.
+      Open debt is a ClientInDebt/Debt pair, both Deleted=0, with Debt.Total >= OPEN_DEBT_MIN.
   (b) Synthetic 1С debt-entry line (ProductID 25422404) is EXCLUDED from turnover/activity
       but KEPT in debt/exposure (it is real carried debt).
   (c) FX snapshot date is pinned per run (GetExchangedToEuroValue revalues at call time).
