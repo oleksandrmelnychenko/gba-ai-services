@@ -117,7 +117,9 @@ def croston_rate(series: list[float], alpha: float, sba: bool) -> float:
     return max(0.0, rate)
 
 
-def tsb_rate(series: list[float], alpha: float, beta: float) -> float:
+def tsb_rate(
+    series: list[float], alpha: float, beta: float, open_month_sold: bool = False
+) -> float:
     if not series:
         return 0.0
     probability = 1.0 if series[0] > 0 else 0.0
@@ -126,6 +128,8 @@ def tsb_rate(series: list[float], alpha: float, beta: float) -> float:
         probability += beta * ((1.0 if value > 0 else 0.0) - probability)
         if value > 0:
             size += alpha * (value - size)
+    if open_month_sold:
+        probability += beta * (1.0 - probability)
     return max(0.0, probability * size)
 
 

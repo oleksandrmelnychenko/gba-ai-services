@@ -338,3 +338,31 @@ def test_tsb_rate_is_never_negative_and_handles_degenerate_input():
     assert demand.tsb_rate([0.0, 0.0, 300.0], 0.5, 0.5) == 150.0
     assert demand.tsb_rate([200.0] * 6, 0.2, 0.3) == pytest.approx(200.0)
     assert demand.tsb_rate([200.0, 0.0, 0.0, 0.0], 0.5, 0.5) == pytest.approx(25.0)
+
+
+def test_tsb_counts_a_sale_in_the_open_month_as_an_occurrence_but_not_as_a_size():
+    series = [200.0, 0.0, 0.0, 0.0]
+    assert demand.tsb_rate(series, 0.5, 0.5, open_month_sold=True) == pytest.approx(112.5)
+    assert demand.tsb_rate([200.0, 0.0, 0.0, 0.0, 1.0], 0.5, 0.5) < 112.5
+
+
+def test_a_sporadic_client_that_bought_this_month_is_not_forecast_as_dead():
+    closed = {
+        "2025-01": 965.89, "2025-02": 596.25, "2025-03": 39.39, "2025-04": 133.96,
+        "2025-05": 505.96, "2025-08": 245.5, "2025-09": 704.28, "2025-10": 951.29,
+        "2025-11": 121.19, "2025-12": 144.92, "2026-01": 89.45, "2026-03": 978.96,
+    }
+    cfg = CFG.model_copy(update={"forecast_method": "auto", "history_months": 24})
+    as_of = date(2026, 11, 15)
+    silent, silent_method = fc.forecast_points_with_method(closed, as_of, cfg, 6, "client")
+    alive, alive_method = fc.forecast_points_with_method(
+        {**closed, "2026-11": 244.92}, as_of, cfg, 6, "client"
+    )
+    assert silent_method == alive_method == {"method": "tsb_a0.5_b0.5", "segment": "lumpy"}
+    assert silent[0]["SaleAmount"] == 3.4
+    assert alive[0]["SaleAmount"] == 293.31
+    assert len({point["SaleAmount"] for point in alive}) == 1
+    product, _ = fc.forecast_points_with_method(
+        {**closed, "2026-11": 244.92}, as_of, cfg, 6, "product"
+    )
+    assert product[0]["SaleAmount"] > fc.forecast_points(closed, as_of, cfg, 6, "product")[0]["SaleAmount"]

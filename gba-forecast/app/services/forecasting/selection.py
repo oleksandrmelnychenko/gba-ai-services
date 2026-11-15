@@ -2,7 +2,9 @@
 
 Regular series (smooth, erratic) are forecast with an EWMA level. Sporadic series
 (intermittent, lumpy) of the client and product scopes are forecast with TSB: a smoothed
-demand probability times a smoothed demand size. Sporadic client+product pairs keep the EWMA
+demand probability times a smoothed demand size. A sale already booked in the open current
+month is a demand occurrence (its amount is still partial, so it never updates the size).
+Sporadic client+product pairs keep the EWMA
 level. Constants depend on the scope and the demand class and are chosen on the months the
 service emits: the current month is still open when a forecast is requested, so the first
 emitted point is two steps past the last closed month.
@@ -142,13 +144,19 @@ def select_method(
     return method_for_segment(segment, segment_method), segment
 
 
-def auto_rate(series: list[float], segment: str, scope: str = SCOPE_CLIENT) -> tuple[float, str]:
+def auto_rate(
+    series: list[float],
+    segment: str,
+    scope: str = SCOPE_CLIENT,
+    open_month_sold: bool = False,
+) -> tuple[float, str]:
     if scope not in SEGMENT_EWMA_ALPHA:
         raise ValueError(f"unknown forecast scope: {scope}")
     constants = SEGMENT_TSB[scope].get(segment)
     if constants is not None:
         alpha, beta = constants
-        return demand.tsb_rate(series, alpha, beta), f"tsb_a{alpha:g}_b{beta:g}"
+        rate = demand.tsb_rate(series, alpha, beta, open_month_sold)
+        return rate, f"tsb_a{alpha:g}_b{beta:g}"
     alpha = SEGMENT_EWMA_ALPHA[scope].get(segment, demand.EWMA_ALPHA)
     return demand.ewma_rate(series, alpha), method_label("ewma", alpha)
 

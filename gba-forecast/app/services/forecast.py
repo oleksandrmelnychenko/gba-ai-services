@@ -146,7 +146,8 @@ def forecast_points_with_method(
 
     method, segment = selection.select_method(series, cfg.forecast_method, scope=scope)
     if selection.is_auto(cfg.forecast_method):
-        rate, label = selection.auto_rate(series, segment, scope)
+        open_month_sold = float(history.get(f"{as_of:%Y-%m}", 0.0)) > 0
+        rate, label = selection.auto_rate(series, segment, scope, open_month_sold)
         projected = [rate] * horizon
     else:
         projected = demand.forecast_series(

@@ -252,4 +252,4 @@ def test_placeholder_diagnostic_reports_what_each_series_dropped(monkeypatch):
 def test_cache_namespace_was_bumped_with_the_definition():
     from app.data import cache
 
-    assert cache._VER == "v7-placeholder-returns"
+    assert cache._VER == "v8-open-month-occurrence"
